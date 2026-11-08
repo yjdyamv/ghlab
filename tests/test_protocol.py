@@ -59,6 +59,22 @@ class EnvelopeTest(unittest.TestCase):
         for name in ("patch", "set_type", "bookmark", "note", "notes", "verify", "report"):
             self.assertIn(name, protocol.COMMAND_NAMES)
 
+    def test_pdb_requires_a_file(self):
+        with self.assertRaises(protocol.ProtocolError) as ctx:
+            protocol.validate({"cmd": "pdb", "binary": "x"})
+        self.assertIn("file", str(ctx.exception))
+        _spec, params = protocol.validate({"cmd": "pdb", "binary": "x", "file": "a.pdb"})
+        self.assertEqual(params["file"], "a.pdb")
+
+    def test_types_requires_a_map_file(self):
+        with self.assertRaises(protocol.ProtocolError) as ctx:
+            protocol.validate({"cmd": "types", "binary": "x"})
+        self.assertIn("from", str(ctx.exception))
+        _spec, params = protocol.validate(
+            {"cmd": "types", "binary": "x", "from": "m.txt", "dry_run": True}
+        )
+        self.assertTrue(params["dry_run"])
+
     def test_map_is_declared_and_validated(self):
         _spec, params = protocol.validate(
             {"cmd": "map", "binary": "x", "from": "import:RegSetValueExW", "op": "decompile"}

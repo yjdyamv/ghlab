@@ -113,6 +113,21 @@ ghlab map notepad.exe --from 'import:RegSetValueExW' --op decompile -g 'Reg|Auto
 #       53: LVar6 = RegCreateKeyExW((HKEY)0xffffffff80000001,L"Software\Microsoft\Notepad\Autosave",0,
 ghlab map notepad.exe --from 'name:^FUN_14000' --op imports -g Reg -n 50   # 只要导入，不反编译
 
+# 外部知识一次搬进来：头文件/PDB 导出的签名表，一个事务一次落盘，单条失败不影响其它
+cat > ~/re/maps/notepad.txt <<'MAP'
+FUN_14001e194 = int reg_set_dword(HKEY h, LPCWSTR name, int value)
+0x1400390a0 = char[8]
+MAP
+ghlab types notepad.exe --from ~/re/maps/notepad.txt --dry-run   # 先看计划
+ghlab types notepad.exe --from ~/re/maps/notepad.txt
+
+# 有 PDB 就不用猜：符号和类型一次进来（不匹配会被拒绝，函数数不变）
+ghlab pdb sample.exe --file ~/re/samples/sample.pdb
+# applied ...: functions 1204 -> 1310 (project.save(program))
+# 1 applied / 1 failed from ~/re/maps/notepad.txt (project.save(program))
+#   OK  14001e194 -> int reg_set_dword(HKEY h, LPCWSTR name, int value)
+#   ERR 0x1400390a0: Could not create Data at address 1400390a0
+
 # 跨程序：哪个样本也连这个域名？这个 API 是由哪条路径走到的？这段逻辑在别的样本里叫什么？
 ghlab cross-xref 'autosave'                       # 全项目搜字符串，附"谁在用"
 ghlab slice notepad.exe RegSetValueExW            # 从入口到该导入的最短调用链
@@ -232,6 +247,8 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
 | `note` | `binary, text` / `at, addr, tag, assert` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
 | `map` | `binary` / `from, op, grep, limit, hits` | **批量原语**：`--from` 选函数集（`all`/`name:`/`import:`/`calls:`/`string:`/`const:`/`addr:`），`--op` 取 `decompile`/`strings`/`imports`/`calls`/`consts`，`-g` 只留命中行。4 个函数反编译+过滤 ≈2.6s，回 15 行而不是 4 份源码 |
+| `pdb` | `binary, file` / `untrusted` | **吃调试符号**：`PdbUniversalAnalyzer.doAnalysis` 套壳；PDB 与二进制不匹配时不写入（`functions_before == functions_after`），日志一并返回 |
+| `types` | `binary, from` / `dry_run` | **批量写类型**：签名表（`.json` 分组或 `target = decl` 文本）一次应用，一个事务一次 `save`；`--dry-run` 只列计划；单条失败进 `failed` 不中断 |
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
 | `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
@@ -240,7 +257,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 10 个工具 + `ghlab://` 资源 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 13 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
@@ -317,6 +334,8 @@ python -m unittest discover -s tests -q  # 105 个测试
 18. **给入口符号改名会让 `program.getEntryPoint()` 失效**（digest 的入口链随之变空）→ 别重命名 `entry`；`_entry_chain` 已加名字/可执行段首函数兜底。
 19. **常量的符号性不可假定**：反编译里的 `(HKEY)0xffffffff80000001` 到 `getScalar()` 是**负数** long → 断言比较时必须同时试 `value` / `_u64(value)` / 32 位与 16 位截断（`_const_views()`）。
 20. **地址字符串没有唯一写法**：`1400019d0` 不带 `0x` 时 `FlatProgramAPI.toAddr()` 认不出来（它不把裸 hex 当地址）→ `_hex_addr()` 统一识别，`_addr`/`_function` 都走它。
+
+21. **PDB 分析没有 2 参 `doAnalysis`**：12.2 只有 `PdbUniversalAnalyzer.doAnalysis(Program, File, PdbReaderOptions, PdbApplicatorOptions, MessageLog, TaskMonitor)`（返回 boolean）；`MessageLog` 没有 `getMessages()`/`getMessageLog()`，取文本用 `str(log)`。坏 PDB 返回 `false` 且函数数不变（干净拒绝），所以 `if ok` 之前不要 `save`。
 
 ## License
 

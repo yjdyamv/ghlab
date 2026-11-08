@@ -359,6 +359,38 @@ def fmt_notes(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_pdb(r: dict[str, Any]) -> str:
+    before, after = r["functions_before"], r["functions_after"]
+    if not r["applied"]:
+        out = [f"PDB refused: {r['file']} (functions unchanged at {before})"]
+        text = (r.get("log") or "").strip()
+        if text:
+            out += [f"  {line}" for line in text.splitlines()[:6]]
+        return chr(10).join(out)
+    out = [f"applied {r['file']}: functions {before} -> {after} ({r.get('saved_via') or ''})"]
+    for line in (r.get("log") or "").strip().splitlines()[:6]:
+        out.append(f"  {line}")
+    return chr(10).join(out)
+
+
+def fmt_types(r: dict[str, Any]) -> str:
+    if r.get("dry_run"):
+        out = [f"{r['planned']} item(s) planned from {r.get('source') or 'map'} (dry run)"]
+        for item in r["items"][:40]:
+            out.append(f"  {item['kind'][:4]} {item['target']} = {item['decl']}")
+        return "\n".join(out)
+    out = [
+        f"{r['count']} applied / {len(r['failed'])} failed from {r['source']} "
+        f"({r.get('saved_via') or 'not saved'})"
+    ]
+    for item in r["applied"]:
+        detail = item.get("prototype") or item.get("datatype") or ""
+        out.append(f"  OK  {item.get('addr') or item.get('target')} -> {detail}")
+    for item in r["failed"]:
+        out.append(f"  ERR {item.get('target')}: {item.get('error') or item.get('message')}")
+    return "\n".join(out)
+
+
 def fmt_map(r: dict[str, Any]) -> str:
     head = f"{r['from']} -> {r['op']}"
     if r.get("grep"):
@@ -472,6 +504,8 @@ FORMATTERS = {
     "notes": fmt_notes,
     "report": fmt_report,
     "map": fmt_map,
+    "types": fmt_types,
+    "pdb": fmt_pdb,
     "cross_xref": fmt_cross_xref,
     "slice": fmt_slice,
     "similar": fmt_similar,
@@ -982,6 +1016,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("--top", type=int, default=6, help="call-graph hubs to include")
     p.set_defaults(func=lambda a: _call(a, "report", {"binary": a.binary, "top": a.top}))
+
+    p = sub.add_parser("types", parents=[common], help="bulk-apply a signature/type map file")
+    p.add_argument("binary")
+    p.add_argument(
+        "--from", dest="from_", required=True, help="map file (.json or `target = decl` text)"
+    )
+    p.add_argument("--dry-run", action="store_true", help="parse and list, apply nothing")
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "types", {"binary": a.binary, "from": a.from_, "dry_run": a.dry_run}
+        )
+    )
+
+    p = sub.add_parser("pdb", parents=[common], help="apply a matching PDB (symbols + types)")
+    p.add_argument("binary")
+    p.add_argument("--file", required=True, help="path to the .pdb that matches this build")
+    p.add_argument("--no-untrusted", dest="untrusted", action="store_false")
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "pdb", {"binary": a.binary, "file": a.file, "untrusted": a.untrusted}
+        )
+    )
 
     p = sub.add_parser(
         "cross-xref", parents=[common], help="search a string/import across all programs"

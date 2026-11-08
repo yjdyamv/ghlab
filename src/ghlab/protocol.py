@@ -141,6 +141,18 @@ _SPECS = [
         "run one operation over a set of functions, return only the matches",
     ),
     Spec(
+        "types",
+        ("binary", "from"),
+        ("dry_run",),
+        "bulk-apply a signature/type map file (JSON or `target = decl` text)",
+    ),
+    Spec(
+        "pdb",
+        ("binary", "file"),
+        ("untrusted",),
+        "apply a matching PDB (symbols and types) via Ghidra's PdbUniversalAnalyzer",
+    ),
+    Spec(
         "notes",
         ("binary",),
         ("tag", "at", "query", "limit"),

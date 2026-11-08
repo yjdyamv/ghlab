@@ -1932,53 +1932,44 @@ def _prototype(fn) -> str:
     return str(fn.getName())
 
 
-def cmd_set_type(a: dict[str, Any]) -> dict[str, Any]:
-    """Apply a function prototype ('int f(char *s, unsigned n)') or a data type
-    ('char[64]', 'void*', 'DWORD') at an address."""
-    from ghidra.app.cmd.data import CreateDataCmd
+def _apply_signature(e, target: Any, decl: str) -> dict[str, Any]:
+    """Set a function prototype from C-ish text. Caller owns the transaction."""
     from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
     from ghidra.program.model.symbol import SourceType
 
-    e = _entry(a["binary"])
     p = e["program"]
-    decl = str(a["decl"]).strip()
-    if "(" in decl and ")" in decl:
-        fn = _function(e, a["target"])
-        if fn is None:
-            raise KeyError(f"function {a['target']!r} not found")
-        # parse() takes a FunctionSignature; fn.getSignature() hands us one (a
-        # FunctionDefinitionDataType) without any jpype casting games.
-        fdef = _signature_parser(p, SourceType.USER_DEFINED).parse(fn.getSignature(), decl)
-        new_name = str(fdef.getName() or "").strip()
-        tx = p.startTransaction("ghlab-signature")
-        try:
-            cmd = ApplyFunctionSignatureCmd(fn.getEntryPoint(), fdef, SourceType.USER_DEFINED)
-            ok = bool(cmd.applyTo(p))
-            # ApplyFunctionSignatureCmd keeps the old name; the declaration is the
-            # authority on what the function is called.
-            if ok and new_name and new_name != str(fn.getName()):
-                fn.setName(new_name, SourceType.USER_DEFINED)
-        finally:
-            p.endTransaction(tx, True)
-        saved = _save(p, "ghlab signature")
-        after = p.getFunctionManager().getFunctionAt(fn.getEntryPoint())
-        return {
-            "kind": "signature",
-            "applied": ok,
-            "addr": str(fn.getEntryPoint()),
-            "prototype": _prototype(after) if after is not None else str(fdef.getPrototypeString()),
-            "message": str(cmd.getStatusMsg()),
-            "saved_via": saved,
-        }
-    addr = _addr(e, str(a["target"]))
+    fn = _function(e, str(target))
+    if fn is None:
+        raise KeyError(f"function {target!r} not found")
+    # parse() takes a FunctionSignature; fn.getSignature() hands us one (a
+    # FunctionDefinitionDataType) without any jpype casting games.
+    fdef = _signature_parser(p, SourceType.USER_DEFINED).parse(fn.getSignature(), decl)
+    new_name = str(fdef.getName() or "").strip()
+    cmd = ApplyFunctionSignatureCmd(fn.getEntryPoint(), fdef, SourceType.USER_DEFINED)
+    ok = bool(cmd.applyTo(p))
+    # ApplyFunctionSignatureCmd keeps the old name; the declaration is the
+    # authority on what the function is called.
+    if ok and new_name and new_name != str(fn.getName()):
+        fn.setName(new_name, SourceType.USER_DEFINED)
+    after = p.getFunctionManager().getFunctionAt(fn.getEntryPoint())
+    return {
+        "kind": "signature",
+        "applied": ok,
+        "addr": str(fn.getEntryPoint()),
+        "prototype": _prototype(after) if after is not None else str(fdef.getPrototypeString()),
+        "message": str(cmd.getStatusMsg()),
+    }
+
+
+def _apply_data(e, target: Any, decl: str) -> dict[str, Any]:
+    """Define a data type at an address. Caller owns the transaction."""
+    from ghidra.app.cmd.data import CreateDataCmd
+
+    p = e["program"]
+    addr = _addr(e, str(target))
     dt = _datatype(p, decl)
-    tx = p.startTransaction("ghlab-set-data")
-    try:
-        cmd = CreateDataCmd(addr, dt)
-        ok = bool(cmd.applyTo(p))
-    finally:
-        p.endTransaction(tx, True)
-    saved = _save(p, "ghlab data")
+    cmd = CreateDataCmd(addr, dt)
+    ok = bool(cmd.applyTo(p))
     data = p.getListing().getDataAt(addr) if ok else None
     return {
         "kind": "data",
@@ -1988,8 +1979,167 @@ def cmd_set_type(a: dict[str, Any]) -> dict[str, Any]:
         "size": int(dt.getLength()),
         "value": str(data.getValue()) if data is not None and data.getValue() is not None else None,
         "message": str(cmd.getStatusMsg()),
-        "saved_via": saved,
     }
+
+
+def _is_signature(decl: str) -> bool:
+    return "(" in decl and ")" in decl
+
+
+def cmd_set_type(a: dict[str, Any]) -> dict[str, Any]:
+    """Apply a function prototype ('int f(char *s, unsigned n)') or a data type
+    ('char[64]', 'void*', 'DWORD') at an address."""
+    e = _entry(a["binary"])
+    p = e["program"]
+    decl = str(a["decl"]).strip()
+    apply_one = _apply_signature if _is_signature(decl) else _apply_data
+    tx = p.startTransaction("ghlab-set-type")
+    try:
+        out = apply_one(e, a["target"], decl)
+    finally:
+        p.endTransaction(tx, True)
+    out["saved_via"] = _save(p, "ghlab set-type")
+    return out
+
+
+def _load_type_map(path: str) -> list[dict[str, str]]:
+    """Read a signature/type map.
+
+    JSON: {"signatures": {target: decl}, "data": {target: decl}} or a flat object.
+    Text: one `target = decl` per line, `#` comments.
+    """
+    p = Path(str(path)).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"type map not found: {p}")
+    text = p.read_text(encoding="utf-8")
+    items: list[dict[str, str]] = []
+    if p.suffix.lower() == ".json":
+        raw = json.loads(text)
+        if not isinstance(raw, dict):
+            raise ValueError("type map JSON must be an object")
+        groups = {"signatures": raw.pop("signatures", None), "data": raw.pop("data", None)}
+        for kind, group in groups.items():
+            if isinstance(group, dict):
+                items += [
+                    {"kind": kind, "target": str(k), "decl": str(v)} for k, v in group.items()
+                ]
+        items += [
+            {
+                "kind": "signatures" if _is_signature(str(v)) else "data",
+                "target": str(k),
+                "decl": str(v),
+            }
+            for k, v in raw.items()
+        ]
+    else:
+        for lineno, line in enumerate(text.splitlines(), 1):
+            body = line.split("#", 1)[0].strip()
+            if not body:
+                continue
+            target, sep, decl = body.partition("=")
+            if not sep or not decl.strip():
+                raise ValueError(f"{p}:{lineno}: expected `target = declaration`")
+            decl = decl.strip()
+            items.append(
+                {
+                    "kind": "signatures" if _is_signature(decl) else "data",
+                    "target": target.strip(),
+                    "decl": decl,
+                }
+            )
+    if not items:
+        raise ValueError(f"type map {p} is empty")
+    return items
+
+
+def cmd_types(a: dict[str, Any]) -> dict[str, Any]:
+    """Bulk-apply a signature/type map: one transaction, one save.
+
+    This is how external knowledge enters the project (headers, PDB dumps, notes from
+    a colleague) without 200 separate `set-type` round-trips and 200 saves.
+    """
+    items = _load_type_map(str(a["from"]))
+    e = _entry(a["binary"])
+    p = e["program"]
+    applied: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    if a.get("dry_run"):
+        return {
+            "binary": str(a["binary"]),
+            "planned": len(items),
+            "items": items,
+            "dry_run": True,
+        }
+    tx = p.startTransaction("ghlab-types")
+    try:
+        for item in items:
+            try:
+                fn = _apply_signature if item["kind"] == "signatures" else _apply_data
+                out = fn(e, item["target"], item["decl"])
+                out["target"] = item["target"]
+                out["decl"] = item["decl"]
+                (applied if out["applied"] else failed).append(out)
+            except Exception as ex:  # noqa: BLE001 - jpype call, can raise anything
+                failed.append(
+                    {
+                        "target": item["target"],
+                        "decl": item["decl"],
+                        "error": f"{type(ex).__name__}: {ex}",
+                    }
+                )
+    finally:
+        p.endTransaction(tx, True)
+    saved = _save(p, "ghlab types")
+    return {
+        "binary": str(a["binary"]),
+        "applied": applied,
+        "failed": failed,
+        "count": len(applied),
+        "saved_via": saved,
+        "source": str(a["from"]),
+    }
+
+
+def cmd_pdb(a: dict[str, Any]) -> dict[str, Any]:
+    """Apply a matching PDB's symbols/types to a program.
+
+    Ghidra ships the whole PDB pipeline (`PdbUniversalAnalyzer.doAnalysis`), so this is
+    a thin wrapper: sanity-check the file, run inside a transaction, keep the log. It is
+    a refusal rather than a partial import when the PDB does not match the binary.
+    """
+    import jpype
+    from java.io import File
+
+    e = _entry(a["binary"])
+    p = e["program"]
+    path = Path(str(a["file"])).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"pdb not found: {path}")
+    analyzer = jpype.JClass("ghidra.app.plugin.core.analysis.PdbUniversalAnalyzer")
+    reader = jpype.JClass("ghidra.app.util.bin.format.pdb2.pdbreader.PdbReaderOptions")()
+    applicator = jpype.JClass("ghidra.app.util.pdb.pdbapplicator.PdbApplicatorOptions")()
+    log = jpype.JClass("ghidra.app.util.importer.MessageLog")()
+    before = int(p.getFunctionManager().getFunctionCount())
+    analyzer.setAllowUntrustedOption(p, bool(a.get("untrusted", True)))
+    tx = p.startTransaction("ghlab-pdb")
+    try:
+        ok = bool(
+            analyzer.doAnalysis(
+                p, File(str(path)).getAbsoluteFile(), reader, applicator, log, MONITOR
+            )
+        )
+    finally:
+        p.endTransaction(tx, True)
+    out = {
+        "applied": ok,
+        "file": str(path),
+        "functions_before": before,
+        "functions_after": int(p.getFunctionManager().getFunctionCount()),
+        "log": str(log)[:2000],
+    }
+    if ok:
+        out["saved_via"] = _save(p, "ghlab pdb")
+    return out
 
 
 BOOKMARK_TYPES = ("Note", "Info", "Warning", "Error", "Analysis")
@@ -2892,6 +3042,8 @@ HANDLERS = {
     "notes": cmd_notes,
     "verify": cmd_verify,
     "map": cmd_map,
+    "types": cmd_types,
+    "pdb": cmd_pdb,
     "report": cmd_report,
     "cross_xref": cmd_cross_xref,
     "slice": cmd_slice,

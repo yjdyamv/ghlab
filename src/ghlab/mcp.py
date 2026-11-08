@@ -236,6 +236,40 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_types",
+        "description": (
+            "Bulk-apply external knowledge: a map file of `target = C declaration` pairs "
+            "(signatures when it contains parentheses, data types otherwise) from headers, "
+            "PDB dumps or a colleague's notes. One transaction, one save, per-item failures "
+            "reported instead of aborting."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "from": {"type": "string", "description": "path to .json or `target = decl` text"},
+                "dry_run": {"type": "boolean"},
+            },
+            "required": ["binary", "from"],
+        },
+    },
+    {
+        "name": "ghlab_pdb",
+        "description": (
+            "Apply a matching PDB: symbols and types come from the debug symbols instead of "
+            "guessing. Refuses cleanly (functions unchanged) when the PDB does not match."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "file": {"type": "string", "description": "path to the .pdb"},
+                "untrusted": {"type": "boolean", "description": "allow unsigned/untrusted pdb"},
+            },
+            "required": ["binary", "file"],
+        },
+    },
+    {
         "name": "ghlab_report",
         "description": "Markdown report for one binary: digest summary, hubs, size buckets and findings.",
         "inputSchema": {
@@ -259,6 +293,8 @@ _COMMANDS = {
     "ghlab_note": "note",
     "ghlab_verify": "verify",
     "ghlab_map": "map",
+    "ghlab_types": "types",
+    "ghlab_pdb": "pdb",
     "ghlab_report": "report",
 }
 

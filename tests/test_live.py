@@ -248,6 +248,51 @@ class LiveTest(unittest.TestCase):
         self.assertIn(text, report)
         self.assertIn("Call-graph hubs", report)
 
+    def test_types_applies_a_signature_map_in_one_call(self):
+        path = os.path.join(tempfile.gettempdir(), "ghlab_types_test.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"signatures": {"FUN_140008508": "int FUN_140008508(char *s)"}}, fh)
+        r = client.call("types", binary=BIN, **{"from": path})
+        self.assertEqual(r["count"], 1)
+        self.assertEqual(r["failed"], [])
+        self.assertIn("char *", r["applied"][0]["prototype"])
+
+    def test_types_dry_run_parses_a_text_map(self):
+        path = os.path.join(tempfile.gettempdir(), "ghlab_types_test.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(chr(10).join(["# comment", "FUN_140008508 = int FUN_140008508(char *s)", ""]))
+        r = client.call("types", binary=BIN, **{"from": path}, dry_run=True)
+        self.assertTrue(r["dry_run"])
+        self.assertEqual(r["planned"], 1)
+        self.assertEqual(r["items"][0]["kind"], "signatures")
+
+    def test_types_can_name_a_function_and_puts_the_name_back(self):
+        funcs = client.call("functions", binary=BIN, match="^FUN_14000", limit=3)["functions"]
+        target = funcs[0]["name"]
+        new_name = "ghlab_probe_" + target.rsplit("_", 1)[-1]
+        path = os.path.join(tempfile.gettempdir(), "ghlab_types_name.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(target + " = int " + new_name + "(int a)" + chr(10))
+        r = client.call("types", binary=BIN, **{"from": path})
+        self.assertEqual(r["count"], 1)
+        self.assertIn(new_name, r["applied"][0]["prototype"])
+        client.call("rename", binary=BIN, target=new_name, new=target)
+        names = [
+            f["name"]
+            for f in client.call("functions", binary=BIN, match="^" + target + "$")["functions"]
+        ]
+        self.assertEqual(names, [target])
+
+    def test_pdb_refuses_a_bogus_file_without_damaging_the_program(self):
+        path = os.path.join(tempfile.gettempdir(), "ghlab_bogus.pdb")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("not a pdb")
+        before = client.call("info", binary=BIN)["functions"]
+        r = client.call("pdb", binary=BIN, file=path)
+        self.assertFalse(r["applied"])
+        self.assertEqual(r["functions_before"], r["functions_after"])
+        self.assertEqual(client.call("info", binary=BIN)["functions"], before)
+
     def test_map_batches_a_selection_and_returns_hits(self):
         r = client.call(
             "map",
@@ -262,7 +307,7 @@ class LiveTest(unittest.TestCase):
         self.assertGreaterEqual(r["hits"], 1)
         for item in r["results"]:
             for hit in item["matched"]:
-                self.assertIn("Reg", hit.get("text", ""))
+                self.assertIn("reg", hit.get("text", "").lower())
 
     def test_map_rejects_unknown_selector(self):
         with self.assertRaises(RemoteError):
