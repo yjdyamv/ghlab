@@ -87,6 +87,12 @@ _SPECS = [
         "one-shot triage: entry chain, risk-grouped imports, API combos, strings, hubs, sizes",
     ),
     Spec(
+        "index",
+        ("binary",),
+        ("refresh",),
+        "build or reuse the persistent per-function fact index",
+    ),
+    Spec(
         "find",
         ("binary",),
         ("import", "string", "calls", "limit", "any"),

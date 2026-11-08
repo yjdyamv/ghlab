@@ -66,6 +66,12 @@ class EnvelopeTest(unittest.TestCase):
         _spec, params = protocol.validate({"cmd": "pdb", "binary": "x", "file": "a.pdb"})
         self.assertEqual(params["file"], "a.pdb")
 
+    def test_index_takes_an_optional_refresh(self):
+        _spec, params = protocol.validate({"cmd": "index", "binary": "x"})
+        self.assertEqual(params, {"binary": "x"})
+        _spec, params = protocol.validate({"cmd": "index", "binary": "x", "refresh": True})
+        self.assertTrue(params["refresh"])
+
     def test_types_requires_a_map_file(self):
         with self.assertRaises(protocol.ProtocolError) as ctx:
             protocol.validate({"cmd": "types", "binary": "x"})

@@ -216,6 +216,18 @@ def _hexblock(hexstr: str, ascii_: str, width: int = 16) -> str:
     return "\n".join(lines)
 
 
+def fmt_index(r: dict[str, Any]) -> str:
+    state = "cached" if r["cached"] else "built"
+    out = [
+        f"{r['binary']}: {r['functions']} functions, {r['strings']} string refs, "
+        f"{r['imports']} imports ({state}, {r['elapsed_ms']}ms, {r['bytes'] // 1024} KiB)"
+    ]
+    if r.get("built_at"):
+        out.append(f"  built_at {r['built_at']}")
+    out.append(f"  {r['path']}")
+    return chr(10).join(out)
+
+
 def fmt_find(r: dict[str, Any]) -> str:
     filters = " ".join(f"{k}={v}" for k, v in (r.get("filters") or {}).items())
     out = [f"# {r.get('candidates')} candidate(s) mode={r.get('mode')} {filters}"]
@@ -494,6 +506,7 @@ FORMATTERS = {
     "graph": fmt_graph,
     "digest": fmt_digest,
     "find": fmt_find,
+    "index": fmt_index,
     "diff": fmt_diff,
     "emulate": fmt_emulate,
     "patch": fmt_patch,
@@ -843,6 +856,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(
         func=lambda a: _call(a, "digest", {"binary": a.binary, "top": a.top, "strings": a.strings})
     )
+
+    p = sub.add_parser("index", parents=[common], help="build or reuse the fact index")
+    p.add_argument("binary")
+    p.add_argument("--refresh", action="store_true", help="rebuild even if it looks fresh")
+    p.set_defaults(func=lambda a: _call(a, "index", {"binary": a.binary, "refresh": a.refresh}))
 
     p = sub.add_parser("find", parents=[common], help="locate candidates by structure")
     p.add_argument("binary")

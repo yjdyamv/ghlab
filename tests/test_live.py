@@ -130,6 +130,30 @@ class LiveTest(unittest.TestCase):
         # a digest must stay cheap: whole payload well under a decompiled file
         self.assertLess(len(str(r)), 40000)
 
+    def test_index_builds_once_then_is_cached(self):
+        first = client.call("index", binary=BIN, refresh=True)
+        self.assertFalse(first["cached"])
+        self.assertGreater(first["functions"], 100)
+        second = client.call("index", binary=BIN)
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["built_at"], first["built_at"])
+        self.assertLess(second["elapsed_ms"], first["elapsed_ms"] + 1)
+
+    def test_a_program_edit_invalidates_the_index(self):
+        client.call("index", binary=BIN, refresh=True)
+        self.assertTrue(client.call("index", binary=BIN)["cached"])
+        target = client.call("functions", binary=BIN, match="^FUN_14000", limit=1)["functions"]
+        name = target[0]["name"]
+        client.call("rename", binary=BIN, target=name, new="ghlab_idx_probe")
+        self.assertFalse(client.call("index", binary=BIN)["cached"], "edits must invalidate")
+        client.call("rename", binary=BIN, target="ghlab_idx_probe", new=name)
+
+    def test_notes_do_not_invalidate_the_index(self):
+        # a finding does not change any function fact, so the index stays valid
+        client.call("index", binary=BIN, refresh=True)
+        client.call("note", binary=BIN, text="index probe", tag="indextest")
+        self.assertTrue(client.call("index", binary=BIN)["cached"])
+
     def test_find_locates_registry_writer(self):
         r = client.call("find", binary=BIN, **{"import": ["RegSetValue"], "string": ["Notepad"]})
         self.assertGreater(r["candidates"], 0)

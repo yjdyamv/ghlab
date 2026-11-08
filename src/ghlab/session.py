@@ -8,6 +8,7 @@ import json
 import os
 import re
 import threading
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -92,7 +93,7 @@ def _entry(binary: str) -> dict[str, Any]:
     decomp.toggleCCode(True)
     decomp.toggleSyntaxTree(True)
     decomp.openProgram(program)
-    entry = {"program": program, "decomp": decomp, "api": FlatProgramAPI(program)}
+    entry = {"binary": binary, "program": program, "decomp": decomp, "api": FlatProgramAPI(program)}
     _programs[binary] = entry
     return entry
 
@@ -806,7 +807,81 @@ def _as_list(value: Any) -> list[str]:
 
 
 def cmd_find(a: dict[str, Any]) -> dict[str, Any]:
-    """Locate candidates by structure (imports / strings / calls), not by name."""
+    """Locate candidates by structure (imports / strings / callees), not by name.
+
+    Reads the persistent index, so repeats cost milliseconds instead of a full scan.
+    """
+    e = _entry(a["binary"])
+    limit = int(a.get("limit", 20))
+    any_mode = bool(a.get("any", False))
+    filters = {
+        "import": [re.compile(x, re.I) for x in _as_list(a.get("import"))],
+        "string": [re.compile(x, re.I) for x in _as_list(a.get("string"))],
+        "calls": [re.compile(x, re.I) for x in _as_list(a.get("calls"))],
+    }
+    active = {k: v for k, v in filters.items() if v}
+    if not active:
+        raise ValueError("pass at least one of import / string / calls")
+    try:
+        idx = load_index(e)
+    except Exception:  # noqa: BLE001 - fall back to a live scan
+        return _find_by_scan(a)
+    rows = idx["rows"]
+    hits: dict[int, dict[str, list[str]]] = {}
+
+    def touch(offset: int, kind: str, detail: str) -> None:
+        slot = hits.setdefault(offset, {"import": [], "string": [], "calls": []})
+        bucket = slot[kind]
+        if len(bucket) < 8 and detail not in bucket:
+            bucket.append(detail)
+
+    for offset, row in rows.items():
+        for name in row["imports"]:
+            for pat in active.get("import", []):
+                if pat.search(name):
+                    touch(offset, "import", name)
+        for value in row["strings"]:
+            for pat in active.get("string", []):
+                if pat.search(value):
+                    touch(offset, "string", value[:80])
+        for name in row["callees"]:
+            for pat in active.get("calls", []):
+                if pat.search(name):
+                    touch(offset, "calls", name)
+
+    needed = len(active)
+    kept = []
+    for offset, matched in hits.items():
+        kinds = sum(1 for k in active if matched[k])
+        if (any_mode and kinds == 0) or (not any_mode and kinds < needed):
+            continue
+        row = rows[offset]
+        kept.append((kinds, int(row["size"]), row, matched))
+    kept.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    out = []
+    for kinds, size, row, matched in kept[:limit]:
+        out.append(
+            {
+                "name": row["name"],
+                "addr": row["addr"],
+                "size": size,
+                "matched": {k: v for k, v in matched.items() if v},
+                "filters_matched": kinds,
+            }
+        )
+    return {
+        "binary": a["binary"],
+        "filters": {k: [pat.pattern for pat in v] for k, v in active.items()},
+        "mode": "any" if any_mode else "all",
+        "candidates": len(kept),
+        "functions": out,
+        "index": {"cached": idx["cached"], "built_at": idx["meta"].get("built_at")},
+    }
+
+
+def _find_by_scan(a: dict[str, Any]) -> dict[str, Any]:
+    """Live scan fallback: used when the index cannot be built for a program."""
     e = _entry(a["binary"])
     p = e["program"]
     fm = p.getFunctionManager()
@@ -953,12 +1028,15 @@ def _fingerprint(program, fn, block_model) -> dict[str, Any]:
                     if value:
                         strings.add(value)
     ext: set[str] = set()
+    callees: set[str] = set()
     calls = 0
     for callee in fn.getCalledFunctions(MONITOR):
         calls += 1
         name = str(callee.getName())
         if callee.isExternal() or callee.isThunk() or name.startswith("PTR_"):
             ext.add(_clean_name(name))
+        elif len(callees) < 64:
+            callees.add(name)
     blocks = 0
     cit = block_model.getCodeBlocksContaining(fn.getBody(), MONITOR)
     while cit.hasNext():
@@ -975,31 +1053,153 @@ def _fingerprint(program, fn, block_model) -> dict[str, Any]:
         "strings": strings,
         "consts": consts,
         "imports": ext,
+        "callees": callees,
+    }
+
+
+_INDEX_SET_KEYS = ("strings", "imports", "consts", "callees")
+
+
+def _ghlab_dir() -> Path:
+    base = _project_dir or (Path.home() / "re" / "proj")
+    d = Path(base) / ".ghlab"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _index_file(binary: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _ghlab_dir() / "index" / f"{slug}.json"
+
+
+def _index_meta(program) -> dict[str, Any]:
+    return {
+        "md5": str(program.getExecutableMD5() or ""),
+        "mods": int(program.getModificationNumber()),
+        "language": str(program.getLanguageID()),
+    }
+
+
+def build_index(e) -> dict[int, dict[str, Any]]:
+    """One scan of the whole program: per-function facts, reused by find/diff/similar."""
+    from ghidra.program.model.block import BasicBlockModel
+
+    program = e["program"]
+    model = BasicBlockModel(program)
+    rows: dict[int, dict[str, Any]] = {}
+    for fn in program.getFunctionManager().getFunctions(True):
+        try:
+            if fn.isExternal() or fn.isThunk():
+                continue
+            row = _fingerprint(program, fn, model)
+        except Exception:  # noqa: BLE001 - one odd function must not kill the scan
+            continue
+        # keep sets (diff/similar do set algebra) but cap what goes into the cache
+        row["consts"] = set(sorted(row["consts"])[:200])
+        row["strings"] = set(sorted(row["strings"])[:200])
+        row["imports"] = set(sorted(row["imports"])[:64])
+        row["callees"] = set(sorted(row["callees"])[:64])
+        rows[int(row["offset"])] = row
+    return rows
+
+
+def _rows_to_cache(rows: dict[int, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        str(k): {**v, **{key: sorted(v[key]) for key in _INDEX_SET_KEYS}} for k, v in rows.items()
+    }
+
+
+def _rows_from_cache(raw: dict[str, dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    rows: dict[int, dict[str, Any]] = {}
+    for key, row in raw.items():
+        rows[int(key)] = {**row, **{k: set(row.get(k) or []) for k in _INDEX_SET_KEYS}}
+    return rows
+
+
+def load_index(e, refresh: bool = False) -> dict[str, Any]:
+    """Return the per-function fact table, rebuilding it when the program changed.
+
+    Invalidation is (md5, modification number): any write through ghlab bumps the
+    modification number, so a stale index can never be mistaken for a fresh one.
+    """
+    started = time.time()
+    program = e["program"]
+    meta = _index_meta(program)
+    path = _index_file(str(e["binary"]))
+    if not refresh and path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cached_meta = raw.get("meta") or {}
+            same = cached_meta.get("md5") == meta["md5"] and cached_meta.get("mods") == meta["mods"]
+        except (OSError, ValueError):
+            same = False
+        if same:
+            rows = _rows_from_cache(raw.get("rows") or {})
+            return {
+                "rows": rows,
+                "meta": raw["meta"],
+                "cached": True,
+                "path": str(path),
+                "bytes": path.stat().st_size,
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+    rows = build_index(e)
+    payload = {
+        "meta": {
+            **meta,
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "functions": len(rows),
+            "binary": str(e["binary"]),
+        },
+        "rows": _rows_to_cache(rows),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8", newline="\n")
+    return {
+        "rows": rows,
+        "meta": payload["meta"],
+        "cached": False,
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def cmd_index(a: dict[str, Any]) -> dict[str, Any]:
+    """Build (or reuse) the fact index for one binary and report what is in it."""
+    e = _entry(a["binary"])
+    idx = load_index(e, refresh=bool(a.get("refresh")))
+    rows = idx["rows"]
+    strings = sum(len(r["strings"]) for r in rows.values())
+    imports = {name for r in rows.values() for name in r["imports"]}
+    return {
+        "binary": str(a["binary"]),
+        "cached": idx["cached"],
+        "functions": len(rows),
+        "strings": strings,
+        "imports": len(imports),
+        "built_at": idx["meta"].get("built_at"),
+        "path": idx["path"],
+        "bytes": idx["bytes"],
+        "elapsed_ms": idx["elapsed_ms"],
     }
 
 
 def _program_fingerprints(binary: str) -> dict[str, Any]:
-    from ghidra.program.model.block import BasicBlockModel
-
     entry = _entry(binary)
     program = entry["program"]
     md5 = str(program.getExecutableMD5() or "")
     cache_key = (str(binary), md5, int(program.getModificationNumber()))
     if cache_key in _FP_CACHE:
         return _FP_CACHE[cache_key]
-    model = BasicBlockModel(program)
-    prints: dict[int, dict[str, Any]] = {}
-    it = program.getFunctionManager().getFunctions(True)
-    while it.hasNext():
-        fn = it.next()
-        try:
-            if fn.isExternal():
-                continue
-            fp = _fingerprint(program, fn, model)
-        except Exception:  # noqa: BLE001
-            continue
-        prints[fp["offset"]] = fp
-    out = {"binary": str(binary), "md5": md5, "program": program, "functions": prints}
+    idx = load_index(entry)
+    out = {
+        "binary": str(binary),
+        "md5": md5,
+        "program": program,
+        "functions": idx["rows"],
+        "index": {"cached": idx["cached"], "built_at": idx["meta"].get("built_at")},
+    }
     _FP_CACHE[cache_key] = out
     return out
 
@@ -1084,7 +1284,6 @@ def _size_swing(entry: dict[str, Any]) -> int:
 
 def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
     """Compare two programs in the project: what was added, removed, patched."""
-    import time
 
     started = time.time()
     left = _program_fingerprints(a["a"])
@@ -1496,7 +1695,6 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     Purely in-emulator: `EmulatorHelper` keeps its own memory state, so nothing is
     written back to the program and no save is needed.
     """
-    import time
 
     from ghidra.app.emulator import EmulatorHelper
     from ghidra.util.task import TimeoutTaskMonitor
@@ -2411,7 +2609,6 @@ def _store_notes(binary: str, notes: list[dict[str, Any]]) -> None:
 
 def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
     """Append a durable finding (JSON on disk + a Ghidra bookmark)."""
-    import time
 
     binary = str(a["binary"])
     notes = _load_notes(binary)
@@ -2465,7 +2662,6 @@ def cmd_verify(a: dict[str, Any]) -> dict[str, Any]:
     A note is only worth as much as its ability to survive a re-run: this walks
     the stored claims, recomputes them from the program, and records pass/fail.
     """
-    import time
 
     binary = str(a["binary"])
     e = _entry(binary)
@@ -2947,7 +3143,6 @@ def cmd_map(a: dict[str, Any]) -> dict[str, Any]:
     and show me the lines mentioning Autosave" used to cost one HTTP round-trip per
     function; now it is one call that returns nothing but the hits.
     """
-    import time
 
     started = time.time()
     e = _entry(a["binary"])
@@ -2989,7 +3184,6 @@ def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:
     builds of the same tool collapse into one cluster while an unrelated binary
     stays alone. Single linkage: a shared loader stub should pull samples together.
     """
-    import time
 
     from . import campaign
 
@@ -3033,6 +3227,7 @@ HANDLERS = {
     "graph": cmd_graph,
     "digest": cmd_digest,
     "find": cmd_find,
+    "index": cmd_index,
     "diff": cmd_diff,
     "emulate": cmd_emulate,
     "patch": cmd_patch,
