@@ -564,6 +564,103 @@ def cmd_imports(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_STACK_REF = re.compile(r"\[(?:RSP|RBP|ESP|EBP)[\s,+\-]")
+
+
+def _insn_sites(
+    program: Any,
+    pattern: re.Pattern[str],
+    start: Any | None = None,
+    end: Any | None = None,
+    limit: int = 60,
+    op: re.Pattern[str] | None = None,
+    skip_stack: bool = True,
+) -> tuple[list[dict[str, Any]], int]:
+    """Instructions whose rendering touches a given displacement, with owner function."""
+    listing = program.getListing()
+    fm = program.getFunctionManager()
+    out: list[dict[str, Any]] = []
+    scanned = 0
+    for block in program.getMemory().getBlocks():
+        if not block.isExecute():
+            continue
+        lo, hi = block.getStart(), block.getEnd()
+        if start is not None and hi.compareTo(start) < 0:
+            continue
+        if end is not None and lo.compareTo(end) > 0:
+            continue
+        if start is not None and lo.compareTo(start) < 0:
+            lo = start
+        if end is not None and hi.compareTo(end) > 0:
+            hi = end
+        it = listing.getInstructions(lo, True)
+        while it.hasNext():
+            insn = it.next()
+            if end is not None and insn.getAddress().compareTo(end) > 0:
+                break
+            scanned += 1
+            text = str(insn)
+            if op is not None and not op.search(text.split(" ", 1)[0]):
+                continue
+            if skip_stack and _STACK_REF.search(text):
+                continue
+            if not pattern.search(text):
+                continue
+            fn = fm.getFunctionContaining(insn.getAddress())
+            out.append(
+                {
+                    "addr": str(insn.getAddress()),
+                    "function": fn.getName() if fn else "",
+                    "text": text,
+                }
+            )
+            if len(out) >= limit:
+                return out, scanned
+    return out, scanned
+
+
+def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
+    """Find the instructions that read or write a given struct field offset.
+
+    This is the question you always ask when a struct's layout is known but its
+    consumers are not: who touches `+0x54`? A displacement search over the code
+    section answers it without any type information.
+    """
+    binary = a["binary"]
+    p = _entry(binary)["program"]
+    offset = int(str(a["offset"]), 0)
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    limit = int(a.get("limit", 60))
+    op = re.compile(str(a["op"]), re.I) if a.get("op") else None
+    pattern = re.compile(rf"[+-]\s*{offset:#x}\]", re.I)
+    start = end = None
+    rng = a.get("range")
+    if rng:
+        lo_text, _, hi_text = str(rng).partition("-")
+        lo = _hex_addr(lo_text)
+        hi = _hex_addr(hi_text) if hi_text else None
+        if lo is None or hi is None:
+            raise ValueError(f"bad range {rng!r}; expected 0xSTART-0xEND")
+        space = p.getAddressFactory().getDefaultAddressSpace()
+        start, end = space.getAddress(lo), space.getAddress(hi)
+    if a.get("func"):
+        fn = _function(_entry(binary), str(a["func"]))
+        start, end = fn.getBody().getMinAddress(), fn.getBody().getMaxAddress()
+    began = time.monotonic()
+    sites, scanned = _insn_sites(p, pattern, start, end, limit, op, not a.get("stack"))
+    return {
+        "binary": binary,
+        "offset": f"{offset:#x}",
+        "pattern": pattern.pattern,
+        "skip_stack": not bool(a.get("stack")),
+        "scanned": scanned,
+        "sites": sites,
+        "truncated": len(sites) >= limit,
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
+
+
 def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
     p = _entry(a["binary"])["program"]
     q = (a.get("query") or "").lower()
@@ -4045,6 +4142,7 @@ HANDLERS = {
     "functions": cmd_functions,
     "decompile": cmd_decompile,
     "strings": cmd_strings,
+    "scan": cmd_scan,
     "imports": cmd_imports,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,

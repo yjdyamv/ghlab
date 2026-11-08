@@ -37,6 +37,15 @@ class ValidateTest(unittest.TestCase):
         self.assertIn("decompile", overview)
         self.assertIn("binary", overview["decompile"]["required"])
 
+    def test_scan_needs_an_offset_and_rejects_junk(self):
+        spec, params = protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54"})
+        self.assertEqual(spec.name, "scan")
+        self.assertEqual(params, {"binary": "a.exe", "offset": "0x54"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "scan", "binary": "a.exe"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54", "nope": 1})
+
 
 class EnvelopeTest(unittest.TestCase):
     def test_ok_roundtrip(self):

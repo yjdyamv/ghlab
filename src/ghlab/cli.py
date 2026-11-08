@@ -116,6 +116,21 @@ def fmt_imports(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_scan(r: dict[str, Any]) -> str:
+    out = [
+        f"== {r['binary']} : {r['scanned']} instruction(s) scanned for {r['pattern']} "
+        f"({r['elapsed_ms']}ms)"
+    ]
+    sites = r.get("sites") or []
+    if not sites:
+        out.append("   (no instruction touches this offset)")
+        return chr(10).join(out)
+    out.append(f"   {len(sites)} hit(s)" + ("  [truncated]" if r.get("truncated") else ""))
+    for s in sites:
+        out.append(f"   {s['addr']}  {s['function'] or '-':<24} {s['text']}")
+    return chr(10).join(out)
+
+
 def fmt_strings(r: dict[str, Any]) -> str:
     body = []
     for s in r.get("strings") or []:
@@ -661,6 +676,7 @@ FORMATTERS = {
     "functions": fmt_functions,
     "decompile": fmt_decompile,
     "strings": fmt_strings,
+    "scan": fmt_scan,
     "imports": fmt_imports,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
@@ -1063,24 +1079,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary", nargs="?", help="program name, e.g. notepad.exe")
     p.set_defaults(func=cmd_use)
 
-    p = sub.add_parser("strings", parents=[common], help="search string data")
+    p = sub.add_parser(
+        "scan", parents=[common], help="instructions that touch a struct field offset"
+    )
     p.add_argument("binary")
-    p.add_argument("-q", "--query", default=None)
-    p.add_argument("-n", "--limit", type=int, default=80)
-    p.add_argument("--offset", type=int, default=0, help="skip this many matches")
-    p.add_argument("--refs", action="store_true", help="show which functions use each string")
+    p.add_argument("offset", help="displacement, e.g. 0x54")
+    p.add_argument("--range", default=None, help="0xSTART-0xEND to limit the sweep")
+    p.add_argument("--func", dest="in_func", default=None, help="limit to one function")
+    p.add_argument("-n", "--limit", type=int, default=60)
+    p.add_argument("--op", default=None, help="regex on the mnemonic, e.g. ^MOV")
+    p.add_argument("--stack", action="store_true", help="also match [RSP]/[RBP] locals")
     p.set_defaults(
         func=lambda a: _call(
             a,
-            "strings",
+            "scan",
             {
                 "binary": a.binary,
-                "query": a.query,
-                "limit": a.limit,
                 "offset": a.offset,
-                "refs": a.refs,
+                "range": a.range,
+                "func": a.in_func,
+                "limit": a.limit,
+                "op": a.op,
+                "stack": a.stack,
             },
-        )
+        ),
     )
 
     p = sub.add_parser("xrefs", parents=[common], help="references to address/function")

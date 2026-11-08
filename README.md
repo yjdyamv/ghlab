@@ -274,6 +274,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
+| `scan` | `binary, offset` / `range, func, limit, op, stack` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）。实测 650 万条指令 38s |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit, format, out` | 调用树 BFS；`--format dot/mermaid/svg` 出图，`--out` 落盘（svg 是自绘的，无需 graphviz；dot 想再加工就交给 graphviz） |
@@ -308,6 +309,13 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。
 
+```bash
+# 结构体偏移 → 消费点：找出所有读写 PapProp.LineSpacing(+0x54) 的指令
+ghlab scan wpscore.dll 0x54 --op '^(MOVSS|MULSS|DIVSS|ADDSS|COMISS)' -n 60
+# 只看某个函数内部，且把栈变量也放进来
+ghlab scan sample.exe 0x18 --func decrypt_string --stack
+```
+
 ## 设计要点
 
 - **常驻 + 项目落盘**：`~/re/proj/ghlab` 是普通 Ghidra 项目，Ghidra GUI 也能打开看，两边结果一致。
@@ -324,6 +332,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **下钻要顺着“谁用了它”走**：`strings --refs` 和 `imports` 把“字符串/API → 函数”这一步做成一次调用。agent 最常做的动作是“找到用它的函数”，而不是“列出所有字符串”
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
 - **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
+- **位移搜索比类型更早可用**：没有类型信息时，"谁碰了 +0x54" 只能靠扫描指令里的 disp 得到（反编译文本里 float 字段常常被放进 XMM 参数，grep 不到）
 - **索引比命令更值钱**：每次调用都全扫是 agent 用不起的。`index` 把每个函数的事实（字符串、导入、被调函数、常量、大小、指令数、基本块数）落成一份 JSON，`find` 从 2.5s 降到 0.16s、`diff` 从 4.4s 降到 0.8s，`similar`/`campaign` 一并变快。失效判定是 `(md5, modification number)`：任何通过 ghlab 的写操作都会让它加一，旧索引不可能被当成新的；`note` 只写 JSON + 书签，不动程序事实，索引仍然有效。
 - **日志比记忆可靠**：所有写操作落 `.ghlab/journal.jsonl`，`overview` 直接显示每个程序的最后一次改动；agent 换会话后先 `journal` 再动手
 - **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。

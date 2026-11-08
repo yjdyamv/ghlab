@@ -635,6 +635,35 @@ class LiveTest(unittest.TestCase):
             with open(os.path.join(tmp, "report.md"), encoding="utf-8") as fh:
                 self.assertIn("Call-graph hubs", fh.read())
 
+    def test_scan_finds_displacements_in_one_function(self):
+        """scan: displacement search - the struct-field question decompilation cannot answer."""
+        scoped = client.call("scan", binary=BIN, offset="0x54", func="entry", limit=5)
+        self.assertEqual(scoped["offset"], "0x54")
+        self.assertGreater(scoped["scanned"], 0)
+        for site in scoped["sites"]:
+            self.assertIn("+ 0x54]", site["text"])
+            self.assertTrue(site["addr"])
+        wide = client.call("scan", binary=BIN, offset="0x10", limit=3)
+        self.assertGreater(wide["scanned"], 100)
+        self.assertLessEqual(len(wide["sites"]), 3)
+
+    def test_scan_range_covers_only_the_named_addresses(self):
+        """scan --range: an address window must actually be scanned.
+
+        Regression: the range path used AddressSet(lo, hi) and JPype picked a
+        different overload, so every range scan silently found nothing.
+        """
+        base = int(client.call("info", binary=BIN)["image_base"], 16)
+        lo, hi = base + 0x1000, base + 0x3000
+        win = client.call(
+            "scan", binary=BIN, offset="0x8", range=f"{lo:#x}-{hi:#x}", op="^MOV", limit=5
+        )
+        self.assertGreater(win["scanned"], 0)
+        for site in win["sites"]:
+            value = int(site["addr"], 16)
+            self.assertGreaterEqual(value, lo)
+            self.assertLessEqual(value, hi)
+
     def test_similar_does_not_equate_empty_stubs(self):
         r = client.call("similar", binary=BIN, target="FUN_140007e1c")
         for m in r["matches"]:

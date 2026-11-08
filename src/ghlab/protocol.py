@@ -93,6 +93,12 @@ _SPECS = [
         ("query", "limit", "offset", "refs"),
         "search string data (refs: which functions use it)",
     ),
+    Spec(
+        "scan",
+        ("binary", "offset"),
+        ("range", "func", "limit", "op", "stack"),
+        "instructions that touch a struct field offset (displacement search)",
+    ),
     Spec("xrefs", ("binary",), ("target", "targets"), "references to address/function"),
     Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),
     Spec("rename", ("binary", "target", "new"), summary="rename a function"),

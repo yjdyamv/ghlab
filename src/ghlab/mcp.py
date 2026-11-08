@@ -79,6 +79,27 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_scan",
+        "description": (
+            "Displacement search: which instructions read/write struct field +0xNN. Use it when "
+            "you know a struct layout but not its consumers (decompiled text grep misses XMM "
+            "operands). Filter by mnemonic with `op`, narrow with `func` or `range`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "offset": {"type": "string", "description": "field offset, e.g. '0x54'"},
+                "range": {"type": "string", "description": "0xSTART-0xEND to limit the sweep"},
+                "func": {"type": "string", "description": "only scan one function's body"},
+                "op": {"type": "string", "description": "regex on the mnemonic, e.g. '^MOVSS$'"},
+                "stack": {"type": "boolean", "description": "also report [RSP/RBP+..] locals"},
+                "limit": _LIMIT,
+            },
+            "required": ["binary", "offset"],
+        },
+    },
+    {
         "name": "ghlab_decompile",
         "description": (
             "Decompile one function, a name regex, or a batch; `grep` filters server-side and "
@@ -327,6 +348,7 @@ _COMMANDS = {
     "ghlab_digest": "digest",
     "ghlab_find": "find",
     "ghlab_imports": "imports",
+    "ghlab_scan": "scan",
     "ghlab_decompile": "decompile",
     "ghlab_diff": "diff",
     "ghlab_slice": "slice",
