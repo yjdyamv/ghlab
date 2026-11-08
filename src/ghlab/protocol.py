@@ -107,8 +107,14 @@ _SPECS = [
     Spec(
         "emulate",
         ("binary", "target"),
-        ("args", "max_insns", "ms", "dump", "buffer"),
+        ("args", "max_insns", "ms", "dump", "buffer", "seed"),
         "run one function on the P-code emulator: seeded args, tracked writes, return value",
+    ),
+    Spec(
+        "decrypt",
+        (),
+        ("binary", "addr", "len", "hex", "ciphers", "min_printable", "limit"),
+        "break a blob: xor/add/rot/utf16/base64 candidates ranked by printability",
     ),
     Spec(
         "patch",

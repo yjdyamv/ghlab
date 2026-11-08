@@ -89,6 +89,20 @@ class EnvelopeTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "map", "binary": "x", "selector": "all"})
 
+    def test_decrypt_needs_hex_or_a_binary(self):
+        _spec, params = protocol.validate({"cmd": "decrypt", "hex": "48 65 6c 6c 6f"})
+        self.assertEqual(params["hex"], "48 65 6c 6c 6f")
+        _spec, params = protocol.validate({"cmd": "decrypt", "binary": "x", "addr": "0x14000"})
+        self.assertEqual(params["binary"], "x")
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "decrypt", "cipher": "xor"})
+
+    def test_emulate_accepts_seeds(self):
+        _spec, params = protocol.validate(
+            {"cmd": "emulate", "binary": "x", "target": "f", "seed": ["0x140000000=4142"]}
+        )
+        self.assertEqual(params["seed"], ["0x140000000=4142"])
+
     def test_note_accepts_claims_and_verify_takes_ids(self):
         _spec, params = protocol.validate(
             {"cmd": "note", "binary": "x", "text": "t", "at": "entry", "assert": ["const=1"]}

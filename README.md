@@ -77,6 +77,13 @@ ghlab graph notepad.exe entry --direction called   # 调用者树
 ghlab emulate notepad.exe __security_check_cookie --arg 1
 ghlab emulate notepad.exe FUN_140007e1c --arg 1 --arg '"hello"' --buffer 64
 ghlab emulate notepad.exe decrypt_config --arg 0x140038600 --buffer 256 --ms 8000
+ghlab emulate notepad.exe check_license --seed '0x140039600=41424344' --dump '0x140039600:8'
+
+# 密文不知道算法：把常见廉价算法全试一遍，只留"像字符串"的候选
+ghlab decrypt --hex '322e2e2a6075753f2c3336743f223b372a363f74393537753b2a33752c6b'
+#   [xor 0x5a] printable 1.0 score 0.933
+#     http://evil.example.com/api/v1
+ghlab decrypt notepad.exe --addr 0x140039600 --len 64      # 直接从程序内存里取
 
 # 两个版本比功能差异（字符串/导入/常量/CFG 形状匹配，不靠地址对齐）
 ghlab import C:/samples/app_v1.exe && ghlab import C:/samples/app_v2.exe
@@ -189,7 +196,7 @@ otepad.exe, ...
 ghlab mcp          # stdio MCP server，转调本机 daemon
 ```
 
-只暴露 10 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+只暴露 15 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
 
 | 工具 | 干什么 |
 |---|---|
@@ -202,6 +209,8 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_cross_xref` | 全项目搜字符串，附引用者 |
 | `ghlab_similar` | 跨样本同构函数 |
 | `ghlab_note` / `ghlab_verify` / `ghlab_report` | 记结论（带断言） / 重算断言 / 出报告 |
+| `ghlab_decrypt` | 破小块密文（xor/add/rot/utf16/base64） |
+| `ghlab_map` / `ghlab_types` / `ghlab_pdb` | 批量扫函数 / 批量写类型 / 吃 PDB 符号 |
 
 还有资源：`ghlab://programs`（名字 + md5 + 架构 + 函数数）、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
 
@@ -242,7 +251,8 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `digest` | `binary` / `top, strings` | **一次性 triage**：入口链、按风险分组的导入、API 组合、字符串分类、调用图枢纽、函数大小分布（实测 notepad ≈450 token / 2.7s） |
 | `index` | `binary` / `refresh` | **持久索引**：一次全扫把每个函数的 strings/imports/callees/常量/大小写进 `<project>/.ghlab/index/<binary>.json`；`find`/`diff`/`similar`/`campaign` 都改读索引，`(md5, modification number)` 变了就自动重建 |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
-| `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因 |
+| `decrypt` | – / `binary, addr, len, hex, ciphers, min_printable, limit` | **破小块密文**：单字节 xor/add/sub、rol/ror、utf-16le、base64 全试一遍，只留"像字符串"的候选（要求至少一段 4 字母连写），按可打印度 + 字母数字占比 + 配置关键词打分排序。`--hex` 直接给密文，或给 `binary`+`--addr/--len` 从内存读 |
+| `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置） |
 | `diff` | `a, b` / `match, limit, min_score, detail` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`） |
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
@@ -259,7 +269,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 13 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 15 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。

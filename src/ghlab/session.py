@@ -1787,6 +1787,15 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     if buf_size:
         emu.writeMemory(space.getAddress(buf_addr), b"\x00" * buf_size)
     string_limit = buf_addr if buf_size else stack_top - 0x400
+    seeded_memory = []
+    for spec in a.get("seed") or []:
+        addr_text, _, hex_text = str(spec).partition("=")
+        offset = _hex_addr(addr_text)
+        if offset is None or not hex_text:
+            raise ValueError(f"bad seed {spec!r}; expected ADDR=HEXBYTES")
+        data = _hex_bytes(hex_text)
+        emu.writeMemory(space.getAddress(offset), data)
+        seeded_memory.append({"addr": hex(offset), "bytes": len(data)})
     words: list[int] = []
     seeded_strings: list[tuple[int, int]] = []
     arg_report = []
@@ -1951,8 +1960,164 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
         "writes": {"tracked": tracked_bytes, "ranges": writes},
         "dump": dumps,
         "buffer": {"addr": hex(buf_addr), "size": buf_size} if buf_size else None,
+        "seeded": seeded_memory,
         "fault": fault,
         "scratch": {"block": str(block.getName()), "base": hex(base), "sp": hex(sp)},
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+# ------------------------------------------------------------------- decrypt
+
+_PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
+_WHITESPACE = {chr(9), chr(10), chr(13)}
+_SKIP_BYTES = {0x20, 0x09, 0x0A, 0x0D, 0x00}
+_B64_ALPHABET = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_WORD_BONUS = (
+    "http",
+    chr(92),
+    ".exe",
+    ".dll",
+    ".com",
+    "software",
+    "microsoft",
+    "cmd.exe",
+    "password",
+    "token",
+    "config",
+    "temp",
+    "appdata",
+    "registry",
+    "currentversion",
+)
+
+
+def _decode_text(data: bytes) -> str:
+    """Decode bytes for display; cp1252 never fails, so every candidate is showable."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", "replace")
+
+
+def _printable_ratio(data: bytes) -> float:
+    if not data:
+        return 0.0
+    return sum(1 for b in data if b in _PRINTABLE) / len(data)
+
+
+_WORD_RUN = re.compile(r"[A-Za-z]{4,}")
+
+
+def _score_text(text: str) -> float:
+    """How much this looks like a real string: printable, wordy, and config-ish."""
+    if not text:
+        return 0.0
+    printable = sum(1 for ch in text if ch.isprintable() or ch in _WHITESPACE) / len(text)
+    alnum = sum(1 for ch in text if ch.isalnum() or ch in " _-.:") / len(text)
+    low = text.lower()
+    bonus = 0.05 * sum(1 for w in _WORD_BONUS if w in low)
+    return 0.4 * printable + 0.5 * alnum + bonus
+
+
+def _looks_like_text(text: str) -> bool:
+    """At least one 4+ letter run: separates real strings from xor noise."""
+    return _WORD_RUN.search(text) is not None
+
+
+def _rot(value: int, shift: int) -> int:
+    shift %= 8
+    return ((value << shift) | (value >> (8 - shift))) & 0xFF
+
+
+def _xor_repeat(data: bytes, key: bytes) -> bytes:
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+
+def _decrypt_candidates(
+    data: bytes, ciphers: list[str], min_printable: float
+) -> list[dict[str, Any]]:
+    """Try the cheap ciphers malware actually uses and keep what looks like text."""
+    out: list[dict[str, Any]] = []
+
+    def consider(cipher: str, key: str, raw: bytes) -> None:
+        text = _decode_text(raw)
+        ratio = _printable_ratio(raw)
+        score = _score_text(text)
+        if ratio < min_printable or score < min_printable:
+            return
+        if not _looks_like_text(text):
+            return
+        out.append(
+            {
+                "cipher": cipher,
+                "key": key,
+                "text": text.rstrip(chr(0)),
+                "printable": round(ratio, 3),
+                "score": round(score, 3),
+            }
+        )
+
+    if "xor" in ciphers:
+        for k in range(256):
+            consider("xor", hex(k), bytes(b ^ k for b in data))
+    if "add" in ciphers:
+        for k in range(256):
+            consider("sub", hex(k), bytes((b - k) & 0xFF for b in data))
+            consider("add", hex(k), bytes((b + k) & 0xFF for b in data))
+    if "rot" in ciphers:
+        for k in range(1, 8):
+            consider("rol", str(k), bytes(_rot(b, -k) for b in data))
+            consider("ror", str(k), bytes(_rot(b, k) for b in data))
+    if "utf16" in ciphers and len(data) % 2 == 0:
+        consider("utf16le", "-", data)
+    if "base64" in ciphers:
+        import base64
+
+        stripped = bytes(b for b in data if b not in _SKIP_BYTES)
+        if stripped and all(chr(b) in _B64_ALPHABET for b in stripped):
+            try:
+                raw = base64.b64decode(stripped + b"=" * (-len(stripped) % 4))
+            except ValueError:
+                raw = b""
+            if raw:
+                consider("base64", "-", raw)
+    out.sort(key=lambda r: (-r["score"], len(r["text"])))
+    return out
+
+
+def cmd_decrypt(a: dict[str, Any]) -> dict[str, Any]:
+    """Break a small blob: XOR/ADD/ROT/UTF-16/base64, ranked by how printable it is."""
+    started = time.time()
+    data = b""
+    source = ""
+    if a.get("hex"):
+        data = _hex_bytes(a["hex"])
+        source = "hex"
+    else:
+        if not a.get("binary"):
+            raise ValueError("decrypt needs hex=... or binary=... with addr=...")
+        entry = _entry(a["binary"])
+        program = entry["program"]
+        offset = _hex_addr(a.get("addr"))
+        if offset is None:
+            raise KeyError(f"address {a.get('addr')!r} not found")
+        size = int(a.get("len", 0) or 64)
+        if size <= 0 or size > 0x4000:
+            raise ValueError("len must be between 1 and 16384")
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        data = _read_memory(program, space.getAddress(offset), size)
+        source = f"{a['binary']}@{hex(offset)}"
+    ciphers = _as_list(a.get("ciphers")) or ["xor", "add", "rot", "utf16", "base64"]
+    min_printable = float(a.get("min_printable", 0.85))
+    limit = int(a.get("limit", 5))
+    found = _decrypt_candidates(data, ciphers, min_printable)[:limit]
+    return {
+        "source": source,
+        "size": len(data),
+        "hex": data.hex(),
+        "ciphers": ciphers,
+        "candidates": found,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
 
@@ -2017,6 +2182,17 @@ _TYPE_ALIASES = {
     "signed int": "int",
     "signed short": "short",
 }
+
+
+def _hex_bytes(text: str) -> bytes:
+    """Parse `90 90` / `0x90 0x90` / `9090` into bytes."""
+    raw = str(text).replace(" ", "").replace(",", "").replace("0x", "").replace(chr(92) + "x", "")
+    if not raw:
+        raise ValueError("empty hex string")
+    try:
+        return bytes.fromhex(raw)
+    except ValueError:
+        raise ValueError(f"expected hex bytes, got {text!r}") from None
 
 
 def _byte_array(data: bytes):
@@ -3272,6 +3448,7 @@ HANDLERS = {
     "graph": cmd_graph,
     "digest": cmd_digest,
     "find": cmd_find,
+    "decrypt": cmd_decrypt,
     "index": cmd_index,
     "diff": cmd_diff,
     "emulate": cmd_emulate,

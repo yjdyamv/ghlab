@@ -191,6 +191,29 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(len(buf), 1)
         self.assertEqual(buf[0]["size"], 32)
 
+    def test_emulate_can_preload_memory(self):
+        r = client.call(
+            "emulate",
+            binary=BIN,
+            target="__security_check_cookie",
+            args=[1],
+            seed=["0x140039600=41424344"],
+            dump=["0x140039600:8"],
+        )
+        self.assertEqual(r["seeded"][0]["bytes"], 4)
+        self.assertEqual(r["dump"][0]["hex"], "4142434400000000")
+
+    def test_decrypt_breaks_a_single_byte_xor(self):
+        plain = b"http://evil.example.com/api/v1"
+        blob = bytes(b ^ 0x5A for b in plain).hex()
+        r = client.call("decrypt", hex=blob)
+        self.assertEqual(r["candidates"][0]["text"], plain.decode())
+        self.assertEqual(r["candidates"][0]["key"], "0x5a")
+
+    def test_decrypt_reads_memory_of_a_program(self):
+        r = client.call("decrypt", binary=BIN, addr="0x140039600", len=32)
+        self.assertEqual(r["size"], 32)
+
     def test_emulate_rejects_unknown_function(self):
         with self.assertRaises(RemoteError) as ctx:
             client.call("emulate", binary=BIN, target="definitely_not_a_function")

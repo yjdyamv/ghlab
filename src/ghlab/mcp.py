@@ -236,6 +236,27 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_decrypt",
+        "description": (
+            "Break a small blob of ciphertext: tries single-byte xor/add/rot, utf-16 and base64, "
+            "keeps only candidates that look like real strings, and ranks them. Pass `hex` or a "
+            "`binary` plus `addr`/`len` to read it from program memory. Use this instead of "
+            "guessing keys or writing a script for a 20-byte blob."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "hex": {"type": "string", "description": "ciphertext as hex"},
+                "binary": _BIN,
+                "addr": {"type": "string", "description": "where the blob lives"},
+                "len": {"type": "integer", "description": "bytes to read, default 64"},
+                "ciphers": {"type": "array", "items": {"type": "string"}},
+                "min_printable": {"type": "number"},
+                "limit": _LIMIT,
+            },
+        },
+    },
+    {
         "name": "ghlab_types",
         "description": (
             "Bulk-apply external knowledge: a map file of `target = C declaration` pairs "
@@ -295,6 +316,7 @@ _COMMANDS = {
     "ghlab_map": "map",
     "ghlab_types": "types",
     "ghlab_pdb": "pdb",
+    "ghlab_decrypt": "decrypt",
     "ghlab_report": "report",
 }
 

@@ -157,6 +157,20 @@ def fmt_diff(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_decrypt(r: dict[str, Any]) -> str:
+    out = [
+        f"# {r['source']}  {r['size']} byte(s)  ciphers: {', '.join(r['ciphers'])}"
+        f"  ({r['elapsed_ms']}ms)",
+        f"   hex       {r['hex'][:96]}{'...' if len(r['hex']) > 96 else ''}",
+    ]
+    if not r.get("candidates"):
+        out.append("   no candidate passed the printability floor (try --min-printable 0.6)")
+    for c in r.get("candidates") or []:
+        out.append(f"   [{c['cipher']} {c['key']}] printable {c['printable']} score {c['score']}")
+        out.append(f"     {c['text']}")
+    return "\n".join(out)
+
+
 def fmt_emulate(r: dict[str, Any]) -> str:
     args = "  ".join(
         f"{a['kind']}:{a.get('value')}" + (f"@{a['addr']}" if a.get("addr") else "")
@@ -513,6 +527,7 @@ FORMATTERS = {
     "index": fmt_index,
     "diff": fmt_diff,
     "emulate": fmt_emulate,
+    "decrypt": fmt_decrypt,
     "patch": fmt_patch,
     "set_type": fmt_set_type,
     "bookmark": fmt_bookmark,
@@ -844,6 +859,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ADDR[:SIZE]",
         help="read this memory range back afterwards (repeatable)",
     )
+    p.add_argument(
+        "--seed",
+        dest="seed",
+        action="append",
+        default=[],
+        metavar="ADDR=HEX",
+        help="preload bytes into emulator memory before the run (repeatable)",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -856,6 +879,38 @@ def build_parser() -> argparse.ArgumentParser:
                 "ms": a.ms,
                 "dump": a.dump,
                 "buffer": a.buffer,
+                "seed": a.seed,
+            },
+        )
+    )
+
+    p = sub.add_parser("decrypt", parents=[common], help="break a small blob of ciphertext")
+    p.add_argument("binary", nargs="?", help="read the blob from this program's memory")
+    p.add_argument("--addr", help="address of the blob (with a binary)")
+    p.add_argument("--len", type=int, default=64, help="bytes to read (default 64)")
+    p.add_argument("--hex", help="ciphertext as hex, instead of reading memory")
+    p.add_argument(
+        "--ciphers",
+        dest="ciphers",
+        action="append",
+        default=[],
+        metavar="C",
+        help="repeatable: xor, add, rot, utf16, base64 (default all)",
+    )
+    p.add_argument("--min-printable", dest="min_printable", type=float, default=0.85)
+    p.add_argument("-n", "--limit", type=int, default=5)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "decrypt",
+            {
+                "binary": a.binary,
+                "addr": a.addr,
+                "len": a.len,
+                "hex": a.hex,
+                "ciphers": a.ciphers,
+                "min_printable": a.min_printable,
+                "limit": a.limit,
             },
         )
     )

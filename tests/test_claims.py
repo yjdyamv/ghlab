@@ -119,3 +119,33 @@ class StatusTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecryptTest(unittest.TestCase):
+    def test_single_byte_xor_is_recovered(self):
+        plain = b"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        blob = bytes(b ^ 0x5A for b in plain)
+        found = session._decrypt_candidates(blob, ["xor"], 0.85)
+        self.assertTrue(found)
+        top = found[0]
+        self.assertEqual(top["cipher"], "xor")
+        self.assertEqual(top["key"], hex(0x5A))
+        self.assertEqual(top["text"], plain.decode())
+
+    def test_add_and_sub_constants_are_recovered(self):
+        plain = b"cmd.exe /c whoami"
+        blob = bytes((b + 7) & 0xFF for b in plain)
+        found = session._decrypt_candidates(blob, ["add"], 0.85)
+        self.assertTrue(any(c["cipher"] == "sub" and c["text"] == plain.decode() for c in found))
+
+    def test_plain_text_is_its_own_xor_zero_candidate(self):
+        found = session._decrypt_candidates(b"plain text", ["xor"], 0.85)
+        self.assertTrue(any(c["key"] == "0x0" and c["text"] == "plain text" for c in found))
+
+    def test_noise_is_filtered_out(self):
+        blob = bytes([0x00, 0xFF] * 8)
+        self.assertEqual(session._decrypt_candidates(blob, ["xor"], 0.99), [])
+
+    def test_base64_candidate_is_decoded(self):
+        found = session._decrypt_candidates(b"aGVsbG8sIHdvcmxk", ["base64"], 0.85)
+        self.assertTrue(any(c["cipher"] == "base64" and "hello, world" in c["text"] for c in found))
