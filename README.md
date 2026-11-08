@@ -171,7 +171,16 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_similar` | 跨样本同构函数 |
 | `ghlab_note` / `ghlab_report` | 记结论 / 出报告 |
 
-还有资源：`ghlab://programs`、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
+还有资源：`ghlab://programs`（名字 + md5 + 架构 + 函数数）、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
+
+以及两个 **prompt 模板**，把"该怎么问"也一起给出去，客户端不用读文档就能起步：
+
+| prompt | 行为 |
+|---|---|
+| `triage(binary)` | 先把 `digest` 结果**渲染好人读格式**内联进去（实测 613 token），再附固定顺序的下一步：`find` → `slice` → `decompile`（先 grep）→ `note` → `report` |
+| `diff-review(a, b)` | 先把 `diff` 摘要内联（205 token），再要求逐函数判断"功能变化 vs 噪声（地址/常量/内联）"，怀疑是修复时点出漏洞类别 |
+
+prompt 里内联的是 CLI 的人读格式而不是 JSON——同一份 digest，JSON 美化后 5935 字符，人读格式 2453 字符。
 MCP 进程本身不起 JVM，客户端可以随时重启它；daemon 用 `ghlab start` 管着就行。
 
 pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用 tool_search 按需加载）：

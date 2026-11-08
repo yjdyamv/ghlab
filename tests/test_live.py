@@ -320,6 +320,14 @@ class LiveTest(unittest.TestCase):
                     "params": {"uri": f"ghlab://program/{BIN}/notes"},
                 }
             ),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "prompts/get",
+                    "params": {"name": "triage", "arguments": {"binary": BIN}},
+                }
+            ),
         ]
         payload = "".join(line + "\n" for line in lines)
         proc = subprocess.run(
@@ -332,12 +340,16 @@ class LiveTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         replies = {json.loads(line)["id"]: json.loads(line) for line in proc.stdout.splitlines() if line.strip()}
-        self.assertEqual(set(replies), {1, 2, 3, 4})
+        self.assertEqual(set(replies), {1, 2, 3, 4, 5})
         self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "ghlab")
         self.assertGreaterEqual(len(replies[2]["result"]["tools"]), 8)
         digest = json.loads(replies[3]["result"]["content"][0]["text"])
         self.assertIn("functions", digest)
         self.assertIn("notes", json.loads(replies[4]["result"]["content"][0]["text"]))
+        prompt = replies[5]["result"]["messages"][0]["content"]["text"]
+        self.assertIn(f"Digest for {BIN}", prompt)
+        self.assertIn("do not call ghlab_digest again", prompt)
+        self.assertLess(len(prompt), 20000, "the triage prompt must stay cheap")
 
     def test_run_script_against_the_daemon(self):
         script_text = "\n".join(["# smoke", "digest $BIN --top 2", "report $BIN > report.md", ""])

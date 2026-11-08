@@ -246,6 +246,27 @@ def call_tool(name: str, args: dict[str, Any], call: Callable[..., Any]) -> dict
         return _error(f"{name} failed: {type(ex).__name__}: {ex}")
 
 
+def programs(call: Callable[..., Any]) -> list[dict[str, Any]]:
+    """Program names plus the cheap facts a client wants before it asks anything."""
+    out: list[dict[str, Any]] = []
+    names = call("binaries").get("binaries") or []
+    for binfo in names:
+        name = binfo.get("name") if isinstance(binfo, dict) else str(binfo or "")
+        if not name:
+            continue
+        row: dict[str, Any] = {"name": name}
+        try:
+            info = call("info", binary=name)
+            row["md5"] = info.get("md5")
+            row["language"] = info.get("language")
+            row["compiler"] = info.get("compiler")
+            row["functions"] = info.get("functions")
+        except Exception:  # noqa: BLE001 - listing must survive a half-broken project
+            pass
+        out.append(row)
+    return out
+
+
 def _resource_uris(call: Callable[..., Any]) -> list[dict[str, str]]:
     out = [
         {"uri": "ghlab://programs", "name": "programs", "mimeType": "application/json"},
@@ -257,16 +278,18 @@ def _resource_uris(call: Callable[..., Any]) -> list[dict[str, str]]:
         },
     ]
     try:
-        for binfo in call("binaries").get("binaries", []):
-            name = binfo.get("name") if isinstance(binfo, dict) else str(binfo or "")
-            if not name:
-                continue
-            for kind in ("digest", "notes"):
+        for row in programs(call):
+            name = row["name"]
+            hint = ", ".join(
+                str(row[k]) for k in ("language", "functions") if row.get(k) not in (None, "")
+            )
+            for kind, what in (("digest", "one-shot triage"), ("notes", "recorded findings")):
                 out.append(
                     {
                         "uri": f"ghlab://program/{name}/{kind}",
                         "name": f"{name} {kind}",
                         "mimeType": "application/json",
+                        "description": f"{what} for {name}" + (f" ({hint})" if hint else ""),
                     }
                 )
     except Exception:  # noqa: BLE001 - resources are best effort
@@ -276,7 +299,7 @@ def _resource_uris(call: Callable[..., Any]) -> list[dict[str, str]]:
 
 def read_resource(uri: str, call: Callable[..., Any]) -> dict[str, Any]:
     if uri == "ghlab://programs":
-        return _text(call("binaries"))
+        return _text({"programs": programs(call)})
     if uri == "ghlab://protocol":
         return _text(call("ping"))
     parts = uri.removeprefix("ghlab://program/").split("/")
@@ -288,6 +311,95 @@ def read_resource(uri: str, call: Callable[..., Any]) -> dict[str, Any]:
     if kind == "notes":
         return _text(call("notes", binary=name))
     raise ValueError(f"unknown resource {uri!r}")
+
+
+PROMPTS: list[dict[str, Any]] = [
+    {
+        "name": "triage",
+        "description": (
+            "Triage a binary: the digest is fetched and inlined, followed by the next steps in "
+            "token order (find -> slice -> decompile -> note -> report)."
+        ),
+        "arguments": [{"name": "binary", "required": True, "description": _BIN["description"]}],
+    },
+    {
+        "name": "diff-review",
+        "description": "Explain what changed between two builds, with the diff already attached.",
+        "arguments": [
+            {"name": "a", "required": True, "description": "original program"},
+            {"name": "b", "required": True, "description": "changed program"},
+        ],
+    },
+]
+
+
+def _inline(call: Callable[..., Any], cmd: str, formatter: str = "", **params: Any) -> str:
+    """Render a daemon answer for a prompt.
+
+    Human formatters are preferred: the CLI's digest is ~450 tokens, while the same
+    payload pretty-printed as JSON is four times that.
+    """
+    try:
+        result = call(cmd, **params)
+    except Exception as ex:  # noqa: BLE001
+        return f"(daemon could not answer {cmd}: {type(ex).__name__}: {ex})"
+    if formatter:
+        try:
+            from . import cli
+
+            return str(getattr(cli, formatter)(result))
+        except Exception:  # noqa: BLE001 - fall through to raw JSON
+            pass
+    return json.dumps(result, ensure_ascii=False)
+
+
+def get_prompt(name: str, args: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any]:
+    """Prompt templates exist so a client can start correctly without reading docs."""
+    args = args or {}
+    if name == "triage":
+        binary = str(args.get("binary") or "").strip()
+        if not binary:
+            raise ValueError("the triage prompt needs a `binary` argument")
+        lines = [
+            f"Triage {binary}. Weigh behaviour over strings; say `unknown` rather than guess.",
+            "",
+            f"Digest for {binary}, already fetched - do not call ghlab_digest again:",
+            "```",
+            _inline(call, "digest", "fmt_digest", binary=binary),
+            "```",
+            "",
+            "Work in this order and stop as soon as the question is answered:",
+            "1. ghlab_find on the imports that matter (persistence, network, crypto, injection).",
+            "2. ghlab_slice from those imports to check they are reachable from entry.",
+            "3. ghlab_decompile only the functions the two steps surfaced; try `grep` before whole bodies.",
+            "4. Persist reusable conclusions with ghlab_note (tag: c2 / crypto / loader / anti).",
+            "5. Finish with ghlab_report and cite note ids as evidence.",
+        ]
+        return {
+            "description": f"triage {binary}",
+            "messages": [{"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}],
+        }
+    if name == "diff-review":
+        a, b = str(args.get("a") or ""), str(args.get("b") or "")
+        if not a or not b:
+            raise ValueError("the diff-review prompt needs `a` and `b` arguments")
+        lines = [
+            f"Explain what changed between {a} (before) and {b} (after).",
+            "",
+            "Diff already computed - do not call ghlab_diff again:",
+            "```",
+            _inline(call, "diff", "fmt_diff", a=a, b=b, limit=5),
+            "```",
+            "",
+            "Then: decompile the changed functions on both sides (same names usually survive),",
+            "say which change is functional and which is noise (addresses, constants, inlining),",
+            "and if this looks like a security fix, name the bug class and the guard that was added.",
+        ]
+        return {
+            "description": f"diff {a} -> {b}",
+            "messages": [{"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}],
+        }
+    raise ValueError(f"unknown prompt {name!r}")
 
 
 def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | None:
@@ -310,7 +422,11 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
         return ok(
             {
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {"tools": {"listChanged": False}, "resources": {"subscribe": False}},
+                "capabilities": {
+                    "tools": {"listChanged": False},
+                    "resources": {"subscribe": False},
+                    "prompts": {"listChanged": False},
+                },
                 "serverInfo": {"name": "ghlab", "version": __version__},
                 "instructions": (
                     "Ghidra-backed RE tools. Start with ghlab_digest, then narrow with ghlab_find / "
@@ -327,6 +443,13 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
         return ok(call_tool(name, params.get("arguments") or {}, call))
     if method == "resources/list":
         return ok({"resources": _resource_uris(call)})
+    if method == "prompts/list":
+        return ok({"prompts": PROMPTS})
+    if method == "prompts/get":
+        try:
+            return ok(get_prompt(str(params.get("name") or ""), params.get("arguments") or {}, call))
+        except Exception as ex:  # noqa: BLE001
+            return fail(-32000, f"{type(ex).__name__}: {ex}")
     if method == "resources/read":
         try:
             return ok(read_resource(str(params.get("uri") or ""), call))

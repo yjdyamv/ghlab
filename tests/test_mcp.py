@@ -11,15 +11,18 @@ from ghlab.client import RemoteError
 class Fake:
     """Stands in for Client: records what the tools ask the daemon for."""
 
-    def __init__(self, result=None, error=None):
+    def __init__(self, result=None, error=None, routes=None):
         self.calls = []
         self.result = {"ok": True} if result is None else result
         self.error = error
+        self.routes = routes or {}
 
     def __call__(self, cmd, **params):
         self.calls.append((cmd, params))
         if self.error is not None:
             raise self.error
+        if cmd in self.routes:
+            return self.routes[cmd]
         return self.result
 
 
@@ -184,6 +187,86 @@ class StdioTest(unittest.TestCase):
         replies = [json.loads(line) for line in out.getvalue().splitlines()]
         self.assertEqual([r["id"] for r in replies], [1, 2, None])
         self.assertEqual(replies[2]["error"]["code"], -32700)
+
+class PromptTest(unittest.TestCase):
+    def test_prompts_list(self):
+        reply = mcp.handle({"jsonrpc": "2.0", "id": 20, "method": "prompts/list"}, Fake())
+        prompts = {p["name"]: p for p in reply["result"]["prompts"]}
+        self.assertEqual(set(prompts), {"triage", "diff-review"})
+        self.assertTrue(prompts["triage"]["arguments"][0]["required"])
+
+    def test_triage_prompt_inlines_the_digest_so_no_second_call_is_needed(self):
+        fake = Fake(routes={"digest": {"binary": "a.exe", "functions": 7, "md5": "deadbeef"}})
+        reply = mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 21,
+                "method": "prompts/get",
+                "params": {"name": "triage", "arguments": {"binary": "a.exe"}},
+            },
+            fake,
+        )
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertEqual(fake.calls, [("digest", {"binary": "a.exe"})])
+        self.assertIn("do not call ghlab_digest again", text)
+        self.assertIn("ghlab_find", text)
+        self.assertLess(len(text), 20000)
+
+    def test_diff_prompt_inlines_the_diff(self):
+        fake = Fake(routes={"diff": {"a": "x", "b": "y", "summary": {"matched": 3}}})
+        reply = mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 22,
+                "method": "prompts/get",
+                "params": {"name": "diff-review", "arguments": {"a": "x", "b": "y"}},
+            },
+            fake,
+        )
+        self.assertIn("do not call ghlab_diff again", reply["result"]["messages"][0]["content"]["text"])
+
+    def test_prompt_errors_are_reported_not_crashed(self):
+        for params in (
+            {"name": "triage", "arguments": {}},
+            {"name": "diff-review", "arguments": {"a": "x"}},
+            {"name": "nope", "arguments": {}},
+        ):
+            reply = mcp.handle({"jsonrpc": "2.0", "id": 23, "method": "prompts/get", "params": params}, Fake())
+            self.assertEqual(reply["error"]["code"], -32000, params)
+
+    def test_prompt_survives_a_dead_daemon(self):
+        reply = mcp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 24,
+                "method": "prompts/get",
+                "params": {"name": "triage", "arguments": {"binary": "a.exe"}},
+            },
+            Fake(error=RemoteError("down")),
+        )
+        text = reply["result"]["messages"][0]["content"]["text"]
+        self.assertIn("could not answer digest", text)
+        self.assertIn("ghlab_find", text)
+
+
+class ProgramResourceTest(unittest.TestCase):
+    def test_programs_resource_merges_info(self):
+        fake = Fake(
+            routes={"binaries": {"binaries": ["a.exe"]}, "info": {"md5": "abc", "functions": 12, "language": "x86:LE:64:default"}}
+        )
+        reply = mcp.handle(
+            {"jsonrpc": "2.0", "id": 25, "method": "resources/read", "params": {"uri": "ghlab://programs"}},
+            fake,
+        )
+        programs = json.loads(reply["result"]["content"][0]["text"])["programs"]
+        self.assertEqual(programs, [{"name": "a.exe", "md5": "abc", "language": "x86:LE:64:default", "compiler": None, "functions": 12}])
+
+    def test_program_resources_describe_themselves(self):
+        fake = Fake(routes={"binaries": {"binaries": ["a.exe"]}, "info": {"functions": 12, "language": "x86:LE:64:default"}})
+        reply = mcp.handle({"jsonrpc": "2.0", "id": 26, "method": "resources/list"}, fake)
+        described = [r for r in reply["result"]["resources"] if r["uri"] == "ghlab://program/a.exe/digest"][0]
+        self.assertIn("one-shot triage", described["description"])
+        self.assertIn("12", described["description"])
 
 
 if __name__ == "__main__":
