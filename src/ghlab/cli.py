@@ -332,6 +332,57 @@ def fmt_report(r: dict[str, Any]) -> str:
     return r["markdown"].rstrip("\n")
 
 
+def fmt_cross_xref(r: dict[str, Any]) -> str:
+    if not r["binaries"]:
+        return f"(no match for {r['query']!r} in {r['searched']} program(s))"
+    out = [f"{r['query']} -> {len(r['binaries'])} program(s) of {r['searched']} searched"]
+    for b in r["binaries"]:
+        if b.get("error"):
+            out.append(f"  {b['binary']}: {b['error']}")
+            continue
+        out.append(f"  {b['binary']}: {b['count']} hit(s)")
+        for m in b["matches"][:6]:
+            users = ", ".join(str(x.get("function") or x.get("from")) for x in m["refs"][:3]) or "-"
+            out.append(f"    {m['addr']}  {m['value'][:70]}")
+            out.append(f"      used by: {users}")
+    return "\n".join(out)
+
+
+def fmt_slice(r: dict[str, Any]) -> str:
+    if not r["paths"]:
+        return f"(nothing calls {r['to']!r})"
+    out = []
+    for p in r["paths"]:
+        tag = "reaches entry" if p["reaches_entry"] else "no entry path"
+        out.append(f"{p['function']} @ {p['addr']}  via {p['via']}  [{tag}]")
+        if p["path"]:
+            out.append("  " + " <- ".join(f"{s['name']}" for s in reversed(p["path"])))
+        if p.get("code"):
+            out.append("")
+            out.append(p["code"])
+    return "\n".join(out)
+
+
+def fmt_similar(r: dict[str, Any]) -> str:
+    head = f"{r['target']} @ {r['addr']}  ({r['strings']} strings, {r['imports']} imports)"
+    if not r["matches"]:
+        return f"{head}\n(no match above threshold in {r['compared']} program(s))"
+    out = [head]
+    for m in r["matches"]:
+        if m.get("error"):
+            out.append(f"  {m['binary']}: {m['error']}")
+            continue
+        out.append(f"  {m['score']:.2f}  {m['binary']}:{m['name']} @ {m['addr']} ({m['size']}b)")
+        extra = []
+        if m["shared_strings"]:
+            extra.append("str: " + ", ".join(str(s)[:30] for s in m["shared_strings"]))
+        if m["shared_imports"]:
+            extra.append("imp: " + ", ".join(m["shared_imports"]))
+        if extra:
+            out.append("        " + " | ".join(extra))
+    return "\n".join(out)
+
+
 FORMATTERS = {
     "binaries": fmt_binaries,
     "info": fmt_info,
@@ -350,6 +401,9 @@ FORMATTERS = {
     "note": fmt_note,
     "notes": fmt_notes,
     "report": fmt_report,
+    "cross_xref": fmt_cross_xref,
+    "slice": fmt_slice,
+    "similar": fmt_similar,
 }
 
 
@@ -522,6 +576,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-g", "--grep", default=None, help="keep only lines matching this regex")
     p.add_argument("-n", "--limit", type=int, default=25, help="max functions")
     p.add_argument("--max-lines", type=int, default=0)
+    p.add_argument("--refresh", action="store_true", help="ignore the decompiler cache")
     p.add_argument("--code", action="store_true", help="include full source even when grepping")
     p.add_argument("--callees", action="store_true")
     p.add_argument("--callers", action="store_true")
@@ -791,6 +846,58 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("--top", type=int, default=6, help="call-graph hubs to include")
     p.set_defaults(func=lambda a: _call(a, "report", {"binary": a.binary, "top": a.top}))
+
+    p = sub.add_parser("cross-xref", parents=[common], help="search a string/import across all programs")
+    p.add_argument("query", help="regex over string data")
+    p.add_argument("--binary", help="restrict to one program")
+    p.add_argument("-n", "--limit", type=int, default=20)
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "cross_xref", {"query": a.query, "binary": a.binary, "limit": a.limit}
+        )
+    )
+
+    p = sub.add_parser("slice", parents=[common], help="shortest call path that reaches an import")
+    p.add_argument("binary")
+    p.add_argument("to", help="import or function name (regex)")
+    p.add_argument("--from", help="stop at a caller matching this (default entry/main/WinMain/DllMain)")
+    p.add_argument("-d", "--depth", type=int, default=12)
+    p.add_argument("-n", "--limit", type=int, default=4)
+    p.add_argument("--code", action="store_true", help="include the caller's decompiled body")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "slice",
+            {
+                "binary": a.binary,
+                "to": a.to,
+                "from": getattr(a, "from"),
+                "depth": a.depth,
+                "limit": a.limit,
+                "code": a.code or None,
+            },
+        )
+    )
+
+    p = sub.add_parser("similar", parents=[common], help="find the same logic in other programs")
+    p.add_argument("binary")
+    p.add_argument("target")
+    p.add_argument("--against", help="compare against one program instead of all others")
+    p.add_argument("-n", "--limit", type=int, default=10)
+    p.add_argument("--min-score", type=float, default=0.4)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "similar",
+            {
+                "binary": a.binary,
+                "target": a.target,
+                "against": a.against,
+                "limit": a.limit,
+                "min_score": a.min_score,
+            },
+        )
+    )
     return ap
 
 

@@ -80,6 +80,22 @@ class EnvelopeTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "find", "binary": "a.exe", "name": "x"})
 
+    def test_cross_binary_commands_validate(self):
+        for cmd, params in (
+            ("cross_xref", {"query": "example.com"}),
+            ("slice", {"binary": "a.exe", "to": "CreateProcessW"}),
+            ("similar", {"binary": "a.exe", "target": "entry"}),
+        ):
+            spec, got = protocol.validate({"cmd": cmd, **params})
+            self.assertEqual(spec.name, cmd)
+            self.assertEqual(got, params)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "cross_xref"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "slice", "binary": "a.exe"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "decompile", "binary": "a.exe", "cached": True})
+
 
 if __name__ == "__main__":
     unittest.main()

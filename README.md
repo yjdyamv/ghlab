@@ -96,6 +96,11 @@ ghlab bookmark notepad.exe --target __security_check_cookie --category security 
 ghlab note notepad.exe 'entry 只做 CRT 初始化' --at entry --tag bootstrap
 ghlab notes notepad.exe --tag bootstrap
 ghlab report notepad.exe > notepad.md
+
+# 跨程序：哪个样本也连这个域名？这个 API 是由哪条路径走到的？这段逻辑在别的样本里叫什么？
+ghlab cross-xref 'autosave'                       # 全项目搜字符串，附"谁在用"
+ghlab slice notepad.exe RegSetValueExW            # 从入口到该导入的最短调用链
+ghlab similar notepad.exe FUN_140021ba8 --against other.exe
 ```
 
 任何命令加 `--json` 得到原始结构；`GHLAB_URL=http://host:port` 可指向远端 daemon。
@@ -115,7 +120,7 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `import` | `path` / `analyze` | 导入并分析 |
 | `info` | `binary` | 语言、基址、MD5、函数数、段 |
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |
-| `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout` | 单个 / 批量 / 服务端 grep |
+| `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache`，热查询 2.5s → 0.19s，`--refresh` 强制重算 |
 | `strings` | `binary` / `query, limit, offset` | 字符串数据搜索 |
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
@@ -131,6 +136,9 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
 | `note` | `binary, text` / `at, tag` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
+| `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
+| `slice` | `binary, to` / `from, depth, limit, code` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译 |
+| `similar` | `binary, target` / `against, limit, min_score` | **跨程序同构函数**：字符串/导入/常量/大小四路指纹打分；零特征的 thunk 一律压到 0.3 以下，避免 stub 互相当成 1.00 |
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
@@ -145,6 +153,8 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 - **协议自描述**：`GET /` 返回全部命令及其参数，agent 可自举。
 - **模拟执行是"够用主义"**：`EmulatorHelper` 在独立内存里跑，写入不落回 program；外部导入用 Python 应答（CRT 真的有语义，其余返回 0），`lock` 等未实现的 p-code op 直接跳过并在输出里点名。所以它适合解密循环、配置解析、返回值推演，不适合依赖真实 API 语义的逻辑。
 - **diff 不假设地址对齐**：指纹是"这个函数引用了哪些字符串/调用了哪些导入/用了哪些常量/多大/多少块"，匹配时先找签名唯一的，再退同地址（同基址补丁）、同名（有符号）、最后相似度贪心（阈值 `--min-score`）。所以既能比同源补丁，也能比隔了几个版本的构建。
+- **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
+- **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
 
 ## 开发

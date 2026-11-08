@@ -69,6 +69,7 @@ _SPECS = [
             "include_callers",
             "include_code",
             "timeout",
+            "refresh",
         ),
         "decompile one/many functions, optionally filtered server-side",
     ),
@@ -137,6 +138,24 @@ _SPECS = [
         ("binary",),
         ("top",),
         "markdown report: digest + findings",
+    ),
+    Spec(
+        "cross_xref",
+        ("query",),
+        ("binary", "limit"),
+        "search a string/import across every program in the project",
+    ),
+    Spec(
+        "slice",
+        ("binary", "to"),
+        ("from", "depth", "limit", "code"),
+        "shortest call path that reaches an import or function",
+    ),
+    Spec(
+        "similar",
+        ("binary", "target"),
+        ("against", "limit", "min_score"),
+        "rank functions of another program by fingerprint similarity",
     ),
 ]
 SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}

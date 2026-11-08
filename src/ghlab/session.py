@@ -247,6 +247,68 @@ def _grep_code(code: str, pattern: re.Pattern[str]) -> list[dict[str, Any]]:
     return hits
 
 
+# ------------------------------------------------------- decompiler disk cache
+
+
+def _cache_dir() -> Path:
+    base = _project_dir or (Path.home() / "re" / "proj")
+    d = Path(base) / ".ghlab" / "cache"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _entry_comments(program, entry) -> str:
+    from ghidra.program.model.listing import CommentType
+
+    listing = program.getListing()
+    parts = []
+    for ctype in (CommentType.PLATE, CommentType.PRE, CommentType.POST, CommentType.EOL):
+        try:
+            parts.append(str(listing.getComment(ctype, entry) or ""))
+        except Exception:  # noqa: BLE001
+            parts.append("")
+    return "|".join(parts)
+
+
+def _decomp_cache_key(e, fn) -> str:
+    """Program md5 + address + prototype + comments.
+
+    Names are deliberately out of the key (renames keep the cache warm), but the
+    prototype is in it (types change the emitted C) and so are comments (they are
+    printed into the output). Instruction bytes are *not* in the key: the first
+    decompile of a function rewrites code units, so a hash taken before the call
+    would never match the one taken after it. Use `--refresh` after patching.
+    """
+    program = e["program"]
+    h = hashlib.sha1()
+    for part in (
+        str(program.getExecutableMD5()),
+        str(fn.getEntryPoint()),
+        _prototype(fn),
+        _entry_comments(program, fn.getEntryPoint()),
+    ):
+        h.update(part.encode("utf-8", "replace"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _cache_read(key: str) -> str | None:
+    path = _cache_dir() / (key + ".c")
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _cache_write(key: str, code: str) -> None:
+    try:
+        (_cache_dir() / (key + ".c")).write_text(code, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
     """Decompile a single target, an explicit list, or every function matching `match`.
 
@@ -281,13 +343,20 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
             if fn is None:
                 results.append({"target": str(t), "error": "function not found"})
                 continue
-            res = e["decomp"].decompileFunction(fn, timeout, MONITOR)
-            if not res.decompileCompleted():
-                results.append({"target": str(t), "error": str(res.getErrorMessage())})
-                continue
-            code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
+            key = None if a.get("refresh") else _decomp_cache_key(e, fn)
+            code = _cache_read(key) if key else None
+            cached = code is not None
+            if code is None:
+                res = e["decomp"].decompileFunction(fn, timeout, MONITOR)
+                if not res.decompileCompleted():
+                    results.append({"target": str(t), "error": str(res.getErrorMessage())})
+                    continue
+                code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
+                if key:
+                    _cache_write(key, code)
             all_lines = code.splitlines()
             item = brief(fn)
+            item["cached"] = cached
             item["lines"] = len(all_lines)
             item["signature"] = next(
                 (ln.strip() for ln in all_lines if ln.strip().endswith(")")), ""
@@ -2132,6 +2201,218 @@ def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
     return {"markdown": markdown, "notes": len(notes), "binary": binary}
 
 
+def cmd_cross_xref(a: dict[str, Any]) -> dict[str, Any]:
+    """Search a string/import across every program in the project.
+
+    Answers "which of my samples also talks to this host / imports this API"
+    without opening them one by one.
+    """
+    pat = re.compile(str(a["query"]), re.I)
+    limit = int(a.get("limit", 20))
+    bins = [str(a["binary"])] if a.get("binary") else binary_names()
+    out = []
+    for b in bins:
+        try:
+            e = _entry(b)
+        except Exception as ex:  # noqa: BLE001
+            out.append({"binary": b, "error": f"{type(ex).__name__}: {ex}"})
+            continue
+        program = e["program"]
+        fm = program.getFunctionManager()
+        rm = program.getReferenceManager()
+        hits = []
+        scanned = 0
+        errors = 0
+        it = program.getListing().getDefinedData(True)
+        while it.hasNext() and len(hits) < limit:
+            scanned += 1
+            d = it.next()
+            try:
+                if not _is_string_data(d):
+                    continue
+                value = _string_value(d)
+            except Exception:  # noqa: BLE001
+                errors += 1
+                continue
+            if not value or not pat.search(value):
+                continue
+            refs = []
+            for ref in rm.getReferencesTo(d.getAddress()):
+                frm = ref.getFromAddress()
+                fn = fm.getFunctionContaining(frm)
+                refs.append({"from": str(frm), "function": str(fn.getName()) if fn else None})
+            hits.append({"addr": str(d.getAddress()), "value": value[:120], "refs": refs[:6]})
+        if hits:
+            out.append(
+                {"binary": b, "matches": hits, "count": len(hits), "scanned": scanned, "errors": errors}
+            )
+    return {"query": a["query"], "searched": len(bins), "binaries": out}
+
+
+def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
+    """Shortest caller chain that reaches an import (or a named function).
+
+    Reverse BFS from every function that touches `to`, stopping when a function
+    matches `from` (entry/main/WinMain/DllMain by default). This answers "what
+    has to run for this API to be called" without reading 800 functions.
+    """
+    e = _entry(a["binary"])
+    p = e["program"]
+    fm = p.getFunctionManager()
+    to_pat = re.compile(str(a["to"]), re.I)
+    from_pat = re.compile(
+        str(a.get("from") or r"^(entry|main|wmain|winmain|wwinmain|dllmain|_start|maincrtstartup)$"),
+        re.I,
+    )
+    depth = int(a.get("depth", 12))
+    limit = int(a.get("limit", 4))
+
+    def matching_callee(fn) -> str | None:
+        try:
+            for callee in fn.getCalledFunctions(MONITOR):
+                if to_pat.search(str(callee.getName())):
+                    return str(callee.getName())
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def callers(fn) -> list[Any]:
+        try:
+            return [c for c in fn.getCallingFunctions(MONITOR) if not c.isExternal() and not c.isThunk()]
+        except Exception:  # noqa: BLE001
+            return []
+
+    roots: list[tuple[Any, str]] = []
+    it = fm.getFunctions(True)
+    while it.hasNext() and len(roots) < limit * 4:
+        fn = it.next()
+        try:
+            if fn.isExternal() or fn.isThunk():
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        name = str(fn.getName())
+        if to_pat.search(name):
+            roots.append((fn, name))
+            continue
+        callee = matching_callee(fn)
+        if callee:
+            roots.append((fn, callee))
+
+    found_paths = []
+    for fn, why in roots[:limit]:
+        prev: dict[str, Any] = {}
+        seen = {str(fn.getEntryPoint())}
+        frontier = [fn]
+        found = None
+        for _ in range(depth):
+            if not frontier:
+                break
+            nxt = []
+            for cur in frontier:
+                if from_pat.search(str(cur.getName())):
+                    found = cur
+                    break
+                for c in callers(cur):
+                    key = str(c.getEntryPoint())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    prev[key] = cur
+                    nxt.append(c)
+            if found is not None:
+                break
+            frontier = nxt
+        chain: list[dict[str, str]] = []
+        if found is not None:
+            cur = found
+            while True:
+                chain.append({"name": str(cur.getName()), "addr": str(cur.getEntryPoint())})
+                key = str(cur.getEntryPoint())
+                if key not in prev:
+                    break
+                cur = prev[key]
+        entry_item = {
+            "function": str(fn.getName()),
+            "addr": str(fn.getEntryPoint()),
+            "via": why,
+            "reaches_entry": found is not None,
+            "path": list(reversed(chain)),
+            "depth": len(chain),
+        }
+        if a.get("code"):
+            try:
+                res = e["decomp"].decompileFunction(fn, 60, MONITOR)
+                if res.decompileCompleted():
+                    code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
+                    entry_item["code"] = "\n".join(code.splitlines()[:60])
+            except Exception:  # noqa: BLE001
+                pass
+        found_paths.append(entry_item)
+    found_paths.sort(key=lambda x: (not x["reaches_entry"], x["depth"] or 999))
+    return {"binary": a["binary"], "to": a["to"], "candidates": len(roots), "paths": found_paths}
+
+
+def cmd_similar(a: dict[str, Any]) -> dict[str, Any]:
+    """Rank functions of another program by fingerprint similarity to `target`.
+
+    Uses the same fingerprints as `diff` (strings, imports, constants, size), so
+    "I saw this in sample A, where is it in sample B" works without symbols.
+    """
+    from ghidra.program.model.block import BasicBlockModel
+
+    e = _entry(a["binary"])
+    fn = _function(e, a["target"])
+    if fn is None:
+        raise KeyError(f"function {a['target']!r} not found")
+    mine = _fingerprint(e["program"], fn, BasicBlockModel(e["program"]))
+    min_score = float(a.get("min_score", 0.4))
+    limit = int(a.get("limit", 10))
+    bins = [str(a["against"])] if a.get("against") else [
+        b for b in binary_names() if b != str(a["binary"])
+    ]
+    hits: list[dict[str, Any]] = []
+    for b in bins:
+        try:
+            prints = _program_fingerprints(b)
+        except Exception as ex:  # noqa: BLE001
+            hits.append({"binary": b, "error": f"{type(ex).__name__}: {ex}"})
+            continue
+        for fp in prints["functions"].values():
+            shared_str = mine["strings"] & fp["strings"]
+            shared_imp = mine["imports"] & fp["imports"]
+            shared_con = mine["consts"] & fp["consts"]
+            score = _similarity(mine, fp)
+            if not (shared_str or shared_imp or shared_con):
+                # nothing but size/instruction shape in common: 29-byte stubs
+                # all look alike, so cap these below any sensible threshold
+                score = min(score, 0.3)
+            if score < min_score:
+                continue
+            hits.append(
+                {
+                    "binary": b,
+                    "name": fp["name"],
+                    "addr": fp["addr"],
+                    "score": round(score, 3),
+                    "size": fp["size"],
+                    "insns": fp["insns"],
+                    "shared_strings": sorted(shared_str)[:3],
+                    "shared_imports": sorted(shared_imp)[:4],
+                }
+            )
+    hits.sort(key=lambda h: h.get("score", 0), reverse=True)
+    return {
+        "binary": a["binary"],
+        "target": mine["name"],
+        "addr": mine["addr"],
+        "strings": len(mine["strings"]),
+        "imports": len(mine["imports"]),
+        "compared": len(bins),
+        "matches": hits[:limit],
+    }
+
+
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
     with LOCK:
         return HANDLERS[cmd](params)
@@ -2160,4 +2441,7 @@ HANDLERS = {
     "note": cmd_note,
     "notes": cmd_notes,
     "report": cmd_report,
+    "cross_xref": cmd_cross_xref,
+    "slice": cmd_slice,
+    "similar": cmd_similar,
 }

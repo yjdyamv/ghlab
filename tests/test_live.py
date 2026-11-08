@@ -251,6 +251,44 @@ class LiveTest(unittest.TestCase):
         self.assertIn(text, report)
         self.assertIn("Call-graph hubs", report)
 
+    def test_decompile_cache_round_trip(self):
+        cold = client.call("decompile", binary=BIN, target="FUN_140007e1c", refresh=True)
+        warm = client.call("decompile", binary=BIN, target="FUN_140007e1c")
+        self.assertFalse(cold["results"][0]["cached"])
+        self.assertTrue(warm["results"][0]["cached"])
+        self.assertEqual(cold["results"][0]["code"], warm["results"][0]["code"])
+
+    def test_cross_xref_finds_strings_in_every_program(self):
+        r = client.call("cross_xref", query="Autosave")
+        self.assertGreaterEqual(r["searched"], 1)
+        self.assertTrue(r["binaries"])
+        for b in r["binaries"]:
+            self.assertGreater(b["count"], 0)
+            self.assertTrue(b["matches"][0]["refs"])
+            self.assertTrue(b["matches"][0]["value"])
+
+    def test_slice_reaches_entry(self):
+        r = client.call("slice", binary=BIN, to="RegSetValueExW")
+        self.assertTrue(r["paths"])
+        self.assertTrue(any(p["reaches_entry"] for p in r["paths"]))
+        self.assertIn("RegSetValueExW", r["paths"][0]["via"])
+        reach = [p for p in r["paths"] if p["reaches_entry"]][0]
+        self.assertGreater(len(reach["path"]), 1)
+
+    def test_similar_finds_the_same_function_elsewhere(self):
+        r = client.call("similar", binary=BIN, target="FUN_140021ba8")
+        if not r["matches"]:
+            self.skipTest("only one program in the project")
+        best = r["matches"][0]
+        self.assertEqual(best["name"], "FUN_140021ba8")
+        self.assertGreater(best["score"], 0.9)
+        self.assertTrue(best["shared_imports"] or best["shared_strings"])
+
+    def test_similar_does_not_equate_empty_stubs(self):
+        r = client.call("similar", binary=BIN, target="FUN_140007e1c")
+        for m in r["matches"]:
+            self.assertTrue(m["shared_strings"] or m["shared_imports"] or m["score"] <= 0.3)
+
 
 @unittest.skipUnless(LIVE and os.environ.get("GHLAB_LIVE_IMPORT"), "set GHLAB_LIVE_IMPORT=1")
 class LiveImportTest(unittest.TestCase):
