@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +101,69 @@ def fmt_graph(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_emulate(r: dict[str, Any]) -> str:
+    args = "  ".join(
+        f"{a['kind']}:{a.get('value')}" + (f"@{a['addr']}" if a.get("addr") else "")
+        for a in r.get("args") or []
+    )
+    out = [
+        f"# {r['function']} @ {r['entry']}  {r['arch']}  ({r['insns']} insns, "
+        f"{r['elapsed_ms']}ms, stop={r['stop']})",
+        f"   prototype {r['prototype']}",
+    ]
+    if args:
+        out.append(f"   args      {args}")
+    out.append(f"   return    {r['ret']['rax_hex']} ({r['ret']['rax']})")
+    if r.get("stubs"):
+        seen: dict[str, int] = {}
+        for s in r["stubs"]:
+            seen[s["fn"]] = seen.get(s["fn"], 0) + 1
+        summary = ", ".join(f"{k}x{v}" for k, v in sorted(seen.items()))
+        out.append(f"   stubs     {len(r['stubs'])} external call(s) answered: {summary}")
+    wr = r.get("writes") or {}
+    out.append(f"   writes    {wr.get('tracked', 0)} byte(s)")
+    for w in wr.get("ranges") or []:
+        out.append(f"     {w['addr']}  {w['size']}b  {w['hex'][:64]}")
+        if w.get("ascii"):
+            out.append(f"       |{w['ascii']}|")
+    buf = r.get("buffer")
+    for d in r.get("dump") or []:
+        label = "buffer" if buf and d["addr"] == buf["addr"] else "dump"
+        out.append(f"   {label} {d['addr']} {d['size']}b")
+        out.append(_hexblock(d["hex"], d["ascii"]))
+    if r.get("skips"):
+        ops = Counter(s["op"] for s in r["skips"])
+        out.append(
+            "   skipped   "
+            + ", ".join(f"{k}x{v}" for k, v in sorted(ops.items()))
+            + " instruction(s) (p-code op not emulated)"
+        )
+    f = r.get("fault")
+    if f:
+        out.append(
+            f"   !! fault at {f['pc']} ({'mapped' if f['mapped'] else 'unmapped'}) "
+            f"after call to {f.get('callee') or '?'} at {f['call_site']}"
+        )
+        out.append(f"      {f['error']}")
+        if f.get("on_instruction") is False:
+            out.append(
+                "      note: PC is not on a decoded instruction — a stubbed call returned 0 "
+                "and the code branched on it; give inputs with --arg or expect the fault"
+            )
+    return "\n".join(out)
+
+
+def _hexblock(hexstr: str, ascii_: str, width: int = 16) -> str:
+    data = bytes.fromhex(hexstr)
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off : off + width]
+        hexpart = " ".join(f"{b:02x}" for b in chunk).ljust(width * 3 - 1)
+        text = ascii_[off : off + width]
+        lines.append(f"     {off:04x}  {hexpart}  |{text}|")
+    return "\n".join(lines)
+
+
 def fmt_find(r: dict[str, Any]) -> str:
     filters = " ".join(f"{k}={v}" for k, v in (r.get("filters") or {}).items())
     out = [f"# {r.get('candidates')} candidate(s) mode={r.get('mode')} {filters}"]
@@ -166,6 +230,7 @@ FORMATTERS = {
     "graph": fmt_graph,
     "digest": fmt_digest,
     "find": fmt_find,
+    "emulate": fmt_emulate,
 }
 
 
@@ -426,6 +491,50 @@ def build_parser() -> argparse.ArgumentParser:
             },
         )
     )
+    p = sub.add_parser("emulate", parents=[common], help="run a function on the P-code emulator")
+    p.add_argument("binary")
+    p.add_argument("target")
+    p.add_argument(
+        "--arg",
+        dest="args",
+        action="append",
+        default=[],
+        metavar="V",
+        help='repeatable: 123, 0x40, "text", L"wide text", null (string args are placed in memory)',
+    )
+    p.add_argument("--max-insns", type=int, default=200000)
+    p.add_argument("--ms", type=int, default=5000, help="wall-clock budget")
+    p.add_argument(
+        "--buffer",
+        type=int,
+        default=0,
+        metavar="SIZE",
+        help="reserve a zeroed output buffer (read back after the run; pass its address as an arg)",
+    )
+    p.add_argument(
+        "--dump",
+        dest="dump",
+        action="append",
+        default=[],
+        metavar="ADDR[:SIZE]",
+        help="read this memory range back afterwards (repeatable)",
+    )
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "emulate",
+            {
+                "binary": a.binary,
+                "target": a.target,
+                "args": a.args,
+                "max_insns": a.max_insns,
+                "ms": a.ms,
+                "dump": a.dump,
+                "buffer": a.buffer,
+            },
+        )
+    )
+
     p = sub.add_parser("digest", parents=[common], help="one-shot triage report")
     p.add_argument("binary")
     p.add_argument("--top", type=int, default=8, help="how many call-graph hubs")

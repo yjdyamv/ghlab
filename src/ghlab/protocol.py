@@ -90,6 +90,12 @@ _SPECS = [
         ("import", "string", "calls", "limit", "any"),
         "locate candidate functions by imports/strings/calls instead of by name",
     ),
+    Spec(
+        "emulate",
+        ("binary", "target"),
+        ("args", "max_insns", "ms", "dump", "buffer"),
+        "run one function on the P-code emulator: seeded args, tracked writes, return value",
+    ),
 ]
 SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}
 COMMAND_NAMES = sorted(SPECS)

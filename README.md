@@ -72,6 +72,11 @@ ghlab find notepad.exe -i 'VirtualAlloc|VirtualProtect' --any -n 10
 ghlab xrefs notepad.exe entry
 ghlab graph notepad.exe entry -d 2                # 调用树
 ghlab graph notepad.exe entry --direction called   # 调用者树
+
+# 让函数跑一遍（P-code 模拟，不落盘）：给定参数，看它返回什么、写了哪块内存
+ghlab emulate notepad.exe __security_check_cookie --arg 1
+ghlab emulate notepad.exe FUN_140007e1c --arg 1 --arg '"hello"' --buffer 64
+ghlab emulate notepad.exe decrypt_config --arg 0x140038600 --buffer 256 --ms 8000
 ghlab bytes notepad.exe 0x1400019d0 --size 32
 ghlab rename notepad.exe FUN_140001008 sub_parse_cmdline
 ghlab comment notepad.exe 0x1400019d0 'entry stub -> 0x140001850'
@@ -103,6 +108,7 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `graph` | `binary, target` / `direction, depth, limit` | 调用树 BFS |
 | `digest` | `binary` / `top, strings` | **一次性 triage**：入口链、按风险分组的导入、API 组合、字符串分类、调用图枢纽、函数大小分布（实测 notepad ≈450 token / 2.7s） |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
+| `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因 |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。
@@ -114,6 +120,7 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 - **服务端过滤**：`grep` 在 daemon 侧执行，只回传 `{line, text}`，几百个函数的扫描也只占几百 token。
 - **零依赖**：`protocol.py`/`client.py` 只用 stdlib，`session.py` 才懒加载 pyghidra → 单元测试和 CLI 都能在没有 Ghidra 的机器上跑。
 - **协议自描述**：`GET /` 返回全部命令及其参数，agent 可自举。
+- **模拟执行是"够用主义"**：`EmulatorHelper` 在独立内存里跑，写入不落回 program；外部导入用 Python 应答（CRT 真的有语义，其余返回 0），`lock` 等未实现的 p-code op 直接跳过并在输出里点名。所以它适合解密循环、配置解析、返回值推演，不适合依赖真实 API 语义的逻辑。
 
 ## 开发
 
@@ -144,7 +151,10 @@ tests/          test_protocol.py, test_server_client.py（stub session，真 HTT
 5. `GhidraProject.openProgram` 会遗留一个未关闭的 transaction，此后 `program.save()` 必报 `Unable to lock due to active transaction`；`project.save(program)` 才能落盘（`_save()` 里做了回退链）。
 6. Ghidra 12.2 的 `CommentType` 只有 `EOL/PRE/POST/PLATE/REPEATABLE`，没有 `DECOMPILER`（11.x 有）→ `decompiler` 映射为 `PRE`。
 7. JVM 冷启动 30–45s 不可避免：`ghlab start` 会轮询 health 直到就绪；进程内查询才是快的。
-6. 环境代理 127.0.0.1:7897 失效会拖垮 pip/uv：`env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY`。
+8. 环境代理 127.0.0.1:7897 失效会拖垮 pip/uv：`env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY`。
+9. `EmulatorHelper.getTrackedMemoryWriteSet()` 返回的是 `AddressRange`（且偏移落在奇怪的低地址）→ 改用"运行前后对可写块做字节 diff"。
+10. P-code 模拟跑到导入 thunk 里必然 `step()` 返回 False 且 `getLastError()` = `Instruction decode failed (invalid memory)`；必须用"最后一个落在 program 内存里的 PC"定位调用点，再从 `[rsp]` 取返回地址继续。
+11. `lock` 前缀/x86 atomics 在 12.2 里是 `CALLOTHER "LOCK"`，未实现就直接抛 `Unimplemented CALLOTHER pcodeop (LOCK)` → ghlab 跳过该指令并记录（计数会失真，解密/解析路径通常无影响）。
 
 ## License
 

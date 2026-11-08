@@ -813,6 +813,530 @@ def cmd_find(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+
+# --------------------------------------------------------------------- emulate
+
+PARAM_REGS = ("RCX", "RDX", "R8", "R9")
+MASK64 = (1 << 64) - 1
+
+
+def parse_arg_spec(text: Any) -> tuple[str, Any]:
+    """Classify one argument: `"str"`, `L"wide"`, `0x1234`, `42`, `null`, `*symbol`."""
+    t = str(text).strip()
+    if len(t) >= 3 and t[:2] == 'L"' and t[-1] == '"':
+        return ("wstr", t[2:-1])
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        return ("str", t[1:-1])
+    if t.startswith("*") and len(t) > 1:
+        return ("deref", t[1:])
+    if t.lower() in ("", "null", "none"):
+        return ("int", 0)
+    try:
+        return ("int", int(t, 0))
+    except ValueError:
+        return ("str", t)
+
+
+def _symbol_addr(program, name: str) -> int | None:
+    text = str(name)
+    if text.lower().startswith("0x"):
+        return int(text, 16)
+    for sym in program.getSymbolTable().getAllSymbols(True):
+        if str(sym.getName()) == text:
+            return int(sym.getAddress().getOffset())
+    return None
+
+
+def _suggest_symbols(program, name: str, limit: int = 6) -> list[str]:
+    low = str(name).lower()
+    hits: list[str] = []
+    for sym in program.getSymbolTable().getAllSymbols(True):
+        text = str(sym.getName())
+        if low in text.lower():
+            hits.append(text)
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def _snapshot_writable(program, emu, budget: int = 2 << 20) -> list[tuple[int, bytes]]:
+    """Bytes of every writable initialized non-code block, for a pre/post diff."""
+    snap: list[tuple[int, bytes]] = []
+    for blk in program.getMemory().getBlocks():
+        if not (blk.isWrite() and blk.isInitialized()) or blk.isExecute():
+            continue
+        size = int(blk.getSize())
+        if size <= 0 or size > (1 << 20) or budget <= 0:
+            continue
+        start = int(blk.getStart().getOffset())
+        snap.append((start, _emu_bytes(emu, start, size)))
+        budget -= size
+    return snap
+
+
+def _diff_runs(
+    emu, baseline: list[tuple[int, bytes]], skip: list[tuple[int, int]], max_runs: int = 12
+) -> list[tuple[int, bytes]]:
+    """Contiguous byte runs that changed during the run, minus the seeded areas."""
+    runs: list[tuple[int, bytes]] = []
+    for start, old in baseline:
+        new = _emu_bytes(emu, start, len(old))
+        if new == old:
+            continue
+        idx, n = 0, len(old)
+        while idx < n and len(runs) < max_runs:
+            if new[idx] == old[idx]:
+                idx += 1
+                continue
+            end = idx
+            while end < n and new[end] != old[end]:
+                end += 1
+            pieces = [[start + idx, start + end]]
+            for slo, shi in skip:
+                nxt = []
+                for plo, phi in pieces:
+                    if phi <= slo or plo >= shi:
+                        nxt.append([plo, phi])
+                        continue
+                    if plo < slo:
+                        nxt.append([plo, slo])
+                    if phi > shi:
+                        nxt.append([shi, phi])
+                pieces = nxt
+            for plo, phi in pieces:
+                if phi > plo:
+                    runs.append((plo, new[plo - start : phi - start]))
+            idx = end
+    return runs[:max_runs]
+
+
+def _u64(value: Any) -> int:
+    try:
+        return int(value) & MASK64
+    except TypeError:  # java.math.BigInteger
+        return value.longValue() & MASK64
+
+
+def _scratch_block(program):
+    """A writable block the emulator can park strings, a stack and buffers in."""
+    mem = program.getMemory()
+    for name in (".didat", ".data", ".bss", ".sbss"):
+        blk = mem.getBlock(name)
+        if blk is not None and blk.isWrite() and blk.getSize() >= 0x800:
+            return blk
+    for blk in mem.getBlocks():
+        if blk.isWrite() and blk.getSize() >= 0x800 and blk.isInitialized():
+            return blk
+    raise ValueError("no writable block large enough for an emulation scratch area")
+
+
+def _emu_bytes(emu, addr: int, size: int) -> bytes:
+    raw = emu.readMemory(
+        emu.getProgram().getAddressFactory().getDefaultAddressSpace().getAddress(addr),
+        size,
+    )
+    return bytes((int(b) & 0xFF) for b in raw)
+
+
+def _hexdump(data: bytes, width: int = 16) -> str:
+    lines = []
+    for off in range(0, len(data), width):
+        chunk = data[off : off + width]
+        hexpart = " ".join(f"{b:02x}" for b in chunk).ljust(width * 3 - 1)
+        text = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"   {off:04x}  {hexpart}  |{text}|")
+    return "\n".join(lines)
+
+
+def _call_target(program, addr: int) -> str | None:
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    refs = program.getReferenceManager().getReferencesFrom(space.getAddress(addr))
+    for ref in refs:
+        sym = program.getSymbolTable().getPrimarySymbol(ref.getToAddress())
+        if sym is not None:
+            return str(sym.getName())
+    return None
+
+
+def _mem_read(emu, addr: int, size: int) -> bytes:
+    return _emu_bytes(emu, addr, size)
+
+
+def _mem_write(emu, addr: int, data: bytes) -> None:
+    space = emu.getProgram().getAddressFactory().getDefaultAddressSpace()
+    emu.writeMemory(space.getAddress(addr), data)
+
+
+def _cstr(emu, addr: int, limit: int = 4096) -> bytes:
+    out = bytearray()
+    while len(out) < limit:
+        byte = _mem_read(emu, addr + len(out), 1)[0]
+        if byte == 0:
+            break
+        out.append(byte)
+    return bytes(out)
+
+
+# External calls can't be emulated, so the common CRT string/memory helpers are
+# answered in Python instead: that is what makes decrypt_config()-style routines
+# (memset + memcpy + strcpy) actually runnable.
+STUB_NAMES = (
+    "memset",
+    "memcpy",
+    "memmove",
+    "strlen",
+    "strcpy",
+    "strncpy",
+    "strcat",
+    "strncat",
+    "strcmp",
+    "strncmp",
+    "wcscpy",
+    "wcslen",
+    "atoi",
+)
+
+
+def _stub_for(name: str | None) -> str | None:
+    if not name:
+        return None
+    low = str(name).lower()
+    if low.startswith("pt_"):
+        low = low[3:]
+    for known in STUB_NAMES:
+        if known in low:
+            return known
+    return None
+
+
+def _clean_name(name: str) -> str:
+    text = str(name)
+    found = re.match(r"^(?:PTR_|thunk_FUN_)(.*?)_[0-9a-fA-F]{6,}$", text)
+    return found.group(1) if found else text
+
+
+def _is_external_call(name: str | None) -> bool:
+    if not name:
+        return False
+    low = str(name).lower()
+    return low.startswith("ptr_") or ".dll" in low or low.startswith("thunk_")
+
+
+def _apply_stub(emu, program, name: str) -> int:
+    """Execute one CRT helper in Python; return the value for RAX."""
+    name = name.split(":", 1)[0]
+    regs = {r: _u64(emu.readRegister(program.getRegister(r))) for r in PARAM_REGS}
+    a0, a1, a2 = regs["RCX"], regs["RDX"], regs["R8"]
+    if name == "memset":
+        _mem_write(emu, a0, bytes([a1 & 0xFF]) * max(0, a2))
+        return a0
+    if name in ("memcpy", "memmove"):
+        _mem_write(emu, a0, _mem_read(emu, a1, max(0, a2)))
+        return a0
+    if name == "strlen":
+        return len(_cstr(emu, a0))
+    if name == "strcpy":
+        data = _cstr(emu, a1) + b"\x00"
+        _mem_write(emu, a0, data)
+        return a0
+    if name == "strncpy":
+        data = _cstr(emu, a1)[: max(0, a2)]
+        data += b"\x00" * (max(0, a2) - len(data))
+        _mem_write(emu, a0, data)
+        return a0
+    if name == "strcat":
+        data = _cstr(emu, a0) + _cstr(emu, a1) + b"\x00"
+        _mem_write(emu, a0, data)
+        return a0
+    if name == "strncat":
+        data = _cstr(emu, a0) + _cstr(emu, a1)[: max(0, a2)] + b"\x00"
+        _mem_write(emu, a0, data)
+        return a0
+    if name in ("strcmp", "strncmp"):
+        left, right = _cstr(emu, a0), _cstr(emu, a1)
+        if name == "strncmp":
+            left, right = left[:a2], right[:a2]
+        return 0 if left == right else (1 if left > right else 0xFFFFFFFF)
+    if name == "atoi":
+        text = _cstr(emu, a0).decode("latin-1", "replace").strip()
+        digits = "".join(c for c in text if c.isdigit() or c in "+-")
+        try:
+            return int(digits or "0", 10) & MASK64
+        except ValueError:
+            return 0
+    return 0
+
+
+def _resume_after_stub(emu, program, name: str) -> bool:
+    """Pretend the external call at the current return address already happened."""
+    sp_reg = emu.getStackPointerRegister()
+    sp = _u64(emu.readRegister(sp_reg))
+    ret = int.from_bytes(_mem_read(emu, sp, 8), "little")
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    if not program.getMemory().contains(space.getAddress(ret)):
+        return False
+    result = _apply_stub(emu, program, name)
+    emu.writeRegister(sp_reg, (sp + 8) & MASK64)
+    emu.writeRegister(emu.getPCRegister(), ret)
+    emu.writeRegister(program.getRegister("RAX"), result & MASK64)
+    return True
+
+
+def _callother_name(err: str) -> str | None:
+    found = re.search(r"Unimplemented CALLOTHER pcodeop \(([^)]+)\)", str(err))
+    return found.group(1) if found else None
+
+
+def _skip_instruction(emu, program, addr) -> bool:
+    """Step past an instruction whose p-code we cannot emulate (e.g. `lock` atomics)."""
+    insn = program.getListing().getInstructionAt(addr)
+    if insn is None:
+        return False
+    target = insn.getFallThrough()
+    if target is None:
+        target = insn.getAddress().add(int(insn.getLength()))
+    emu.writeRegister(emu.getPCRegister(), int(target.getOffset()))
+    return True
+
+
+def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
+    """Run one function on the P-code emulator and report writes + return value.
+
+    Purely in-emulator: `EmulatorHelper` keeps its own memory state, so nothing is
+    written back to the program and no save is needed.
+    """
+    import time
+
+    from ghidra.app.emulator import EmulatorHelper
+    from ghidra.util.task import TimeoutTaskMonitor
+    from java.util.concurrent import TimeUnit
+
+    started = time.time()
+    entry = _entry(a["binary"])
+    program = entry["program"]
+    lang = program.getLanguage()
+    proc = str(lang.getProcessor()).lower()
+    if "x86" not in proc:
+        raise ValueError(
+            "emulate currently supports x86/x86-64 only (Windows x64 calling convention); "
+            f"this binary is {lang.getLanguageID()} (processor {proc})"
+        )
+    fn = _function(entry, a["target"])
+    if fn is None:
+        raise KeyError(f"function {a['target']!r} not found")
+
+    max_insns = int(a.get("max_insns", 200000))
+    ms = int(a.get("ms", 5000))
+    block = _scratch_block(program)
+    base = int(block.getStart().getOffset())
+    size = int(block.getSize())
+    if size < 0x1000:
+        raise ValueError(f"scratch block {block.getName()} too small ({size:#x})")
+    stack_top = base + size - 0x200
+    sentinel = base + size - 0x10
+    string_at = base + 0x40
+
+    emu = EmulatorHelper(program)
+    baseline = _snapshot_writable(program, emu)
+    emu.writeMemory(
+        program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel),
+        b"\xcc\xcc\xcc\xcc",
+    )
+    emu.setBreakpoint(
+        program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel)
+    )
+
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    cursor = string_at
+    buf_size = int(a.get("buffer") or 0)
+    if buf_size > 0x700:
+        raise ValueError("buffer is capped at 0x700 bytes inside the scratch block")
+    buf_addr = base + 0x600
+    if buf_size:
+        emu.writeMemory(space.getAddress(buf_addr), b"\x00" * buf_size)
+    string_limit = buf_addr if buf_size else stack_top - 0x400
+    words: list[int] = []
+    seeded_strings: list[tuple[int, int]] = []
+    arg_report = []
+    for spec in a.get("args") or []:
+        kind, value = parse_arg_spec(spec)
+        if kind == "deref":
+            addr = _symbol_addr(program, value)
+            if addr is None:
+                near = _suggest_symbols(program, value)
+                raise KeyError(
+                    f"symbol {value!r} not found"
+                    + (f" — did you mean {', '.join(near)}?" if near else "")
+                )
+            word = int.from_bytes(_emu_bytes(emu, addr, 8), "little")
+            arg_report.append(
+                {"kind": "deref", "value": str(value), "addr": hex(addr), "word": hex(word)}
+            )
+            words.append(word)
+            continue
+        if kind in ("str", "wstr"):
+            data = (
+                value.encode("utf-8", "replace") + b"\x00"
+                if kind == "str"
+                else value.encode("utf-16-le", "replace") + b"\x00\x00"
+            )
+            if cursor + len(data) >= string_limit:
+                raise ValueError(
+                    "too many/large string arguments for the scratch area"
+                    + (" (raise --buffer less or pass fewer strings)" if buf_size else "")
+                )
+            emu.writeMemory(space.getAddress(cursor), data)
+            arg_report.append(
+                {"kind": kind, "value": value, "addr": hex(cursor), "bytes": len(data)}
+            )
+            seeded_strings.append((cursor, cursor + len(data)))
+            words.append(cursor)
+            cursor += (len(data) + 7) & ~7
+        else:
+            arg_report.append({"kind": "int", "value": value})
+            words.append(value)
+
+    extra = max(0, len(words) - len(PARAM_REGS))
+    sp = stack_top - 0x28 - 8 * extra
+    emu.writeMemory(space.getAddress(sp), sentinel.to_bytes(8, "little"))
+    emu.writeMemory(space.getAddress(sp + 8), b"\x00" * 0x20)  # shadow space
+    for i, value in enumerate(words):
+        if i < len(PARAM_REGS):
+            emu.writeRegister(program.getRegister(PARAM_REGS[i]), value & MASK64)
+        else:
+            emu.writeMemory(
+                space.getAddress(sp + 0x28 + 8 * (i - len(PARAM_REGS))),
+                (value & MASK64).to_bytes(8, "little"),
+            )
+    emu.writeRegister(emu.getStackPointerRegister(), sp)
+    emu.writeRegister(emu.getPCRegister(), fn.getEntryPoint().getOffset())
+
+    monitor = TimeoutTaskMonitor.timeoutIn(max(1, ms), TimeUnit.MILLISECONDS)
+    sentinel_addr = space.getAddress(sentinel)
+    stop = "max-insns"
+    insns = 0
+    fault = None
+    stubs: list[dict] = []
+    skips: list[dict] = []
+    prev_pc = fn.getEntryPoint()
+    last_valid_pc = fn.getEntryPoint()
+    try:
+        while insns < max_insns:
+            pc = emu.getExecutionAddress()
+            if pc.equals(sentinel_addr):
+                stop = "returned"
+                break
+            if program.getMemory().contains(pc):
+                last_valid_pc = pc
+            prev_pc = pc
+            if emu.step(monitor):
+                insns += 1
+                continue
+            if monitor.didTimeout():
+                stop = "timeout"
+                break
+            callee = _call_target(program, int(last_valid_pc.getOffset()))
+            stub = _stub_for(callee)
+            if stub is None and _is_external_call(callee):
+                stub = "external:" + _clean_name(callee)
+            if stub and len(stubs) < 4000 and _resume_after_stub(emu, program, stub):
+                stubs.append({"at": str(last_valid_pc), "fn": stub})
+                continue
+            op = _callother_name(str(emu.getLastError() or ""))
+            if op and len(skips) < 2000 and _skip_instruction(emu, program, last_valid_pc):
+                skips.append({"at": str(last_valid_pc), "op": op})
+                continue
+            stop = "fault"
+            break
+    except Exception as exc:  # noqa: BLE001 - emulator raises on bad memory
+        stop = "fault"
+        fault = f"{type(exc).__name__}: {exc}"
+
+    if stop == "fault":
+        pc = emu.getExecutionAddress()
+        last = str(emu.getLastError() or "")
+        fault = {
+            "pc": str(pc),
+            "error": last or fault or "emulation stopped",
+            "call_site": str(last_valid_pc),
+            "callee": _call_target(program, int(last_valid_pc.getOffset())),
+            "mapped": bool(program.getMemory().contains(pc)),
+            "on_instruction": program.getListing().getInstructionAt(pc) is not None,
+        }
+
+    seeded = [(base, base + size)]
+    runs = _diff_runs(emu, baseline, seeded)
+    writes = []
+    for lo, data in runs:
+        head = data[:64]
+        writes.append(
+            {
+                "addr": hex(lo),
+                "size": len(data),
+                "hex": head.hex(),
+                "ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in head),
+            }
+        )
+    tracked_bytes = sum(len(data) for _, data in runs)
+
+    dumps = []
+    if buf_size:
+        data = _emu_bytes(emu, buf_addr, buf_size)
+        dumps.append(
+            {
+                "addr": hex(buf_addr),
+                "size": buf_size,
+                "hex": data.hex(),
+                "ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in data),
+            }
+        )
+    for spec in a.get("dump") or []:
+        text = str(spec)
+        addr_text, _, size_text = text.partition(":")
+        daddr = int(addr_text, 0) if addr_text.lower().startswith("0x") else int(addr_text, 0)
+        dlen = int(size_text, 0) if size_text else 64
+        data = _emu_bytes(emu, daddr, dlen)
+        dumps.append(
+            {
+                "addr": hex(daddr),
+                "size": dlen,
+                "hex": data.hex(),
+                "ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in data),
+            }
+        )
+
+    rax = _u64(emu.readRegister(program.getRegister("RAX"))) if _has_reg(program, "RAX") else 0
+    return {
+        "binary": a["binary"],
+        "function": str(fn.getName()),
+        "entry": str(fn.getEntryPoint()),
+        "prototype": str(fn.getPrototypeString(False, False)),
+        "arch": str(program.getLanguage().getLanguageID()),
+        "args": arg_report,
+        "stop": stop,
+        "insns": insns,
+        "stubs": stubs,
+        "skips": skips,
+        "ret": {"rax": rax, "rax_hex": hex(rax)},
+        "writes": {"tracked": tracked_bytes, "ranges": writes},
+        "dump": dumps,
+        "buffer": {"addr": hex(buf_addr), "size": buf_size} if buf_size else None,
+        "fault": fault,
+        "scratch": {"block": str(block.getName()), "base": hex(base), "sp": hex(sp)},
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def _has_reg(program, name: str) -> bool:
+    return program.getLanguage().getRegister(name) is not None
+
+
+def dispatch(cmd: str, params: dict[str, Any]) -> Any:
+    with LOCK:
+        return HANDLERS[cmd](params)
+
+
 HANDLERS = {
     "ping": ping,
     "binaries": cmd_binaries,
@@ -828,9 +1352,5 @@ HANDLERS = {
     "graph": cmd_graph,
     "digest": cmd_digest,
     "find": cmd_find,
+    "emulate": cmd_emulate,
 }
-
-
-def dispatch(cmd: str, params: dict[str, Any]) -> Any:
-    with LOCK:
-        return HANDLERS[cmd](params)

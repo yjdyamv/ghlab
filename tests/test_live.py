@@ -143,6 +143,38 @@ class LiveTest(unittest.TestCase):
             client.call("find", binary=BIN)
         self.assertIn("at least one", str(ctx.exception))
 
+    def test_emulate_runs_and_reports_stubs(self):
+        r = client.call(
+            "emulate", binary=BIN, target="__security_check_cookie", args=[1], ms=5000
+        )
+        self.assertIn(r["stop"], ("returned", "fault", "timeout"))
+        self.assertGreater(r["insns"], 0)
+        self.assertIn("rax_hex", r["ret"])
+        self.assertIsInstance(r["stubs"], list)
+        self.assertIn("scratch", r)
+
+    def test_emulate_seeds_strings_in_memory(self):
+        r = client.call(
+            "emulate", binary=BIN, target="__security_check_cookie", args=['"abc"'], ms=5000
+        )
+        arg = r["args"][0]
+        self.assertEqual(arg["kind"], "str")
+        self.assertEqual(arg["bytes"], 4, "string plus NUL is written into scratch memory")
+
+    def test_emulate_buffer_is_read_back(self):
+        r = client.call(
+            "emulate", binary=BIN, target="__security_check_cookie", args=[1], buffer=32
+        )
+        self.assertEqual(r["buffer"]["size"], 32)
+        buf = [d for d in r["dump"] if d["addr"] == r["buffer"]["addr"]]
+        self.assertEqual(len(buf), 1)
+        self.assertEqual(buf[0]["size"], 32)
+
+    def test_emulate_rejects_unknown_function(self):
+        with self.assertRaises(RemoteError) as ctx:
+            client.call("emulate", binary=BIN, target="definitely_not_a_function")
+        self.assertIn("not found", str(ctx.exception))
+
 
 @unittest.skipUnless(LIVE and os.environ.get("GHLAB_LIVE_IMPORT"), "set GHLAB_LIVE_IMPORT=1")
 class LiveImportTest(unittest.TestCase):
