@@ -100,6 +100,62 @@ def fmt_graph(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_find(r: dict[str, Any]) -> str:
+    filters = " ".join(f"{k}={v}" for k, v in (r.get("filters") or {}).items())
+    out = [f"# {r.get('candidates')} candidate(s) mode={r.get('mode')} {filters}"]
+    if not r.get("functions"):
+        out.append("   (nothing matched; loosen the patterns or use --any)")
+    for f in r.get("functions") or []:
+        why = " | ".join(
+            f"{k}: {', '.join(v)}" for k, v in (f.get("matched") or {}).items()
+        )
+        out.append(f"   {f['addr']}  {f['size']:>5}b  {f['name']:<28} {why}")
+    return "\n".join(out)
+
+
+def fmt_digest(r: dict[str, Any]) -> str:
+    imp = r.get("imports") or {}
+    st = r.get("strings") or {}
+    chain = " -> ".join(f"{c['name']}@{c['addr']}" for c in r.get("entry") or [])
+    libs_all = list((imp.get("libs") or {}).items())
+    libs = ", ".join(f"{k}:{v}" for k, v in libs_all[:5])
+    if len(libs_all) > 5:
+        libs += f" +{len(libs_all) - 5} libs"
+    out = [
+        f"== {r['binary']}  {r['language']}  base {r['image_base']}",
+        f"   md5 {r['md5']}  compiler {r.get('compiler')}",
+        f"   entry {chain or '-'}",
+        f"   {r.get('functions')} functions | {st.get('total', 0)} strings | "
+        f"{imp.get('total', 0)} imports ({libs})",
+    ]
+    combos = r.get("combos") or []
+    if combos:
+        out.append("combos")
+        for c in combos:
+            out.append(f"   !! {c['label']}: {', '.join(c['hits'])}")
+    groups = imp.get("groups") or {}
+    if groups:
+        out.append("imports by risk")
+        for kind, names in groups.items():
+            more = f" +{len(names)}..." if len(names) >= 12 else ""
+            out.append(f"   {kind:<9} {', '.join(names[:12])}{more}")
+    counts = st.get("counts") or {}
+    samples = st.get("samples") or {}
+    if counts:
+        out.append("strings")
+        for kind, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            vals = " | ".join(s["value"] for s in (samples.get(kind) or []))
+            out.append(f"   {kind:<8}({n}) {vals}")
+    hubs = r.get("hubs") or []
+    if hubs:
+        out.append("hubs (most callers)")
+        for h in hubs:
+            out.append(f"   {h['callers']:>3}x  {h['addr']}  {h['name']}  ({h['size']}b)")
+    sizes = r.get("sizes") or {}
+    if sizes:
+        out.append("sizes   " + "  ".join(f"{k}:{v}" for k, v in sizes.items()))
+    body = "\n".join(out)
+    return f"{body}\n~{len(body) // 4} tokens"
 FORMATTERS = {
     "binaries": fmt_binaries,
     "info": fmt_info,
@@ -108,6 +164,8 @@ FORMATTERS = {
     "strings": fmt_strings,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
+    "digest": fmt_digest,
+    "find": fmt_find,
 }
 
 
@@ -365,6 +423,38 @@ def build_parser() -> argparse.ArgumentParser:
                 "target": a.target,
                 "depth": a.depth,
                 "direction": a.direction,
+            },
+        )
+    )
+    p = sub.add_parser("digest", parents=[common], help="one-shot triage report")
+    p.add_argument("binary")
+    p.add_argument("--top", type=int, default=8, help="how many call-graph hubs")
+    p.add_argument("--strings", type=int, default=3, help="samples per string kind")
+    p.set_defaults(
+        func=lambda a: _call(a, "digest", {"binary": a.binary, "top": a.top, "strings": a.strings})
+    )
+
+    p = sub.add_parser("find", parents=[common], help="locate candidates by structure")
+    p.add_argument("binary")
+    p.add_argument("-i", "--import", dest="import_", action="append", default=[],
+                   help="regex on imported symbol names (repeatable)")
+    p.add_argument("-s", "--string", action="append", default=[],
+                   help="regex on string data (repeatable)")
+    p.add_argument("-c", "--calls", action="append", default=[],
+                   help="regex on callee names (repeatable)")
+    p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("--any", action="store_true", help="any filter instead of all")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "find",
+            {
+                "binary": a.binary,
+                "import": a.import_ or None,
+                "string": a.string or None,
+                "calls": a.calls or None,
+                "limit": a.limit,
+                "any": a.any,
             },
         )
     )

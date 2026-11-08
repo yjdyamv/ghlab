@@ -117,6 +117,32 @@ class LiveTest(unittest.TestCase):
         r = client.call("decompile", binary=BIN, targets=["definitely_not_here"])
         self.assertIn("not found", r["results"][0]["error"])
 
+    def test_digest_summarises_without_flooding(self):
+        r = client.call("digest", binary=BIN)
+        self.assertGreater(r["functions"], 100)
+        self.assertEqual(len(r["md5"]), 32)
+        self.assertTrue(r["entry"], "entry chain should resolve on a PE")
+        self.assertGreater(r["imports"]["total"], 10)
+        self.assertTrue(r["imports"]["groups"], "risk grouping should find something")
+        self.assertIn("total", r["strings"])
+        self.assertTrue(r["sizes"], "size buckets expected")
+        # a digest must stay cheap: whole payload well under a decompiled file
+        self.assertLess(len(str(r)), 40000)
+
+    def test_find_locates_registry_writer(self):
+        r = client.call(
+            "find", binary=BIN, **{"import": ["RegSetValue"], "string": ["Notepad"]}
+        )
+        self.assertGreater(r["candidates"], 0)
+        first = r["functions"][0]
+        self.assertIn("RegSetValueExW", first["matched"]["import"])
+        self.assertEqual(first["filters_matched"], 2, "default mode is all-filters")
+
+    def test_find_requires_a_filter(self):
+        with self.assertRaises(RemoteError) as ctx:
+            client.call("find", binary=BIN)
+        self.assertIn("at least one", str(ctx.exception))
+
 
 @unittest.skipUnless(LIVE and os.environ.get("GHLAB_LIVE_IMPORT"), "set GHLAB_LIVE_IMPORT=1")
 class LiveImportTest(unittest.TestCase):

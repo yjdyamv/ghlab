@@ -78,6 +78,18 @@ _SPECS = [
     Spec("rename", ("binary", "target", "new"), summary="rename a function"),
     Spec("comment", ("binary", "target", "text"), ("type",), "set a listing/decompiler comment"),
     Spec("graph", ("binary", "target"), ("direction", "depth", "limit"), "call tree"),
+    Spec(
+        "digest",
+        ("binary",),
+        ("top", "strings"),
+        "one-shot triage: entry chain, risk-grouped imports, API combos, strings, hubs, sizes",
+    ),
+    Spec(
+        "find",
+        ("binary",),
+        ("import", "string", "calls", "limit", "any"),
+        "locate candidate functions by imports/strings/calls instead of by name",
+    ),
 ]
 SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}
 COMMAND_NAMES = sorted(SPECS)

@@ -51,6 +51,18 @@ class EnvelopeTest(unittest.TestCase):
         payload = json.loads(protocol.Ok({"text": "你好"}).to_bytes())
         self.assertEqual(payload["result"]["text"], "你好")
 
+    def test_digest_and_find_are_declared(self):
+        self.assertIn("digest", protocol.COMMAND_NAMES)
+        self.assertIn("find", protocol.COMMAND_NAMES)
+        spec, params = protocol.validate({"cmd": "digest", "binary": "a.exe", "top": 3})
+        self.assertEqual(params["top"], 3)
+        spec, params = protocol.validate(
+            {"cmd": "find", "binary": "a.exe", "import": ["VirtualAlloc"], "any": True}
+        )
+        self.assertEqual(params["import"], ["VirtualAlloc"])
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "find", "binary": "a.exe", "name": "x"})
+
 
 if __name__ == "__main__":
     unittest.main()

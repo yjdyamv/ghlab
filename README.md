@@ -61,6 +61,14 @@ ghlab decompile notepad.exe -t FUN_140001008 --max-lines 30
 ghlab decompile notepad.exe -m 'FUN_' -g 'CreateWindow|RegisterClass|GetDlgItem' -n 40
 
 ghlab strings notepad.exe -q txt
+
+# 先看全局，再决定花 token 看哪里
+ghlab digest notepad.exe
+
+# 按结构缩小候选集：谁既写注册表又碰 Notepad 字符串
+ghlab find notepad.exe -i RegSetValue -s Notepad
+ghlab find notepad.exe -i 'VirtualAlloc|VirtualProtect' --any -n 10
+
 ghlab xrefs notepad.exe entry
 ghlab graph notepad.exe entry -d 2                # 调用树
 ghlab graph notepad.exe entry --direction called   # 调用者树
@@ -93,6 +101,8 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit` | 调用树 BFS |
+| `digest` | `binary` / `top, strings` | **一次性 triage**：入口链、按风险分组的导入、API 组合、字符串分类、调用图枢纽、函数大小分布（实测 notepad ≈450 token / 2.7s） |
+| `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。

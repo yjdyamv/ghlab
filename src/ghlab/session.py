@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -471,6 +472,347 @@ def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
 
 
 
+# ------------------------------------------------------------------ triage
+
+# Import-name classification. First match wins, so ordering is the priority:
+# inject before exec before file (VirtualAlloc reads as injection).
+RISK: dict[str, re.Pattern[str]] = {
+    # anchors matter: bare substrings match OpenProcessToken, SendMessageW, ...
+    "inject": re.compile(
+        r"virtualalloc|virtualprotect|writeprocessmemory|createremotethread"
+        r"|^openprocess$|^createthread$|queueuserapc|setthreadcontext"
+        r"|rtlcreateuserthread|mapviewoffile|unmapviewoffile|ntunmapviewofsection"
+    ),
+    "exec": re.compile(
+        r"createprocess|shellexecute|winexec$|loadlibrary|getprocaddress"
+        r"|findresource|loadresource|createservice"
+    ),
+    "network": re.compile(
+        r"winhttp|wininet|ws2_32|^wsa|^socket$|^connect$|^sendto$|^recvfrom$"
+        r"|internetopen|internetread|urldownload|getaddrinfo|dnsquery|closesocket"
+    ),
+    "file": re.compile(
+        r"^createfile|^writefile|^readfile|^deletefile|^movefile|^copyfile"
+        r"|findfirstfile|findnextfile|setfileattributes|gettemppath|createdirectory"
+    ),
+    "registry": re.compile(
+        r"regopenkey|regsetvalue|regcreatekey|regqueryvalue|regdeletekey|regsavekey"
+    ),
+    "crypto": re.compile(r"crypt|bcrypt|ncrypt|aes|rc4|md5|sha256|sha512|rsa"),
+    "anti": re.compile(
+        r"isdebuggerpresent|checkremotedebuggerpresent|outputdebugstring"
+        r"|ntqueryinformationprocess|gettickcount|queryperformancecounter"
+        r"|ntglobalflag|getforegroundwindow|toolhelp32snapshot"
+    ),
+    "ui": re.compile(r"messagebox|dialogbox|^createwindow|setwindowtext|getdlgitemtext"),
+}
+
+# (label, every one of these must be imported) — triage signals, not findings.
+COMBOS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("alloc+exec", ("virtualalloc", "virtualprotect")),
+    ("remote-thread", ("openprocess", "writeprocessmemory", "createremotethread")),
+    ("dynamic-load", ("loadlibrary", "getprocaddress")),
+    ("net+exec", ("socket", "createprocess")),
+    ("persist", ("createservice",)),
+    ("anti-debug", ("isdebuggerpresent",)),
+)
+
+STRING_KINDS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("url", re.compile(r"^(https?|ftp)://", re.I)),
+    ("ip", re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")),
+    ("path", re.compile(r"^([A-Za-z]:\\|\\\\|%(temp|appdata|systemroot|programdata)%)", re.I)),
+    ("registry", re.compile(r"^(HKEY_|SOFTWARE\\|SYSTEM\\)", re.I)),
+    ("cmdline", re.compile(r"(cmd\.exe|powershell|schtasks|wscript|mshta)", re.I)),
+    ("fmt", re.compile(r"%[-#0-9.]*(s|d|u|x|p)")),
+    ("b64", re.compile(r"^[A-Za-z0-9+/]{16,}[+/=][A-Za-z0-9+/=]*$")),
+    ("dll", re.compile(r"^[\w .-]+\.(dll|exe|sys|bat|ps1|vbs)$", re.I)),
+)
+
+
+def _classify_import(name: str) -> str | None:
+    low = name.lower()
+    for group, pat in RISK.items():
+        if pat.search(low):
+            return group
+    return None
+
+
+def _imports(program) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        it = program.getSymbolTable().getExternalSymbols()
+    except Exception:  # noqa: BLE001
+        return out
+    for sym in it:
+        try:
+            name = str(sym.getName())
+            ns = sym.getParentNamespace()
+            lib = str(ns.getName()) if ns is not None else ""
+            lib = re.sub(r"\.(dll|so|dylib)$", "", lib, flags=re.I).upper() or "?"
+            if not name or (lib, name) in seen:
+                continue
+            seen.add((lib, name))
+            out.append({"name": name, "lib": lib, "addr": str(sym.getAddress())})
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _string_kind(value: str) -> str | None:
+    for kind, pat in STRING_KINDS:
+        if pat.search(value):
+            return kind
+    return None
+
+
+def _scan_strings(program, per_kind: int = 3) -> dict[str, Any]:
+    """One pass over defined data: total count + samples per interesting kind."""
+    total = 0
+    counts: Counter[str] = Counter()
+    samples: dict[str, list[dict[str, str]]] = {k: [] for k, _ in STRING_KINDS}
+    scanned = 0
+    it = program.getListing().getDefinedData(True)
+    while it.hasNext():
+        d = it.next()
+        scanned += 1
+        try:
+            tname = str(d.getDataType().getName()).lower()
+            if not any(k in tname for k in ("string", "unicode", "terminated", "char")):
+                continue
+            try:
+                val = str(d.getValue())
+            except Exception:  # noqa: BLE001
+                val = str(d.getDefaultValueRepresentation())
+        except Exception:  # noqa: BLE001
+            continue
+        if not val or val == "None" or len(val) < 4:
+            continue
+        total += 1
+        kind = _string_kind(val)
+        if kind is None:
+            continue
+        counts[kind] += 1
+        if len(samples[kind]) < per_kind:
+            samples[kind].append({"addr": str(d.getAddress()), "value": val[:160]})
+    return {"total": total, "scanned": scanned, "counts": dict(counts), "samples": samples}
+
+
+def _entry_chain(program, depth: int = 3) -> list[dict[str, str]]:
+    fm = program.getFunctionManager()
+    try:
+        entry_addr = program.getEntryPoint()
+    except Exception:  # noqa: BLE001
+        entry_addr = None
+    if entry_addr is None:
+        for sym in program.getSymbolTable().getAllSymbols(True):
+            if str(sym.getName()).lower() in ("entry", "_start", "maincrtstartup"):
+                entry_addr = sym.getAddress()
+                break
+    if entry_addr is None:
+        return []
+    chain: list[dict[str, str]] = []
+    cur = fm.getFunctionContaining(entry_addr) or fm.getFunctionAt(entry_addr)
+    if cur is None:
+        return [{"name": "<entry>", "addr": str(entry_addr)}]
+    while cur is not None and len(chain) < depth:
+        chain.append({"name": str(cur.getName()), "addr": str(cur.getEntryPoint())})
+        nxt = None
+        try:
+            for callee in cur.getCalledFunctions(MONITOR):
+                if callee.isExternal() or callee.isThunk():
+                    continue
+                if str(callee.getName()).lower() in ("main", "wmain", "winmain", "wwinmain"):
+                    nxt = callee
+                    break
+                if nxt is None:
+                    nxt = callee
+        except Exception:  # noqa: BLE001
+            nxt = None
+        cur = nxt
+    return chain
+
+
+def _hubs(program, top: int) -> list[dict[str, Any]]:
+    """Functions with the most callers (where logic usually condenses)."""
+    scored = []
+    for fn in program.getFunctionManager().getFunctions(True):
+        if fn.isExternal() or fn.isThunk():
+            continue
+        try:
+            callers = list(fn.getCallingFunctions(MONITOR))
+        except Exception:  # noqa: BLE001
+            continue
+        if callers:
+            scored.append((len(callers), fn))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [
+        {
+            "name": str(fn.getName()),
+            "addr": str(fn.getEntryPoint()),
+            "callers": n,
+            "size": int(fn.getBody().getNumAddresses()),
+        }
+        for n, fn in scored[:top]
+    ]
+
+
+def _size_buckets(program) -> dict[str, int]:
+    buckets = {"<32": 0, "32-128": 0, "128-512": 0, ">512": 0}
+    for fn in program.getFunctionManager().getFunctions(True):
+        if fn.isExternal() or fn.isThunk():
+            continue
+        n = int(fn.getBody().getNumAddresses())
+        key = "<32" if n < 32 else "32-128" if n < 128 else "128-512" if n < 512 else ">512"
+        buckets[key] += 1
+    return buckets
+
+
+def cmd_digest(a: dict[str, Any]) -> dict[str, Any]:
+    """One call, whole-picture triage — composition of existing commands only."""
+    p = _entry(a["binary"])["program"]
+    top = int(a.get("top", 8))
+    per_kind = int(a.get("strings", 3))
+    imports = _imports(p)
+    names = [i["name"] for i in imports]
+    low_names = [n.lower() for n in names]
+    groups: dict[str, list[str]] = {k: [] for k in RISK}
+    for n in names:
+        kind = _classify_import(n)
+        if kind:
+            groups[kind].append(n)
+    combos = [
+        {"label": label, "hits": [r for r in required if any(r in n for n in low_names)]}
+        for label, required in COMBOS
+        if all(any(r in n for n in low_names) for r in required)
+    ]
+    blocks = list(p.getMemory().getBlocks())
+    return {
+        "binary": str(p.getName()),
+        "md5": str(p.getExecutableMD5()),
+        "language": str(p.getLanguageID()),
+        "compiler": str(p.getCompiler()),
+        "image_base": str(p.getImageBase()),
+        "entry": _entry_chain(p, 3),
+        "functions": int(p.getFunctionManager().getFunctionCount()),
+        "imports": {
+            "total": len(imports),
+            "libs": dict(Counter(i["lib"] for i in imports).most_common()),
+            "groups": {k: v[:12] for k, v in groups.items() if v},
+        },
+        "combos": combos,
+        "strings": _scan_strings(p, per_kind),
+        "hubs": _hubs(p, top),
+        "sizes": _size_buckets(p),
+        "memory": {
+            "blocks": len(blocks),
+            "executable": [str(b.getName()) for b in blocks if bool(b.isExecute())][:8],
+        },
+    }
+
+
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value]
+
+
+def cmd_find(a: dict[str, Any]) -> dict[str, Any]:
+    """Locate candidates by structure (imports / strings / calls), not by name."""
+    e = _entry(a["binary"])
+    p = e["program"]
+    fm = p.getFunctionManager()
+    limit = int(a.get("limit", 20))
+    any_mode = bool(a.get("any", False))
+    filters = {
+        "import": [re.compile(x, re.I) for x in _as_list(a.get("import"))],
+        "string": [re.compile(x, re.I) for x in _as_list(a.get("string"))],
+        "calls": [re.compile(x, re.I) for x in _as_list(a.get("calls"))],
+    }
+    active = {k: v for k, v in filters.items() if v}
+    if not active:
+        raise ValueError("pass at least one of import / string / calls")
+
+    hits: dict[str, dict[str, Any]] = {}
+
+    def touch(fn, kind: str, detail: str) -> None:
+        slot = hits.setdefault(
+            str(fn.getEntryPoint()),
+            {"function": fn, "matched": {"import": [], "string": [], "calls": []}},
+        )
+        bucket = slot["matched"][kind]
+        if len(bucket) < 8 and detail not in bucket:
+            bucket.append(detail)
+
+    if active.get("import"):
+        for sym in p.getSymbolTable().getExternalSymbols():
+            name = str(sym.getName())
+            if not any(pat.search(name) for pat in active["import"]):
+                continue
+            for ref in p.getReferenceManager().getReferencesTo(sym.getAddress()):
+                fn = fm.getFunctionContaining(ref.getFromAddress())
+                if fn is not None:
+                    touch(fn, "import", name)
+
+    if active.get("string"):
+        it = p.getListing().getDefinedData(True)
+        while it.hasNext():
+            d = it.next()
+            try:
+                tname = str(d.getDataType().getName()).lower()
+                if not any(k in tname for k in ("string", "unicode", "terminated", "char")):
+                    continue
+                val = str(d.getValue())
+            except Exception:  # noqa: BLE001
+                continue
+            if not any(pat.search(val) for pat in active["string"]):
+                continue
+            for ref in p.getReferenceManager().getReferencesTo(d.getAddress()):
+                fn = fm.getFunctionContaining(ref.getFromAddress())
+                if fn is not None:
+                    touch(fn, "string", val[:80])
+
+    if active.get("calls"):
+        for fn in fm.getFunctions(True):
+            if fn.isExternal() or fn.isThunk():
+                continue
+            try:
+                called = [str(c.getName()) for c in fn.getCalledFunctions(MONITOR)]
+            except Exception:  # noqa: BLE001
+                continue
+            for name in called:
+                if any(pat.search(name) for pat in active["calls"]):
+                    touch(fn, "calls", name)
+
+    needed = len(active)
+    kept = []
+    for slot in hits.values():
+        matched = slot["matched"]
+        kinds = sum(1 for k in active if matched[k])
+        if (any_mode and kinds == 0) or (not any_mode and kinds < needed):
+            continue
+        fn = slot["function"]
+        kept.append((kinds, int(fn.getBody().getNumAddresses()), fn, matched))
+    kept.sort(key=lambda row: (row[0], row[1]), reverse=True)
+
+    out = []
+    for kinds, size, fn, matched in kept[:limit]:
+        item = brief(fn)
+        item["matched"] = {k: v for k, v in matched.items() if v}
+        item["filters_matched"] = kinds
+        item["size"] = size
+        out.append(item)
+    return {
+        "binary": a["binary"],
+        "filters": {k: [pat.pattern for pat in v] for k, v in active.items()},
+        "mode": "any" if any_mode else "all",
+        "candidates": len(kept),
+        "functions": out,
+    }
+
+
 HANDLERS = {
     "ping": ping,
     "binaries": cmd_binaries,
@@ -484,6 +826,8 @@ HANDLERS = {
     "rename": cmd_rename,
     "comment": cmd_comment,
     "graph": cmd_graph,
+    "digest": cmd_digest,
+    "find": cmd_find,
 }
 
 
