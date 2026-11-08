@@ -3091,6 +3091,51 @@ def cmd_cross_xref(a: dict[str, Any]) -> dict[str, Any]:
     return {"query": a["query"], "searched": len(bins), "binaries": out}
 
 
+def _forward_slice(start_fn, depth: int, limit: int) -> dict[str, Any]:
+    """Everything `start_fn` can reach, with the shortest path to each import.
+
+    Reverse `slice` answers "what has to run for this API to be called"; this
+    answers "if this runs, what can it do" - the question you ask about a
+    function you just found with `find`.
+    """
+    reached: dict[str, dict[str, Any]] = {}
+    seen = {str(start_fn.getEntryPoint())}
+    frontier = [(start_fn, [str(start_fn.getName())])]
+    functions_seen = 1
+    for level in range(1, depth + 1):
+        nxt = []
+        for fn, path in frontier:
+            try:
+                callees = list(fn.getCalledFunctions(MONITOR))
+            except Exception:  # noqa: BLE001
+                continue
+            for callee in callees:
+                name = str(callee.getName())
+                if callee.isExternal() or callee.isThunk() or name.startswith("PTR_"):
+                    key = _clean_name(name)
+                    if key not in reached:
+                        reached[key] = {"import": key, "depth": level, "path": [*path, key]}
+                    continue
+                key = str(callee.getEntryPoint())
+                if key in seen:
+                    continue
+                seen.add(key)
+                functions_seen += 1
+                nxt.append((callee, [*path, name]))
+        frontier = nxt
+        if not frontier:
+            break
+    rows = sorted(reached.values(), key=lambda r: (r["depth"], r["import"]))[:limit]
+    return {
+        "from": str(start_fn.getName()),
+        "addr": str(start_fn.getEntryPoint()),
+        "direction": "forward",
+        "functions_seen": functions_seen,
+        "reached": rows,
+        "total_imports": len(reached),
+    }
+
+
 def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
     """Shortest caller chain that reaches an import (or a named function).
 
@@ -3101,6 +3146,13 @@ def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
     e = _entry(a["binary"])
     p = e["program"]
     fm = p.getFunctionManager()
+    if str(a.get("direction") or "back").lower() == "forward":
+        start = _function(e, a["to"])
+        if start is None:
+            raise KeyError(f"function {a['to']!r} not found")
+        out = _forward_slice(start, int(a.get("depth", 6)), int(a.get("limit", 40)))
+        out["binary"] = a["binary"]
+        return out
     to_pat = re.compile(str(a["to"]), re.I)
     from_pat = re.compile(
         str(
@@ -3433,6 +3485,72 @@ def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def cmd_family(a: dict[str, Any]) -> dict[str, Any]:
+    """Cross-sample report for one family: profiles, shared evidence, and notes.
+
+    `campaign` answers "which samples belong together"; this answers "what do we
+    already know about this family" - the per-program profile plus the notes each
+    sample carries, so a report can be written without re-reading any of them.
+    """
+    from . import campaign
+
+    started = time.time()
+    min_score = float(a.get("min_score", 0.35))
+    target = str(a["binary"]) if a.get("binary") else None
+    bins = binary_names()
+    profiles: dict[str, dict[str, Any]] = {}
+    prints_by: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    for b in bins:
+        try:
+            prints = _program_fingerprints(b)
+        except Exception as ex:  # noqa: BLE001
+            errors.append({"binary": b, "error": f"{type(ex).__name__}: {ex}"})
+            continue
+        prints_by[b] = prints
+        profiles[b] = campaign.profile_from_fingerprints(prints)
+    clusters = campaign.cluster_programs(profiles, min_score)
+    if target:
+        clusters = [c for c in clusters if target in c["members"]]
+        if not clusters:
+            raise KeyError(f"{target} is not in the project")
+
+    reports = []
+    for cluster in clusters:
+        programs = []
+        for member in cluster["members"]:
+            prints = prints_by[member]
+            fns = prints.get("functions") or {}
+            hubs: Counter[str] = Counter()
+            for fp in fns.values():
+                for callee in fp.get("callees") or ():
+                    hubs[callee] += 1
+            notes = _load_notes(member)
+            programs.append(
+                {
+                    "binary": member,
+                    "md5": prints.get("md5"),
+                    "functions": len(fns),
+                    "strings": len(profiles[member]["strings"]),
+                    "imports": len(profiles[member]["imports"]),
+                    "hubs": [{"name": n, "callers": k} for n, k in hubs.most_common(3)],
+                    "notes": len(notes),
+                    "tags": sorted({str(n["tag"]) for n in notes if n.get("tag")}),
+                }
+            )
+        reports.append({**cluster, "programs": programs})
+    limit = int(a.get("limit") or 0)
+    if limit:
+        reports = reports[:limit]
+    return {
+        "min_score": min_score,
+        "binaries": len(profiles),
+        "clusters": reports,
+        "errors": errors,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 HANDLERS = {
     "ping": ping,
     "binaries": cmd_binaries,
@@ -3466,4 +3584,5 @@ HANDLERS = {
     "slice": cmd_slice,
     "similar": cmd_similar,
     "campaign": cmd_campaign,
+    "family": cmd_family,
 }

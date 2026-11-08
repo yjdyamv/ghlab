@@ -31,11 +31,17 @@ def _cluster_order(cluster: dict[str, Any]) -> tuple[int, float, str]:
     return (-int(cluster["size"]), -float(cluster["max_score"]), str(cluster["members"][0]))
 
 
+def _one_line(value: str, width: int = 60) -> str:
+    """Collapse whitespace and truncate, so evidence stays one line per string."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= width else text[: width - 1] + "~"
+
+
 def _string_evidence(values: set[str], limit: int = 5) -> list[str]:
     """The most telling shared strings: long first, placeholders and padding dropped."""
     useful = [v for v in values if len(v.strip()) >= 4]
     useful.sort(key=len, reverse=True)
-    return useful[:limit]
+    return [_one_line(v) for v in useful[:limit]]
 
 
 def cluster_programs(

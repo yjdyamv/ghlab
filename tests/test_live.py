@@ -253,6 +253,27 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("+") for line in lines), "expected an added line")
         self.assertIn("ADDR", "".join(lines))
 
+    def test_slice_forward_lists_reachable_imports(self):
+        r = client.call("slice", binary=BIN, to="FUN_14001e02c", direction="forward")
+        self.assertEqual(r["direction"], "forward")
+        imports = [item["import"] for item in r["reached"]]
+        self.assertIn("RegSetValueExW", imports)
+        for item in r["reached"]:
+            self.assertTrue(item["path"])
+            self.assertEqual(item["depth"], len(item["path"]) - 1)
+
+    def test_family_reports_profiles_and_notes(self):
+        r = client.call("family", binary=BIN)
+        self.assertTrue(r["clusters"])
+        members = [p["binary"] for c in r["clusters"] for p in c["programs"]]
+        self.assertIn(BIN, members)
+        program = next(p for c in r["clusters"] for p in c["programs"] if p["binary"] == BIN)
+        self.assertGreater(program["functions"], 100)
+        self.assertTrue(program["hubs"])
+        for c in r["clusters"]:
+            for value in c["shared_strings"]:
+                self.assertNotIn(chr(10), value)
+
     def test_patch_roundtrip_and_expect_guard(self):
         addr = "1400019d0"
         original = client.call("bytes", binary=BIN, addr=addr, size=4)["hex"]

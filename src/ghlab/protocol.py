@@ -171,6 +171,12 @@ _SPECS = [
         "list stored findings with optional filters",
     ),
     Spec(
+        "family",
+        (),
+        ("binary", "min_score", "limit"),
+        "cross-sample report for one family: per-program profile, shared evidence, notes",
+    ),
+    Spec(
         "report",
         ("binary",),
         ("top",),
@@ -185,8 +191,9 @@ _SPECS = [
     Spec(
         "slice",
         ("binary", "to"),
-        ("from", "depth", "limit", "code"),
-        "shortest call path that reaches an import or function",
+        ("from", "depth", "limit", "code", "direction"),
+        "shortest call path that reaches an import or function (direction=forward: "
+        "what this function can reach)",
     ),
     Spec(
         "similar",

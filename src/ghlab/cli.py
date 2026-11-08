@@ -464,6 +464,18 @@ def fmt_cross_xref(r: dict[str, Any]) -> str:
 
 
 def fmt_slice(r: dict[str, Any]) -> str:
+    if r.get("direction") == "forward":
+        head = (
+            f"# {r['from']} @ {r['addr']}  reaches {r['total_imports']} import(s) "
+            f"via {r['functions_seen']} function(s)"
+        )
+        if not r.get("reached"):
+            return head + chr(10) + "  (reaches no external call within the depth limit)"
+        out = [head]
+        for item in r["reached"]:
+            out.append(f"  {item['import']}  (depth {item['depth']})")
+            out.append("    " + " -> ".join(item["path"]))
+        return chr(10).join(out)
     if not r["paths"]:
         return f"(nothing calls {r['to']!r})"
     out = []
@@ -496,6 +508,28 @@ def fmt_similar(r: dict[str, Any]) -> str:
         if extra:
             out.append("        " + " | ".join(extra))
     return "\n".join(out)
+
+
+def fmt_family(r: dict[str, Any]) -> str:
+    if not r["clusters"]:
+        return "(no family found; lower --min-score)"
+    out = []
+    for c in r["clusters"]:
+        out.append(f"# family of {c['size']}  max_score {c['max_score']}  ({r['elapsed_ms']}ms)")
+        for prog in c["programs"]:
+            hub = ", ".join(f"{h['name']} x{h['callers']}" for h in prog["hubs"]) or "-"
+            out.append(
+                f"  {prog['binary']}  {prog['functions']} fn  {prog['strings']} str  "
+                f"{prog['imports']} imp  notes {prog['notes']}  [{prog['md5'][:8]}]"
+            )
+            out.append(f"    hubs  {hub}")
+            if prog["tags"]:
+                out.append(f"    tags  {', '.join(prog['tags'])}")
+        if c["shared_imports"]:
+            out.append(f"  shared imports  {', '.join(c['shared_imports'])}")
+        if c["shared_strings"]:
+            out.append(f"  shared strings  {', '.join(c['shared_strings'])}")
+    return chr(10).join(out)
 
 
 def fmt_campaign(r: dict[str, Any]) -> str:
@@ -542,6 +576,7 @@ FORMATTERS = {
     "slice": fmt_slice,
     "similar": fmt_similar,
     "campaign": fmt_campaign,
+    "family": fmt_family,
 }
 
 
@@ -1144,6 +1179,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-d", "--depth", type=int, default=12)
     p.add_argument("-n", "--limit", type=int, default=4)
     p.add_argument("--code", action="store_true", help="include the caller's decompiled body")
+    p.add_argument(
+        "--forward",
+        action="store_true",
+        help="reverse the question: what can `to` reach (imports, with paths)",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -1155,6 +1195,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "depth": a.depth,
                 "limit": a.limit,
                 "code": a.code or None,
+                "direction": "forward" if a.forward else None,
             },
         )
     )
@@ -1197,6 +1238,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(
         func=lambda a: _call(
             a, "campaign", {"binary": a.binary, "min_score": a.min_score, "limit": a.limit}
+        )
+    )
+
+    p = sub.add_parser(
+        "family", parents=[common], help="report on one family: profiles, evidence, notes"
+    )
+    p.add_argument("binary", nargs="?", help="report the family this program belongs to")
+    p.add_argument("--min-score", type=float, default=0.35)
+    p.add_argument("-n", "--limit", type=int, default=0, help="max families to show")
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "family", {"binary": a.binary, "min_score": a.min_score, "limit": a.limit}
         )
     )
 

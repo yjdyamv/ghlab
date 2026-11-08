@@ -139,6 +139,8 @@ ghlab pdb sample.exe --file ~/re/samples/sample.pdb
 # 跨程序：哪个样本也连这个域名？这个 API 是由哪条路径走到的？这段逻辑在别的样本里叫什么？
 ghlab cross-xref 'autosave'                       # 全项目搜字符串，附"谁在用"
 ghlab slice notepad.exe RegSetValueExW            # 从入口到该导入的最短调用链
+ghlab slice notepad.exe FUN_14001e02c --forward   # 反过来：它能碰到哪些导入、走哪条路
+ghlab family notepad.exe                          # 这一族每个样本的规模/枢纽/已有结论
 ghlab similar notepad.exe FUN_140021ba8 --against other.exe
 ```
 
@@ -264,13 +266,14 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
 | `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
-| `slice` | `binary, to` / `from, depth, limit, code` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译 |
+| `slice` | `binary, to` / `from, depth, limit, code, direction` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译；`--forward` 反向问"这个函数能到达哪些导入、路径是什么" |
 | `similar` | `binary, target` / `against, limit, min_score` | **跨程序同构函数**：字符串/导入/常量/大小四路指纹打分；零特征的 thunk 一律压到 0.3 以下，避免 stub 互相当成 1.00 |
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
 | `mcp` | – | 以 stdio MCP server 形式暴露 15 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
+| `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。
