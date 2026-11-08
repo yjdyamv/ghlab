@@ -85,6 +85,17 @@ ghlab diff app_v1.exe app_v2.exe -m 'decrypt|auth' -n 10
 ghlab bytes notepad.exe 0x1400019d0 --size 32
 ghlab rename notepad.exe FUN_140001008 sub_parse_cmdline
 ghlab comment notepad.exe 0x1400019d0 'entry stub -> 0x140001850'
+
+# 写：改签名/改数据/打补丁（都落盘，有 --expect 防误写）
+ghlab set-type notepad.exe FUN_14001109c 'int sub_parse(char *s, unsigned n)'
+ghlab set-type notepad.exe 0x140038600 'char[16]'
+ghlab patch notepad.exe 0x1400019d0 --nop 2 --expect 4883        # 只在这两个字节确实是 4883 时才写
+
+# 结论与证据：写进 Ghidra 书签 + 磁盘上的 JSON，最后出 markdown
+ghlab bookmark notepad.exe --target __security_check_cookie --category security --text 'cookie 校验在此'
+ghlab note notepad.exe 'entry 只做 CRT 初始化' --at entry --tag bootstrap
+ghlab notes notepad.exe --tag bootstrap
+ghlab report notepad.exe > notepad.md
 ```
 
 任何命令加 `--json` 得到原始结构；`GHLAB_URL=http://host:port` 可指向远端 daemon。
@@ -115,6 +126,12 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
 | `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因 |
 | `diff` | `a, b` / `match, limit, min_score` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s） |
+| `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
+| `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
+| `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
+| `note` | `binary, text` / `at, tag` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签 |
+| `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
+| `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。
@@ -128,6 +145,7 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 - **协议自描述**：`GET /` 返回全部命令及其参数，agent 可自举。
 - **模拟执行是"够用主义"**：`EmulatorHelper` 在独立内存里跑，写入不落回 program；外部导入用 Python 应答（CRT 真的有语义，其余返回 0），`lock` 等未实现的 p-code op 直接跳过并在输出里点名。所以它适合解密循环、配置解析、返回值推演，不适合依赖真实 API 语义的逻辑。
 - **diff 不假设地址对齐**：指纹是"这个函数引用了哪些字符串/调用了哪些导入/用了哪些常量/多大/多少块"，匹配时先找签名唯一的，再退同地址（同基址补丁）、同名（有符号）、最后相似度贪心（阈值 `--min-score`）。所以既能比同源补丁，也能比隔了几个版本的构建。
+- **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
 
 ## 开发
 
@@ -163,6 +181,12 @@ tests/          test_protocol.py, test_server_client.py（stub session，真 HTT
 10. P-code 模拟跑到导入 thunk 里必然 `step()` 返回 False 且 `getLastError()` = `Instruction decode failed (invalid memory)`；必须用"最后一个落在 program 内存里的 PC"定位调用点，再从 `[rsp]` 取返回地址继续。
 11. `lock` 前缀/x86 atomics 在 12.2 里是 `CALLOTHER "LOCK"`，未实现就直接抛 `Unimplemented CALLOTHER pcodeop (LOCK)` → ghlab 跳过该指令并记录（计数会失真，解密/解析路径通常无影响）。
 12. `MemoryMap.getBytes` 只有 `(Address, byte[])` 重载，jpype 下传长度会 `TypeError: No matching overloads` → 必须用 `JArray(JByte)(size)` 做 sink 再转回 `bytes`。
+13. **不能直接 `setBytes` 到指令上**：报 `Memory change conflicts with instruction at ...` → 先 `listing.clearCodeUnits(addr, end, False)`，写完再 `DisassembleCommand(addr, None, True).applyTo(p)`。
+14. `MemoryBlockDB` 没有 `isWriteable()`（是 `isWrite()`/`setWrite()`），猜错属性名会在**已开启事务之后**抛异常，把 program 卡在未结束事务里，后续所有保存都报 `Unable to lock due to active transaction` → 属性探测要放在 `startTransaction` 之前。
+15. 12.2 的 `BookmarkDBManager` 用**字符串**类型名：`setBookmark(Address, String type, String category, String comment)`、`removeBookmark(Bookmark)`（不是按地址+类型删），也没有 `getType`（是 `getBookmarkType(String)`）。
+16. `FunctionSignatureParser` 的构造是 `(DataTypeManager, DataTypeQueryService)`（传 `None` 即可），`parse` 要 `FunctionSignature` 而不是 `Function`：`parser.parse(fn.getSignature(), 'int f(char *)')`；且 `C`/`CPP` 解析器类在 12.2 已不存在。
+17. `ApplyFunctionSignatureCmd` 不会改函数名 → `set_type` 里要另外 `fn.setName(声明里的名字)`。
+18. **给入口符号改名会让 `program.getEntryPoint()` 失效**（digest 的入口链随之变空）→ 别重命名 `entry`；`_entry_chain` 已加名字/可执行段首函数兜底。
 
 ## License
 

@@ -271,6 +271,67 @@ def fmt_digest(r: dict[str, Any]) -> str:
         out.append("sizes   " + "  ".join(f"{k}:{v}" for k, v in sizes.items()))
     body = "\n".join(out)
     return f"{body}\n~{len(body) // 4} tokens"
+def fmt_patch(r: dict[str, Any]) -> str:
+    return (
+        f"patched {r['size']} byte(s) at {r['addr']}\n"
+        f"  {r['before']} -> {r['after']}\n"
+        f"  saved via {r['saved_via']}"
+    )
+
+
+def fmt_set_type(r: dict[str, Any]) -> str:
+    status = "ok   " if r["applied"] else "FAILED"
+    if r["kind"] == "signature":
+        out = [f"{status} {r['addr']}  {r['prototype']}"]
+    else:
+        out = [f"{status} {r['addr']}  {r['datatype']} ({r['size']}b)"]
+        if r.get("value") is not None:
+            out.append(f"  value: {r['value']}")
+    if r.get("message") and r["message"] not in ("None", "null"):
+        out.append(f"  {r['message']}")
+    return "\n".join(out)
+
+
+def fmt_bookmark(r: dict[str, Any]) -> str:
+    if "bookmarks" in r:
+        if not r["bookmarks"]:
+            return "(no bookmarks)"
+        return "\n".join(
+            f"  [{b['type']}] {b['addr']}  "
+            + (f"{b['category']}: " if b["category"] else "")
+            + b["comment"]
+            for b in r["bookmarks"]
+        )
+    if r.get("removed"):
+        return f"removed bookmark at {r['addr']} ({r['category']})"
+    return f"bookmarked {r['addr']} ({r['type']}, {r['category']})"
+
+
+def fmt_note(r: dict[str, Any]) -> str:
+    n = r["note"]
+    where = f"{n['addr']} {n.get('function') or ''}".strip() or "(general)"
+    return (
+        f"note #{n['id']} [{n['tag']}] {where}\n"
+        f"  {n['text']}\n"
+        f"  ({r['total']} total, {r['path']})"
+    )
+
+
+def fmt_notes(r: dict[str, Any]) -> str:
+    if not r["notes"]:
+        return f"(no notes matched; {r['total']} stored in {r['path']})"
+    out = []
+    for n in r["notes"]:
+        where = f"{n.get('addr') or ''} {n.get('function') or ''}".strip() or "(general)"
+        out.append(f"  #{n['id']} [{n['tag']}] {where}\n      {n['text']}")
+    out.append(f"  ({r['count']} shown / {r['total']} total)")
+    return "\n".join(out)
+
+
+def fmt_report(r: dict[str, Any]) -> str:
+    return r["markdown"].rstrip("\n")
+
+
 FORMATTERS = {
     "binaries": fmt_binaries,
     "info": fmt_info,
@@ -283,6 +344,12 @@ FORMATTERS = {
     "find": fmt_find,
     "diff": fmt_diff,
     "emulate": fmt_emulate,
+    "patch": fmt_patch,
+    "set_type": fmt_set_type,
+    "bookmark": fmt_bookmark,
+    "note": fmt_note,
+    "notes": fmt_notes,
+    "report": fmt_report,
 }
 
 
@@ -645,6 +712,85 @@ def build_parser() -> argparse.ArgumentParser:
             },
         )
     )
+    p = sub.add_parser("patch", parents=[common], help="overwrite bytes (a real patch)")
+    p.add_argument("binary")
+    p.add_argument("addr")
+    p.add_argument("bytes", nargs="?", help="hex bytes, e.g. 9090 or '90 90'")
+    p.add_argument("--nop", type=int, help="write N 0x90 bytes instead")
+    p.add_argument("--expect", help="refuse unless the current bytes match this hex")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "patch",
+            {"binary": a.binary, "addr": a.addr, "bytes": a.bytes, "nop": a.nop, "expect": a.expect},
+        )
+    )
+
+    p = sub.add_parser("set-type", parents=[common], help="apply a prototype or a data type")
+    p.add_argument("binary")
+    p.add_argument("target", help="function name/address, or a data address")
+    p.add_argument("decl", help="'int f(char *s, unsigned n)' or 'char[64]' / 'void*'")
+    p.set_defaults(
+        func=lambda a: _call(a, "set_type", {"binary": a.binary, "target": a.target, "decl": a.decl})
+    )
+
+    p = sub.add_parser("bookmark", parents=[common], help="Ghidra bookmarks")
+    p.add_argument("binary")
+    p.add_argument("--list", dest="action", action="store_const", const="list")
+    p.add_argument("--remove", dest="action", action="store_const", const="remove")
+    p.add_argument("--addr")
+    p.add_argument("--target")
+    p.add_argument("--type", default="Note", choices=list(session.BOOKMARK_TYPES))
+    p.add_argument("--category")
+    p.add_argument("--text", help="bookmark comment")
+    p.add_argument("-n", "--limit", type=int, default=100)
+    p.set_defaults(
+        action="add",
+        func=lambda a: _call(
+            a,
+            "bookmark",
+            {
+                "binary": a.binary,
+                "action": a.action,
+                "addr": a.addr,
+                "target": a.target,
+                "type": a.type,
+                "category": a.category,
+                "comment": a.text,
+                "limit": a.limit,
+            },
+        ),
+    )
+
+    p = sub.add_parser("note", parents=[common], help="record a durable finding")
+    p.add_argument("binary")
+    p.add_argument("text")
+    p.add_argument("--at", help="function name or address")
+    p.add_argument("--tag", default="note", help="group findings (auth, crypto, bug, ...)")
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "note", {"binary": a.binary, "text": a.text, "at": a.at, "tag": a.tag}
+        )
+    )
+
+    p = sub.add_parser("notes", parents=[common], help="list recorded findings")
+    p.add_argument("binary")
+    p.add_argument("--tag")
+    p.add_argument("--at")
+    p.add_argument("-q", "--query")
+    p.add_argument("-n", "--limit", type=int, default=200)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "notes",
+            {"binary": a.binary, "tag": a.tag, "at": a.at, "query": a.query, "limit": a.limit},
+        )
+    )
+
+    p = sub.add_parser("report", parents=[common], help="markdown report (digest + findings)")
+    p.add_argument("binary")
+    p.add_argument("--top", type=int, default=6, help="call-graph hubs to include")
+    p.set_defaults(func=lambda a: _call(a, "report", {"binary": a.binary, "top": a.top}))
     return ap
 
 
@@ -666,6 +812,12 @@ def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Piped output is UTF-8 (agents, editors); a real console keeps its codepage.
+    if not sys.stdout.isatty():
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     argv = list(sys.argv[1:] if argv is None else argv)
     # `--json` is accepted before or after the subcommand.
     global_json = "--json" in argv

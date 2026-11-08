@@ -54,6 +54,23 @@ class EnvelopeTest(unittest.TestCase):
     def test_digest_and_find_are_declared(self):
         self.assertIn("digest", protocol.COMMAND_NAMES)
         self.assertIn("find", protocol.COMMAND_NAMES)
+
+    def test_write_commands_are_declared(self):
+        for name in ("patch", "set_type", "bookmark", "note", "notes", "report"):
+            self.assertIn(name, protocol.COMMAND_NAMES)
+
+    def test_patch_requires_address(self):
+        with self.assertRaises(protocol.ProtocolError) as ctx:
+            protocol.validate({"cmd": "patch", "binary": "x"})
+        self.assertIn("addr", str(ctx.exception))
+
+    def test_set_type_requires_declaration(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "set_type", "binary": "x", "target": "entry"})
+
+    def test_notes_reject_unknown_parameter(self):
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "notes", "binary": "x", "tagz": "y"})
         spec, params = protocol.validate({"cmd": "digest", "binary": "a.exe", "top": 3})
         self.assertEqual(params["top"], 3)
         spec, params = protocol.validate(

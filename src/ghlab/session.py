@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import threading
@@ -102,7 +103,10 @@ def _addr(entry: dict[str, Any], text: str):
         return program.getAddressFactory().getDefaultAddressSpace().getAddress(
             int(text, 16)
         )
-    return entry["api"].toAddr(text)
+    addr = entry["api"].toAddr(text)
+    if addr is None:
+        raise KeyError(f"address or symbol {text!r} not found")
+    return addr
 
 
 def _function(entry: dict[str, Any], target: str):
@@ -607,9 +611,19 @@ def _entry_chain(program, depth: int = 3) -> list[dict[str, str]]:
     except Exception:  # noqa: BLE001
         entry_addr = None
     if entry_addr is None:
+        # getEntryPoint() can come back empty after the entry symbol is renamed,
+        # so fall back to names, then to the first function in executable memory.
+        wanted = ("entry", "_start", "maincrtstartup", "__scrt_common_main_seh")
         for sym in program.getSymbolTable().getAllSymbols(True):
-            if str(sym.getName()).lower() in ("entry", "_start", "maincrtstartup"):
+            if str(sym.getName()).lower() in wanted:
                 entry_addr = sym.getAddress()
+                break
+    if entry_addr is None:
+        for fn in fm.getFunctions(True):
+            if fn.isExternal() or fn.isThunk():
+                continue
+            if program.getMemory().getExecuteSet().contains(fn.getEntryPoint()):
+                entry_addr = fn.getEntryPoint()
                 break
     if entry_addr is None:
         return []
@@ -1639,6 +1653,485 @@ def _has_reg(program, name: str) -> bool:
     return program.getLanguage().getRegister(name) is not None
 
 
+# ------------------------------------------------------------------ write ops
+
+_PRIMITIVES = {
+    "void": "VoidDataType",
+    "char": "CharDataType",
+    "uchar": "UnsignedCharDataType",
+    "byte": "ByteDataType",
+    "sbyte": "SignedByteDataType",
+    "short": "ShortDataType",
+    "ushort": "UnsignedShortDataType",
+    "word": "WordDataType",
+    "int": "IntegerDataType",
+    "uint": "UnsignedIntegerDataType",
+    "dword": "DWordDataType",
+    "long": "LongDataType",
+    "ulong": "UnsignedLongDataType",
+    "longlong": "LongLongDataType",
+    "ulonglong": "UnsignedLongLongDataType",
+    "qword": "QWordDataType",
+    "float": "FloatDataType",
+    "double": "DoubleDataType",
+    "bool": "BooleanDataType",
+    "wchar": "WideCharDataType",
+    "unicode": "UnicodeDataType",
+}
+
+_TYPE_ALIASES = {
+    "int8": "sbyte",
+    "uint8": "byte",
+    "int16": "short",
+    "uint16": "ushort",
+    "int32": "int",
+    "uint32": "uint",
+    "int64": "longlong",
+    "uint64": "ulonglong",
+    "size_t": "ulonglong",
+    "ssize_t": "longlong",
+    "uintptr_t": "ulonglong",
+    "intptr_t": "longlong",
+    "ptrdiff_t": "longlong",
+    "wchar_t": "wchar",
+    "handle": "void*",
+    "lpvoid": "void*",
+    "lpcstr": "char*",
+    "lpstr": "char*",
+    "lpwstr": "wchar*",
+    "signed char": "sbyte",
+    "unsigned char": "uchar",
+    "unsigned short": "ushort",
+    "unsigned int": "uint",
+    "unsigned long": "ulong",
+    "unsigned long long": "ulonglong",
+    "long long": "longlong",
+    "signed int": "int",
+    "signed short": "short",
+}
+
+
+def _byte_array(data: bytes):
+    """Java byte[] (signed) from Python bytes."""
+    from jpype import JArray, JByte
+
+    arr = JArray(JByte)(len(data))
+    for i, value in enumerate(data):
+        arr[i] = value - 256 if value > 127 else value
+    return arr
+
+
+def _parse_type_spec(text: str) -> tuple[str, int, list[int]]:
+    """Split 'char * * [16]' into (base, pointer_depth, [dims])."""
+    spec = text.strip().rstrip(";").strip()
+    while spec.lower().startswith(("const ", "volatile ", "struct ", "union ", "enum ")):
+        spec = spec.split(None, 1)[1].strip()
+    m = re.match(
+        r"^(?P<base>[A-Za-z_][A-Za-z0-9_ ]*?)\s*(?P<stars>\*+)?\s*(?P<dims>(?:\[\s*\d+\s*\])*)$",
+        spec,
+    )
+    if not m:
+        raise ValueError(f"cannot parse type {text!r} (try 'char[64]', 'int*', 'void')")
+    base = m.group("base").strip().lower()
+    stars = len(m.group("stars") or "")
+    dims = [int(d) for d in re.findall(r"\[\s*(\d+)\s*\]", m.group("dims") or "")]
+    alias = _TYPE_ALIASES.get(base)
+    if alias is not None:
+        alias_base, alias_stars, _ = _parse_type_spec(alias)
+        base, stars = alias_base, stars + alias_stars
+    return base, stars, dims
+
+
+def _datatype(program, text: str):
+    """Build a Ghidra DataType from a small C-ish type expression."""
+    import jpype
+    from ghidra.program.model.data import ArrayDataType, PointerDataType, StructureDataType
+
+    base, stars, dims = _parse_type_spec(text)
+    dtm = program.getDataTypeManager()
+    dt = None
+    if base in _PRIMITIVES:
+        dt = getattr(jpype.JClass("ghidra.program.model.data." + _PRIMITIVES[base]), "dataType")
+    if dt is None:
+        dt = dtm.getDataType("/" + base)
+    if dt is None:
+        dt = dtm.getDataType(base)
+    if dt is None:
+        raise ValueError(
+            f"unknown type {base!r} (primitives: {', '.join(sorted(_PRIMITIVES))}; "
+            "other names must exist in the program's data type manager)"
+        )
+    for dim in reversed(dims):
+        dt = ArrayDataType(dt, dim, 0)
+    for _ in range(stars):
+        dt = PointerDataType(dt)
+    return dt
+
+
+def _signature_parser(program, source_type):
+    from ghidra.app.util.parser import FunctionSignatureParser
+
+    dtm = program.getDataTypeManager()
+    # 12.2 signature: (DataTypeManager, DataTypeQueryService); the service is optional here.
+    for ctor in (
+        lambda: FunctionSignatureParser(dtm, None),
+        lambda: FunctionSignatureParser(dtm, source_type),
+    ):
+        try:
+            return ctor()
+        except Exception:
+            continue
+    raise RuntimeError("could not construct FunctionSignatureParser")
+
+
+def _block_writable(block) -> bool:
+    """MemoryBlock exposes either isWriteable() or isWrite() depending on version."""
+    for attr in ("isWriteable", "isWrite"):
+        fn = getattr(block, attr, None)
+        if fn is not None:
+            try:
+                return bool(fn())
+            except Exception:
+                continue
+    return True
+
+
+def cmd_patch(a: dict[str, Any]) -> dict[str, Any]:
+    """Overwrite bytes in the program image (a real patch, saved to the project)."""
+    e = _entry(a["binary"])
+    p = e["program"]
+    addr = _addr(e, str(a["addr"]))
+    if a.get("nop"):
+        data = b"\x90" * int(a["nop"])
+    else:
+        raw = str(a.get("bytes") or "").replace(" ", "").replace("\\x", "")
+        if not raw:
+            raise ValueError("nothing to write: pass bytes='9090' or nop=5")
+        try:
+            data = bytes.fromhex(raw)
+        except ValueError:
+            raise ValueError(f"bytes must be hex, got {a.get('bytes')!r}") from None
+    mem = p.getMemory()
+    before = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(len(data)))
+    if a.get("expect") is not None:
+        want = bytes.fromhex(str(a["expect"]).replace(" ", "").replace("\\x", ""))
+        if len(want) != len(data):
+            raise ValueError(
+                f"expect is {len(want)} byte(s) but the write is {len(data)} byte(s) "
+                "(they must describe the same range)"
+            )
+        if want != before:
+            raise ValueError(
+                f"expect mismatch at {addr}: found {before.hex()}, expected {want.hex()} (not patched)"
+            )
+    tx = p.startTransaction("ghlab-patch")
+    block = mem.getBlock(addr)
+    writable = _block_writable(block) if block is not None else True
+    try:
+        if block is not None and not writable:
+            block.setWrite(True)
+        # Ghidra refuses to overwrite bytes that belong to an instruction, so drop
+        # the code units first and re-disassemble afterwards.
+        p.getListing().clearCodeUnits(addr, addr.add(len(data) - 1), False)
+        mem.setBytes(addr, _byte_array(data))
+    finally:
+        if block is not None and not writable:
+            try:
+                block.setWrite(False)
+            except Exception:
+                pass
+        p.endTransaction(tx, True)
+    from ghidra.app.cmd.disassemble import DisassembleCommand
+
+    tx = p.startTransaction("ghlab-patch-disasm")
+    try:
+        DisassembleCommand(addr, None, True).applyTo(p)
+    finally:
+        p.endTransaction(tx, True)
+    after = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(len(data)))
+    saved = _save(p, "ghlab patch")
+    return {
+        "addr": str(addr),
+        "before": before.hex(),
+        "after": after.hex(),
+        "size": len(data),
+        "saved_via": saved,
+    }
+
+
+def _prototype(fn) -> str:
+    """Prototype string across Ghidra versions (overloads differ per class)."""
+    for args in ((True, False), (True,), ()):
+        try:
+            return str(fn.getPrototypeString(*args))
+        except Exception:
+            continue
+    return str(fn.getName())
+
+
+def cmd_set_type(a: dict[str, Any]) -> dict[str, Any]:
+    """Apply a function prototype ('int f(char *s, unsigned n)') or a data type
+    ('char[64]', 'void*', 'DWORD') at an address."""
+    from ghidra.app.cmd.data import CreateDataCmd
+    from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+    from ghidra.program.model.symbol import SourceType
+
+    e = _entry(a["binary"])
+    p = e["program"]
+    decl = str(a["decl"]).strip()
+    if "(" in decl and ")" in decl:
+        fn = _function(e, a["target"])
+        if fn is None:
+            raise KeyError(f"function {a['target']!r} not found")
+        # parse() takes a FunctionSignature; fn.getSignature() hands us one (a
+        # FunctionDefinitionDataType) without any jpype casting games.
+        fdef = _signature_parser(p, SourceType.USER_DEFINED).parse(fn.getSignature(), decl)
+        new_name = str(fdef.getName() or "").strip()
+        tx = p.startTransaction("ghlab-signature")
+        try:
+            cmd = ApplyFunctionSignatureCmd(fn.getEntryPoint(), fdef, SourceType.USER_DEFINED)
+            ok = bool(cmd.applyTo(p))
+            # ApplyFunctionSignatureCmd keeps the old name; the declaration is the
+            # authority on what the function is called.
+            if ok and new_name and new_name != str(fn.getName()):
+                fn.setName(new_name, SourceType.USER_DEFINED)
+        finally:
+            p.endTransaction(tx, True)
+        saved = _save(p, "ghlab signature")
+        after = p.getFunctionManager().getFunctionAt(fn.getEntryPoint())
+        return {
+            "kind": "signature",
+            "applied": ok,
+            "addr": str(fn.getEntryPoint()),
+            "prototype": _prototype(after) if after is not None else str(fdef.getPrototypeString()),
+            "message": str(cmd.getStatusMsg()),
+            "saved_via": saved,
+        }
+    addr = _addr(e, str(a["target"]))
+    dt = _datatype(p, decl)
+    tx = p.startTransaction("ghlab-set-data")
+    try:
+        cmd = CreateDataCmd(addr, dt)
+        ok = bool(cmd.applyTo(p))
+    finally:
+        p.endTransaction(tx, True)
+    saved = _save(p, "ghlab data")
+    data = p.getListing().getDataAt(addr) if ok else None
+    return {
+        "kind": "data",
+        "applied": ok,
+        "addr": str(addr),
+        "datatype": str(data.getDataType().getName()) if data is not None else str(dt.getName()),
+        "size": int(dt.getLength()),
+        "value": str(data.getValue()) if data is not None and data.getValue() is not None else None,
+        "message": str(cmd.getStatusMsg()),
+        "saved_via": saved,
+    }
+
+
+BOOKMARK_TYPES = ("Note", "Info", "Warning", "Error", "Analysis")
+
+
+def cmd_bookmark(a: dict[str, Any]) -> dict[str, Any]:
+    """Ghidra bookmarks, so findings show up in the GUI too."""
+    e = _entry(a["binary"])
+    p = e["program"]
+    bm = p.getBookmarkManager()
+    action = str(a.get("action", "add")).lower()
+    btype = str(a.get("type") or "Note")
+    category = str(a.get("category") or "ghlab")
+    if action == "list":
+        out = []
+        cap = int(a.get("limit", 100))
+        it = bm.getBookmarksIterator()
+        while it.hasNext() and len(out) < cap:
+            b = it.next()
+            if a.get("type") and str(b.getTypeString()) != btype:
+                continue
+            out.append(
+                {
+                    "addr": str(b.getAddress()),
+                    "type": str(b.getTypeString()),
+                    "category": str(b.getCategory()),
+                    "comment": str(b.getComment()),
+                }
+            )
+        return {"bookmarks": out, "count": len(out)}
+    target = a.get("target") or a.get("addr")
+    if not target:
+        raise ValueError("bookmark needs --addr/--target")
+    addr = _addr(e, str(target))
+    if action == "remove":
+        doomed = []
+        it = bm.getBookmarksIterator()
+        while it.hasNext():
+            b = it.next()
+            if (
+                str(b.getAddress()) == str(addr)
+                and str(b.getCategory()) == category
+                and str(b.getTypeString()) == btype
+            ):
+                doomed.append(b)
+        tx = p.startTransaction("ghlab-bookmark")
+        try:
+            for b in doomed:
+                bm.removeBookmark(b)
+        finally:
+            p.endTransaction(tx, True)
+        _save(p, "ghlab bookmark")
+        return {"removed": len(doomed), "addr": str(addr), "category": category}
+    if action != "add":
+        raise ValueError("action must be add, list or remove")
+    tx = p.startTransaction("ghlab-bookmark")
+    try:
+        bm.setBookmark(addr, btype, category, str(a.get("comment") or ""))
+    finally:
+        p.endTransaction(tx, True)
+    _save(p, "ghlab bookmark")
+    return {"added": True, "addr": str(addr), "type": btype, "category": category}
+
+
+# ------------------------------------------------------------------- findings
+
+def _notes_dir() -> Path:
+    base = _project_dir or (Path.home() / "re" / "proj")
+    d = Path(base) / ".ghlab" / "notes"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _notes_file(binary: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _notes_dir() / (safe + ".json")
+
+
+def _load_notes(binary: str) -> list[dict[str, Any]]:
+    path = _notes_file(binary)
+    if not path.exists():
+        return []
+    try:
+        return list(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def _store_notes(binary: str, notes: list[dict[str, Any]]) -> None:
+    _notes_file(binary).write_text(json.dumps(notes, indent=2) + "\n", encoding="utf-8")
+
+
+def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
+    """Append a durable finding (JSON on disk + a Ghidra bookmark)."""
+    import time
+
+    binary = str(a["binary"])
+    notes = _load_notes(binary)
+    at = a.get("at")
+    addr = None
+    name = None
+    if at or a.get("addr"):
+        e = _entry(binary)
+        target = at or a.get("addr")
+        fn = _function(e, str(target))
+        addr = str(fn.getEntryPoint()) if fn is not None else str(_addr(e, str(target)))
+        name = str(fn.getName()) if fn is not None else None
+        bm = e["program"].getBookmarkManager()
+        tx = e["program"].startTransaction("ghlab-note")
+        try:
+            bm.setBookmark(_addr(e, addr), "Note", str(a.get("tag") or "ghlab"), str(a["text"]))
+        finally:
+            e["program"].endTransaction(tx, True)
+    note = {
+        "id": len(notes) + 1,
+        "binary": binary,
+        "addr": addr,
+        "function": name,
+        "tag": str(a.get("tag") or "note"),
+        "text": str(a["text"]),
+        "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    notes.append(note)
+    _store_notes(binary, notes)
+    return {"note": note, "total": len(notes), "path": str(_notes_file(binary))}
+
+
+def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
+    binary = str(a["binary"])
+    notes = _load_notes(binary)
+    tag = a.get("tag")
+    at = a.get("at")
+    query = a.get("query")
+    out = []
+    for n in notes:
+        if tag and n.get("tag") != tag:
+            continue
+        if at and at.lower() not in (n.get("addr") or "").lower() and at.lower() not in (
+            (n.get("function") or "").lower()
+        ):
+            continue
+        if query and query.lower() not in (n.get("text") or "").lower():
+            continue
+        out.append(n)
+    cap = int(a.get("limit", 200))
+    return {"notes": out[:cap], "count": len(out), "total": len(notes), "path": str(_notes_file(binary))}
+
+
+def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
+    """Markdown report: triage digest + findings, ready to paste into a writeup."""
+    binary = str(a["binary"])
+    d = cmd_digest({"binary": binary, "top": int(a.get("top", 6)), "strings": 2})
+    notes = _load_notes(binary)
+    imports = d.get("imports") or {}
+    strings = d.get("strings") or {}
+    lines = [f"# {binary}", ""]
+    lines.append(
+        "- md5 `{}` | {} | {} | {} functions | {} strings | {} imports".format(
+            str(d.get("md5", ""))[:16],
+            d.get("language", "?"),
+            d.get("compiler", "?"),
+            d.get("functions", "?"),
+            strings.get("total", "?"),
+            imports.get("total", "?"),
+        )
+    )
+    entry = d.get("entry") or []
+    if entry:
+        lines.append("- entry chain: " + " -> ".join(f"{e.get('name')}" for e in entry[:4]))
+    groups = imports.get("groups") or {}
+    hot = [f"{k} ({v})" for k, v in groups.items() if v]
+    if hot:
+        lines.append("- import groups: " + ", ".join(hot))
+    combos = d.get("combos") or []
+    if combos:
+        lines.append(
+            "- capability combos: "
+            + "; ".join(f"{c.get('label')} [{', '.join(c.get('hits') or [])}]" for c in combos)
+        )
+    hubs = d.get("hubs") or []
+    if hubs:
+        lines += ["", "## Call-graph hubs", ""]
+        for h in hubs:
+            lines.append(f"- `{h.get('addr')}` {h.get('name')} — {h.get('callers')} callers, {h.get('size')}b")
+    sizes = d.get("sizes") or {}
+    if sizes:
+        lines += ["", "## Function sizes", ""]
+        lines.append(" | ".join(f"{k}: {v}" for k, v in sizes.items()))
+    lines += ["", "## Findings"]
+    if not notes:
+        lines += ["", "_none yet — `ghlab note BIN ...` while you work_"]
+    by_tag: dict[str, list[dict[str, Any]]] = {}
+    for n in notes:
+        by_tag.setdefault(str(n.get("tag") or "note"), []).append(n)
+    for tag in sorted(by_tag):
+        lines += ["", f"### {tag}"]
+        for n in by_tag[tag]:
+            where = n.get("addr") or ""
+            fn = n.get("function")
+            label = f"`{where}` {fn}" if fn else (f"`{where}`" if where else "(general)")
+            lines.append(f"- {label} — {n.get('text')}")
+    markdown = chr(10).join(lines) + chr(10)
+    return {"markdown": markdown, "notes": len(notes), "binary": binary}
+
+
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
     with LOCK:
         return HANDLERS[cmd](params)
@@ -1661,4 +2154,10 @@ HANDLERS = {
     "find": cmd_find,
     "diff": cmd_diff,
     "emulate": cmd_emulate,
+    "patch": cmd_patch,
+    "set_type": cmd_set_type,
+    "bookmark": cmd_bookmark,
+    "note": cmd_note,
+    "notes": cmd_notes,
+    "report": cmd_report,
 }

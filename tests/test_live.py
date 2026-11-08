@@ -196,6 +196,61 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(changed["matched_by"], "signature")
         self.assertLess(changed["delta"]["insns"][1], changed["delta"]["insns"][0])
 
+    def test_patch_roundtrip_and_expect_guard(self):
+        addr = "1400019d0"
+        original = client.call("bytes", binary=BIN, addr=addr, size=4)["hex"]
+        try:
+            r = client.call("patch", binary=BIN, addr=addr, bytes="90909090", expect=original)
+            self.assertEqual(r["after"], "90909090")
+            self.assertEqual(client.call("bytes", binary=BIN, addr=addr, size=4)["hex"], "90909090")
+        finally:
+            client.call("patch", binary=BIN, addr=addr, bytes=original, expect="90909090")
+        self.assertEqual(client.call("bytes", binary=BIN, addr=addr, size=4)["hex"], original)
+        with self.assertRaises(RemoteError) as ctx:
+            client.call("patch", binary=BIN, addr=addr, bytes="90", expect="aabb")
+        self.assertIn("expect", str(ctx.exception))
+
+    def test_set_type_signature_and_data(self):
+        # Rename a spare function, then put the name back: the point is that the
+        # declaration's name wins and that the signature sticks.
+        target = "FUN_140008508"
+        names = client.call("functions", binary=BIN, match=f"^{target}$")["functions"]
+        if not names:
+            self.skipTest(f"{target} not present")
+        try:
+            r = client.call("set_type", binary=BIN, target=target, decl="int ghlab_probe(int a)")
+            self.assertEqual(r["kind"], "signature")
+            self.assertTrue(r["applied"])
+            self.assertIn("ghlab_probe", r["prototype"])
+        finally:
+            client.call("rename", binary=BIN, target="ghlab_probe", new=target)
+        data = client.call("set_type", binary=BIN, target="0x140038600", decl="char[8]")
+        self.assertEqual(data["kind"], "data")
+        self.assertEqual(data["size"], 8)
+        self.assertTrue(data["datatype"].startswith("char"))
+
+    def test_bookmark_roundtrip(self):
+        addr = "1400019d0"
+        client.call(
+            "bookmark", binary=BIN, addr=addr, category="ghlab-test", comment="unit test"
+        )
+        listed = client.call("bookmark", binary=BIN, action="list")["bookmarks"]
+        self.assertTrue(any(b["category"] == "ghlab-test" for b in listed))
+        removed = client.call("bookmark", binary=BIN, action="remove", addr=addr, category="ghlab-test")
+        self.assertEqual(removed["removed"], 1)
+
+    def test_note_then_report_contains_it(self):
+        text = "ghlab live test finding"
+        r = client.call("note", binary=BIN, text=text, at="entry", tag="test")
+        note = r["note"]
+        self.assertEqual(note["function"], "entry")
+        listed = client.call("notes", binary=BIN, tag="test")
+        self.assertTrue(any(n["text"] == text for n in listed["notes"]))
+        report = client.call("report", binary=BIN, top=3)["markdown"]
+        self.assertIn("## Findings", report)
+        self.assertIn(text, report)
+        self.assertIn("Call-graph hubs", report)
+
 
 @unittest.skipUnless(LIVE and os.environ.get("GHLAB_LIVE_IMPORT"), "set GHLAB_LIVE_IMPORT=1")
 class LiveImportTest(unittest.TestCase):

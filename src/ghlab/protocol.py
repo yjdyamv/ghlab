@@ -102,6 +102,42 @@ _SPECS = [
         ("args", "max_insns", "ms", "dump", "buffer"),
         "run one function on the P-code emulator: seeded args, tracked writes, return value",
     ),
+    Spec(
+        "patch",
+        ("binary", "addr"),
+        ("bytes", "nop", "expect"),
+        "overwrite bytes at an address (hex or --nop), optionally verifying the old bytes",
+    ),
+    Spec(
+        "set_type",
+        ("binary", "target", "decl"),
+        (),
+        "apply a prototype ('int f(char *s, unsigned n)') or a data type ('char[64]', 'void*')",
+    ),
+    Spec(
+        "bookmark",
+        ("binary",),
+        ("action", "addr", "target", "type", "category", "comment", "limit"),
+        "add/list/remove Ghidra bookmarks so findings are visible in the GUI",
+    ),
+    Spec(
+        "note",
+        ("binary", "text"),
+        ("at", "addr", "tag"),
+        "append a durable finding (JSON on disk + bookmark)",
+    ),
+    Spec(
+        "notes",
+        ("binary",),
+        ("tag", "at", "query", "limit"),
+        "list stored findings with optional filters",
+    ),
+    Spec(
+        "report",
+        ("binary",),
+        ("top",),
+        "markdown report: digest + findings",
+    ),
 ]
 SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}
 COMMAND_NAMES = sorted(SPECS)
