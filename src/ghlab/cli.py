@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from . import session
+from . import __version__, session
 from .client import Client, RemoteError
 from .protocol import DEFAULT_HOST, DEFAULT_PORT
 
@@ -544,6 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ghlab",
         description="Warm Ghidra bridge: persistent headless Ghidra behind a JSON API.",
     )
+    ap.add_argument("--version", action="version", version=f"ghlab {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("serve", parents=[daemon], help="run the daemon in the foreground")
@@ -975,11 +976,12 @@ def cmd_run(a: argparse.Namespace) -> int:
         return 2
     if a.json:
         _print_json(summary)
+    elif summary["dry_run"]:
+        print(f"{summary['total']} step(s) planned (dry run)")
     else:
         spent = sum(int(s.get("ms") or 0) for s in summary["steps"])
         ok = summary["ran"] - summary["failed"]
-        note = " (dry run)" if summary["dry_run"] else f" in {spent}ms"
-        print(f"{ok}/{summary['total']} steps ok{note}")
+        print(f"{ok}/{summary['total']} steps ok in {spent}ms")
         for s in summary["steps"]:
             if s["status"] == "failed":
                 print(f"  line {s['line']}: {s['command']} - {s['error']}")
