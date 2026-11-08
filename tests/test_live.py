@@ -248,6 +248,34 @@ class LiveTest(unittest.TestCase):
         self.assertIn(text, report)
         self.assertIn("Call-graph hubs", report)
 
+    def test_map_batches_a_selection_and_returns_hits(self):
+        r = client.call(
+            "map",
+            binary=BIN,
+            **{"from": "import:RegSetValueExW"},
+            op="decompile",
+            grep="Reg",
+            limit=10,
+        )
+        self.assertEqual(r["op"], "decompile")
+        self.assertGreaterEqual(r["selected"], 1)
+        self.assertGreaterEqual(r["hits"], 1)
+        for item in r["results"]:
+            for hit in item["matched"]:
+                self.assertIn("Reg", hit.get("text", ""))
+
+    def test_map_rejects_unknown_selector(self):
+        with self.assertRaises(RemoteError):
+            client.call("map", binary=BIN, **{"from": "bogus:1"})
+
+    def test_map_collects_imports_without_decompiling(self):
+        r = client.call(
+            "map", binary=BIN, **{"from": "name:^FUN_14000"}, op="imports", grep="Reg", limit=5
+        )
+        self.assertEqual(r["op"], "imports")
+        for item in r["results"]:
+            self.assertTrue(item["matched"])
+
     def test_claims_are_checked_at_write_and_again_on_verify(self):
         note = client.call(
             "note",

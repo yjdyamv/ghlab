@@ -106,6 +106,13 @@ ghlab note notepad.exe '持久化写入点' --at FUN_14001e02c --tag persistence
 #   [OK] size>=200 - 213 bytes
 ghlab verify notepad.exe            # 全部重算：PASS / FAIL / UNKNOWN
 
+# 批量：一个调用扫完一组函数，只回命中行（不再"每个函数一次往返"）
+ghlab map notepad.exe --from 'import:RegSetValueExW' --op decompile -g 'Reg|Autosave'
+# import:RegSetValueExW -> decompile (grep: Reg|Autosave), 4/4 function(s), 15 hit(s), 2610ms
+#   140021ba8 FUN_140021ba8 (1082b) 9 hit(s)
+#       53: LVar6 = RegCreateKeyExW((HKEY)0xffffffff80000001,L"Software\Microsoft\Notepad\Autosave",0,
+ghlab map notepad.exe --from 'name:^FUN_14000' --op imports -g Reg -n 50   # 只要导入，不反编译
+
 # 跨程序：哪个样本也连这个域名？这个 API 是由哪条路径走到的？这段逻辑在别的样本里叫什么？
 ghlab cross-xref 'autosave'                       # 全项目搜字符串，附"谁在用"
 ghlab slice notepad.exe RegSetValueExW            # 从入口到该导入的最短调用链
@@ -224,6 +231,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
 | `note` | `binary, text` / `at, addr, tag, assert` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
+| `map` | `binary` / `from, op, grep, limit, hits` | **批量原语**：`--from` 选函数集（`all`/`name:`/`import:`/`calls:`/`string:`/`const:`/`addr:`），`--op` 取 `decompile`/`strings`/`imports`/`calls`/`consts`，`-g` 只留命中行。4 个函数反编译+过滤 ≈2.6s，回 15 行而不是 4 份源码 |
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
 | `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
@@ -250,6 +258,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
+- **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
 - **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。
 
 ## 开发

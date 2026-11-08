@@ -59,6 +59,14 @@ class EnvelopeTest(unittest.TestCase):
         for name in ("patch", "set_type", "bookmark", "note", "notes", "verify", "report"):
             self.assertIn(name, protocol.COMMAND_NAMES)
 
+    def test_map_is_declared_and_validated(self):
+        _spec, params = protocol.validate(
+            {"cmd": "map", "binary": "x", "from": "import:RegSetValueExW", "op": "decompile"}
+        )
+        self.assertEqual(params["op"], "decompile")
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "map", "binary": "x", "selector": "all"})
+
     def test_note_accepts_claims_and_verify_takes_ids(self):
         _spec, params = protocol.validate(
             {"cmd": "note", "binary": "x", "text": "t", "at": "entry", "assert": ["const=1"]}

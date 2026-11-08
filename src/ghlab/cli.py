@@ -359,6 +359,28 @@ def fmt_notes(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_map(r: dict[str, Any]) -> str:
+    head = f"{r['from']} -> {r['op']}"
+    if r.get("grep"):
+        head += f" (grep: {r['grep']})"
+    head += f", {r['matched']}/{r['scanned']} function(s), {r['hits']} hit(s), {r['elapsed_ms']}ms"
+    if not r["matched"]:
+        return f"{head}\n  (nothing matched - widen --from or drop --grep)"
+    out = [head]
+    for item in r["results"]:
+        label = f"  {item.get('addr')} {item.get('name')} ({item.get('size')}b)"
+        if item.get("error"):
+            out.append(f"{label}\n      error: {item['error']}")
+            continue
+        out.append(f"{label} {item['hits']} hit(s)")
+        for hit in item["matched"]:
+            if "line" in hit:
+                out.append(f"      {hit['line']}: {str(hit.get('text', ''))[:110]}")
+            else:
+                out.append(f"      {str(hit.get('text', ''))[:110]}")
+    return "\n".join(out)
+
+
 def fmt_report(r: dict[str, Any]) -> str:
     return r["markdown"].rstrip("\n")
 
@@ -449,6 +471,7 @@ FORMATTERS = {
     "verify": fmt_verify,
     "notes": fmt_notes,
     "report": fmt_report,
+    "map": fmt_map,
     "cross_xref": fmt_cross_xref,
     "slice": fmt_slice,
     "similar": fmt_similar,
@@ -908,6 +931,38 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("--id", action="append", type=int, help="only these note ids")
     p.set_defaults(func=lambda a: _call(a, "verify", {"binary": a.binary, "id": a.id}))
+
+    p = sub.add_parser("map", parents=[common], help="run one op over many functions, keep hits")
+    p.add_argument("binary")
+    p.add_argument(
+        "--from",
+        dest="from_",
+        default="all",
+        help="all | name:RE | import:RE | calls:RE | string:RE | const:HEX | addr:0x..,0x..",
+    )
+    p.add_argument(
+        "--op",
+        default="decompile",
+        choices=["decompile", "strings", "imports", "calls", "consts"],
+        help="what to collect per function",
+    )
+    p.add_argument("-g", "--grep", help="regex: keep only matching lines/entries")
+    p.add_argument("-n", "--limit", type=int, default=200, help="max functions")
+    p.add_argument("--hits", type=int, default=5, help="max hits per function")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "map",
+            {
+                "binary": a.binary,
+                "from": a.from_,
+                "op": a.op,
+                "grep": a.grep,
+                "limit": a.limit,
+                "hits": a.hits,
+            },
+        )
+    )
 
     p = sub.add_parser("notes", parents=[common], help="list recorded findings")
     p.add_argument("binary")

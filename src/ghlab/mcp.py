@@ -212,6 +212,30 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_map",
+        "description": (
+            "Batch primitive: pick a set of functions with `from` (name:/import:/calls:/string:/"
+            "const:/addr:), then either decompile them or collect their strings/imports/calls/"
+            "constants. `grep` keeps only matching lines, so a 200-function sweep costs one "
+            "call and returns only the hits. Use this instead of looping ghlab_decompile."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "from": {"type": "string", "description": "selector, default all"},
+                "op": {
+                    "type": "string",
+                    "enum": ["decompile", "strings", "imports", "calls", "consts"],
+                },
+                "grep": {"type": "string", "description": "regex over source lines / entries"},
+                "limit": _LIMIT,
+                "hits": {"type": "integer", "description": "max hits per function"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
         "name": "ghlab_report",
         "description": "Markdown report for one binary: digest summary, hubs, size buckets and findings.",
         "inputSchema": {
@@ -234,6 +258,7 @@ _COMMANDS = {
     "ghlab_similar": "similar",
     "ghlab_note": "note",
     "ghlab_verify": "verify",
+    "ghlab_map": "map",
     "ghlab_report": "report",
 }
 

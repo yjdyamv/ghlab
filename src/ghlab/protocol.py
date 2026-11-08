@@ -135,6 +135,12 @@ _SPECS = [
         "re-run the claims of stored findings and report pass/fail",
     ),
     Spec(
+        "map",
+        ("binary",),
+        ("from", "op", "grep", "limit", "hits"),
+        "run one operation over a set of functions, return only the matches",
+    ),
+    Spec(
         "notes",
         ("binary",),
         ("tag", "at", "query", "limit"),

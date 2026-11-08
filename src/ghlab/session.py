@@ -2694,6 +2694,139 @@ def cmd_similar(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _select_functions(e, spec: str, limit: int) -> list[Any]:
+    """Resolve `name:^FUN_`, `import:RegSet`, `calls:X`, `string:Auto`, `const:0x41`,
+    `addr:0x140001000,0x140002000` or `all` into a bounded list of functions."""
+    program = e["program"]
+    kind, _, value = str(spec).partition(":")
+    kind = kind.strip().lower() or "all"
+    value = value.strip()
+    known = ("all", "name", "import", "calls", "string", "const", "addr")
+    if kind not in known:
+        raise ValueError(f"unknown selector {kind!r} (kinds: {', '.join(known)})")
+    pat = re.compile(value, re.I) if value else None
+    wanted_addrs = set()
+    if kind == "addr":
+        for chunk in value.split(","):
+            numeric = _hex_addr(chunk)
+            if numeric is None:
+                raise ValueError(f"bad address {chunk!r} in selector")
+            wanted_addrs.add(numeric)
+    out: list[Any] = []
+    for fn in program.getFunctionManager().getFunctions(True):
+        if fn.isExternal() or fn.isThunk():
+            continue
+        ok = False
+        if kind == "all":
+            ok = True
+        elif kind == "name":
+            ok = bool(pat and pat.search(str(fn.getName())))
+        elif kind == "addr":
+            ok = int(fn.getEntryPoint().getOffset()) in wanted_addrs
+        elif kind in ("import", "calls"):
+            ok = bool(pat) and any(
+                pat.search(str(c.getName())) for c in fn.getCalledFunctions(MONITOR)
+            )
+        else:  # string / const need the instruction-level facts
+            try:
+                facts = _claim_facts(program, fn)
+            except Exception:  # noqa: BLE001 - jpype call, can raise anything
+                continue
+            if pat is None:
+                continue
+            pool = facts["strings"] if kind == "string" else {str(c) for c in facts["consts"]}
+            ok = any(pat.search(x) for x in pool)
+        if ok:
+            out.append(fn)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _map_rows(e, functions: list[Any], op: str, grep: re.Pattern[str] | None, hits: int):
+    """One row per function: only what matched, never the whole body."""
+    program = e["program"]
+    rows = []
+    for fn in functions:
+        item = brief(fn)
+        item["matched"] = []
+        item["hits"] = 0
+        if op == "decompile":
+            code = None
+            with contextlib.suppress(Exception):  # cache key touches jpype
+                code = _cache_read(_decomp_cache_key(e, fn))
+            if code is None:
+                res = e["decomp"].decompileFunction(fn, 60, MONITOR)
+                if not res.decompileCompleted():
+                    item["error"] = str(res.getErrorMessage())
+                    rows.append(item)
+                    continue
+                code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
+                with contextlib.suppress(OSError):
+                    _cache_write(_decomp_cache_key(e, fn), code)
+            if grep is not None:
+                found = _grep_code(code, grep)
+                item["hits"] = len(found)
+                item["matched"] = found[:hits]
+            else:
+                item["lines"] = len(code.splitlines())
+        else:
+            try:
+                facts = _claim_facts(program, fn)
+            except Exception as ex:  # noqa: BLE001 - jpype call, can raise anything
+                item["error"] = f"{type(ex).__name__}: {ex}"
+                rows.append(item)
+                continue
+            pool = {
+                "strings": sorted(facts["strings"]),
+                "imports": sorted(facts["imports"]),
+                "calls": sorted(facts["calls"]),
+                "consts": [hex(c) for c in sorted(facts["consts"])],
+            }[op]
+            found = [x for x in pool if grep is None or grep.search(x)]
+            item["hits"] = len(found)
+            item["matched"] = [{"text": x} for x in found[:hits]]
+        rows.append(item)
+    return rows
+
+
+def cmd_map(a: dict[str, Any]) -> dict[str, Any]:
+    """Run one operation over a *set* of functions and return only what matched.
+
+    This is the batch primitive: "decompile every function that calls RegSetValueExW
+    and show me the lines mentioning Autosave" used to cost one HTTP round-trip per
+    function; now it is one call that returns nothing but the hits.
+    """
+    import time
+
+    started = time.time()
+    e = _entry(a["binary"])
+    op = str(a.get("op") or "decompile").lower()
+    known = ("decompile", "strings", "imports", "calls", "consts")
+    if op not in known:
+        raise ValueError(f"unknown op {op!r} (ops: {', '.join(known)})")
+    limit = int(a.get("limit", 200))
+    hits = int(a.get("hits", 5))
+    grep = re.compile(str(a["grep"]), re.I) if a.get("grep") else None
+    functions = _select_functions(e, str(a.get("from") or "all"), limit)
+    rows = _map_rows(e, functions, op, grep, hits)
+    matched = [
+        r for r in rows if r["hits"] or r.get("error") or (op == "decompile" and grep is None)
+    ]
+    return {
+        "binary": str(a["binary"]),
+        "from": str(a.get("from") or "all"),
+        "op": op,
+        "grep": a.get("grep"),
+        "selected": len(functions),
+        "scanned": len(rows),
+        "matched": len(matched),
+        "hits": sum(r["hits"] for r in rows),
+        "results": matched[:limit],
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
     with LOCK:
         return HANDLERS[cmd](params)
@@ -2758,6 +2891,7 @@ HANDLERS = {
     "note": cmd_note,
     "notes": cmd_notes,
     "verify": cmd_verify,
+    "map": cmd_map,
     "report": cmd_report,
     "cross_xref": cmd_cross_xref,
     "slice": cmd_slice,
