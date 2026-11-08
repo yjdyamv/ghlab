@@ -184,8 +184,31 @@ TOOLS: list[dict[str, Any]] = [
                 "text": {"type": "string"},
                 "at": {"type": "string", "description": "function name or 0x address"},
                 "tag": {"type": "string", "description": "grouping label, e.g. c2/crypto/loader"},
+                "assert": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "checkable claims about that function, e.g. const=0x41, string=Autosave, "
+                        "import=RegSetValueExW, calls=FUN_140010350, size>=200"
+                    ),
+                },
             },
             "required": ["binary", "text"],
+        },
+    },
+    {
+        "name": "ghlab_verify",
+        "description": (
+            "Re-run every claim stored by ghlab_note and report pass/fail. Use it before you "
+            "trust your own earlier conclusions, and before writing them into a report."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "id": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["binary"],
         },
     },
     {
@@ -210,10 +233,11 @@ _COMMANDS = {
     "ghlab_cross_xref": "cross_xref",
     "ghlab_similar": "similar",
     "ghlab_note": "note",
+    "ghlab_verify": "verify",
     "ghlab_report": "report",
 }
 
-_LIST_KEYS = {"import", "string", "calls", "targets", "args", "dump"}
+_LIST_KEYS = {"import", "string", "calls", "targets", "args", "dump", "assert", "id"}
 
 
 def _as_params(_name: str, args: dict[str, Any]) -> dict[str, Any]:

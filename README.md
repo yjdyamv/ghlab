@@ -97,6 +97,15 @@ ghlab note notepad.exe 'entry 只做 CRT 初始化' --at entry --tag bootstrap
 ghlab notes notepad.exe --tag bootstrap
 ghlab report notepad.exe > notepad.md
 
+# 结论带「可复算的断言」：写的时候验证一次，之后随时重算
+ghlab note notepad.exe '持久化写入点' --at FUN_14001e02c --tag persistence \
+  -a 'string=Software.Microsoft' -a 'import=RegCreateKeyW' -a 'size>=200'
+# note #31 [persistence] 14001e02c FUN_14001e02c
+#   [OK] string=Software.Microsoft - strings: Software\Microsoft\Notepad
+#   [OK] import=RegCreateKeyW - imports: RegCreateKeyW
+#   [OK] size>=200 - 213 bytes
+ghlab verify notepad.exe            # 全部重算：PASS / FAIL / UNKNOWN
+
 # 跨程序：哪个样本也连这个域名？这个 API 是由哪条路径走到的？这段逻辑在别的样本里叫什么？
 ghlab cross-xref 'autosave'                       # 全项目搜字符串，附"谁在用"
 ghlab slice notepad.exe RegSetValueExW            # 从入口到该导入的最短调用链
@@ -133,7 +142,7 @@ ghlab run ~/re/pipes/triage.gh --set BIN=notepad.exe
 ```
 
 规则只有四条：一行一条命令、`#` 注释、`$VAR` 来自 `--set`、`>`/`>>` 把这一步的 stdout 写进文件。
-`--keep-going` 失败继续，`--dry-run` 只解析不执行。中转义只在引号前生效（所以 `C:	mp.md` 不会被吃掉反斜杠）。
+`--keep-going` 失败继续，`--dry-run` 只解析不执行。中转义只在引号前生效（所以 `C:\tmp\a.md` 不会被吃掉反斜杠）。
 
 ## 家族聚类（`ghlab campaign`）
 
@@ -169,7 +178,7 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_emulate` | P-code 模拟执行，取返回值与内存写入 |
 | `ghlab_cross_xref` | 全项目搜字符串，附引用者 |
 | `ghlab_similar` | 跨样本同构函数 |
-| `ghlab_note` / `ghlab_report` | 记结论 / 出报告 |
+| `ghlab_note` / `ghlab_verify` / `ghlab_report` | 记结论（带断言） / 重算断言 / 出报告 |
 
 还有资源：`ghlab://programs`（名字 + md5 + 架构 + 函数数）、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
 
@@ -214,7 +223,8 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
-| `note` | `binary, text` / `at, tag` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签 |
+| `note` | `binary, text` / `at, addr, tag, assert` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
+| `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
 | `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
 | `slice` | `binary, to` / `from, depth, limit, code` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译 |
@@ -240,6 +250,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
+- **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。
 
 ## 开发
 
@@ -295,6 +306,8 @@ python -m unittest discover -s tests -q  # 105 个测试
 16. `FunctionSignatureParser` 的构造是 `(DataTypeManager, DataTypeQueryService)`（传 `None` 即可），`parse` 要 `FunctionSignature` 而不是 `Function`：`parser.parse(fn.getSignature(), 'int f(char *)')`；且 `C`/`CPP` 解析器类在 12.2 已不存在。
 17. `ApplyFunctionSignatureCmd` 不会改函数名 → `set_type` 里要另外 `fn.setName(声明里的名字)`。
 18. **给入口符号改名会让 `program.getEntryPoint()` 失效**（digest 的入口链随之变空）→ 别重命名 `entry`；`_entry_chain` 已加名字/可执行段首函数兜底。
+19. **常量的符号性不可假定**：反编译里的 `(HKEY)0xffffffff80000001` 到 `getScalar()` 是**负数** long → 断言比较时必须同时试 `value` / `_u64(value)` / 32 位与 16 位截断（`_const_views()`）。
+20. **地址字符串没有唯一写法**：`1400019d0` 不带 `0x` 时 `FlatProgramAPI.toAddr()` 认不出来（它不把裸 hex 当地址）→ `_hex_addr()` 统一识别，`_addr`/`_function` 都走它。
 
 ## License
 

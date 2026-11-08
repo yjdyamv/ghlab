@@ -248,6 +248,26 @@ class LiveTest(unittest.TestCase):
         self.assertIn(text, report)
         self.assertIn("Call-graph hubs", report)
 
+    def test_claims_are_checked_at_write_and_again_on_verify(self):
+        note = client.call(
+            "note",
+            binary=BIN,
+            text="claim probe",
+            at="entry",
+            tag="claimtest",
+            **{"assert": ["size>=1", "string=zzz-no-such-string-zzz"]},
+        )["note"]
+        marks = {row["claim"]: row["ok"] for row in note["claims"]}
+        self.assertTrue(marks["size>=1"])
+        self.assertFalse(marks["string=zzz-no-such-string-zzz"])
+        r = client.call("verify", binary=BIN, id=[note["id"]])
+        self.assertEqual(r["checked"], 1)
+        self.assertEqual(r["status"], "fail")
+        self.assertGreaterEqual(r["passed"], 1)
+        self.assertGreaterEqual(r["failed"], 1)
+        report = client.call("report", binary=BIN, top=3)["markdown"]
+        self.assertIn("[FAIL] string=zzz-no-such-string-zzz", report)
+
     def test_decompile_cache_round_trip(self):
         cold = client.call("decompile", binary=BIN, target="FUN_140007e1c", refresh=True)
         warm = client.call("decompile", binary=BIN, target="FUN_140007e1c")

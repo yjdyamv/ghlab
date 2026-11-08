@@ -56,8 +56,18 @@ class EnvelopeTest(unittest.TestCase):
         self.assertIn("find", protocol.COMMAND_NAMES)
 
     def test_write_commands_are_declared(self):
-        for name in ("patch", "set_type", "bookmark", "note", "notes", "report"):
+        for name in ("patch", "set_type", "bookmark", "note", "notes", "verify", "report"):
             self.assertIn(name, protocol.COMMAND_NAMES)
+
+    def test_note_accepts_claims_and_verify_takes_ids(self):
+        _spec, params = protocol.validate(
+            {"cmd": "note", "binary": "x", "text": "t", "at": "entry", "assert": ["const=1"]}
+        )
+        self.assertEqual(params["assert"], ["const=1"])
+        _spec, params = protocol.validate({"cmd": "verify", "binary": "x", "id": [1, 2]})
+        self.assertEqual(params["id"], [1, 2])
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "verify", "binary": "x", "claim": "x"})
 
     def test_patch_requires_address(self):
         with self.assertRaises(protocol.ProtocolError) as ctx:

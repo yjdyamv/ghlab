@@ -97,12 +97,22 @@ def _entry(binary: str) -> dict[str, Any]:
     return entry
 
 
+def _hex_addr(text: Any) -> int | None:
+    """`0x1400019d0` and bare `1400019d0` are both addresses."""
+    raw = str(text).strip()
+    if raw.lower().startswith("0x") and re.fullmatch(r"0[xX][0-9a-fA-F]+", raw):
+        return int(raw, 16)
+    if re.fullmatch(r"[0-9a-fA-F]{6,}", raw):
+        return int(raw, 16)
+    return None
+
+
 def _addr(entry: dict[str, Any], text: str):
     program = entry["program"]
-    text = str(text)
-    if text.lower().startswith("0x"):
-        return program.getAddressFactory().getDefaultAddressSpace().getAddress(int(text, 16))
-    addr = entry["api"].toAddr(text)
+    numeric = _hex_addr(text)
+    if numeric is not None:
+        return program.getAddressFactory().getDefaultAddressSpace().getAddress(numeric)
+    addr = entry["api"].toAddr(str(text))
     if addr is None:
         raise KeyError(f"address or symbol {text!r} not found")
     return addr
@@ -112,7 +122,8 @@ def _function(entry: dict[str, Any], target: str):
     program = entry["program"]
     fm = program.getFunctionManager()
     text = str(target)
-    if text.lower().startswith("0x"):
+    numeric = _hex_addr(text)
+    if numeric is not None:
         addr = _addr(entry, text)
         fn = fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
         if fn is not None:
@@ -2043,6 +2054,182 @@ def cmd_bookmark(a: dict[str, Any]) -> dict[str, Any]:
     return {"added": True, "addr": str(addr), "type": btype, "category": category}
 
 
+# ------------------------------------------------------------------- evidence
+
+
+_CLAIM_KINDS = ("const", "string", "import", "calls", "size", "bytes", "symbol", "name")
+
+
+def _parse_claim(text: Any) -> dict[str, str]:
+    """Split `const=0x41` / `size>=200` into kind, operator and value."""
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("empty claim")
+    for op in (">=", "<=", ">", "<"):
+        head, found, value = raw.partition(op)
+        if found and value.strip():
+            return {"kind": head.strip().lower(), "op": op, "value": value.strip(), "raw": raw}
+    kind, found, value = raw.partition("=")
+    if not found or not value.strip():
+        raise ValueError(
+            f"claim {raw!r} must look like kind=value; kinds: {', '.join(_CLAIM_KINDS)}"
+        )
+    return {"kind": kind.strip().lower(), "op": "=", "value": value.strip(), "raw": raw}
+
+
+def _claim_facts(program, fn) -> dict[str, Any]:
+    """Everything a claim can be checked against, collected in one pass."""
+    listing = program.getListing()
+    consts: set[int] = set()
+    strings: set[str] = set()
+    it = listing.getInstructions(fn.getBody(), True)
+    while it.hasNext():
+        insn = it.next()
+        for i in range(insn.getNumOperands()):
+            try:
+                scalar = insn.getScalar(i)
+            except Exception:  # noqa: BLE001 - jpype call, can raise anything
+                scalar = None
+            if scalar is not None:
+                consts.add(int(scalar.getValue()))
+        for ref in insn.getReferencesFrom():
+            data = listing.getDataAt(ref.getToAddress())
+            if data is not None and _is_string_data(data):
+                value = _string_value(data)
+                if value:
+                    strings.add(value)
+    calls: set[str] = set()
+    imports: set[str] = set()
+    for callee in fn.getCalledFunctions(MONITOR):
+        name = str(callee.getName())
+        calls.add(name)
+        if callee.isExternal() or callee.isThunk() or name.startswith("PTR_"):
+            imports.add(_clean_name(name))
+    return {
+        "name": str(fn.getName()),
+        "size": int(fn.getBody().getNumAddresses()),
+        "consts": consts,
+        "strings": strings,
+        "calls": calls,
+        "imports": imports,
+    }
+
+
+def _const_views(value: int) -> set[int]:
+    """The same constant as Ghidra may store it: signed, unsigned, 32- or 16-bit.
+
+    `(HKEY)0xffffffff80000001` from decompiled C turns up as a negative long, so a
+    claim written in the form a human reads has to match every plausible spelling.
+    """
+    wide = _u64(value)
+    return {value, wide, wide & 0xFFFFFFFF, wide & 0xFFFF}
+
+
+def _claim_int(text: Any) -> int:
+    """Parse `0x41`, `65` or `'65'` the same way everywhere."""
+    return int(str(text).strip(), 0)
+
+
+def _compare(value: int, op: str, want: int) -> bool:
+    if op == "=":
+        return value == want
+    if op == ">=":
+        return value >= want
+    if op == "<=":
+        return value <= want
+    if op == ">":
+        return value > want
+    return value < want
+
+
+def _claim_bytes(entry, addr_text: str | None, spec: dict[str, str]) -> tuple[bool | None, str]:
+    if not addr_text:
+        return None, "a bytes claim needs the note to sit on an address (--at)"
+    want = re.sub(r"[^0-9a-fA-F?]", "", spec["value"])
+    if len(want) % 2:
+        return None, "bytes claim needs an even number of hex digits (use ?? for wildcards)"
+    program = entry["program"]
+    got = _read_memory(program, _addr(entry, addr_text), len(want) // 2).hex()
+    pattern = "".join("." if c in "?" else c for c in want.lower())
+    ok = re.fullmatch(pattern, got) is not None
+    return ok, f"{addr_text} holds {got}"
+
+
+def _claim_symbol(entry, spec: dict[str, str]) -> tuple[bool | None, str]:
+    pat = re.compile(spec["value"], re.I)
+    hits = [
+        str(sym.getName())
+        for sym in entry["program"].getSymbolTable().getAllSymbols(True)
+        if pat.search(str(sym.getName()))
+    ]
+    if hits:
+        return True, f"symbol {hits[0]}"
+    return False, "no symbol matches"
+
+
+def _check_claim(
+    entry, fn, facts: dict[str, Any] | None, addr_text: str | None, claim: str
+) -> tuple[bool | None, str]:
+    """Re-evaluate one claim. Returns (ok, detail); ok is None when it cannot be judged."""
+    spec = _parse_claim(claim)
+    kind, op, value = spec["kind"], spec["op"], spec["value"]
+    if kind not in _CLAIM_KINDS:
+        raise ValueError(f"unknown claim kind {kind!r} (kinds: {', '.join(_CLAIM_KINDS)})")
+    if kind == "bytes":
+        return _claim_bytes(entry, addr_text, spec)
+    if kind == "symbol":
+        return _claim_symbol(entry, spec)
+    if fn is None or facts is None:
+        return None, "note is not attached to a function; point --at at one"
+    if kind == "size":
+        want = _claim_int(value)
+        return _compare(facts["size"], op, want), f"{facts['size']} bytes"
+    if kind == "name":
+        ok = re.search(value, facts["name"], re.I) is not None
+        return ok, facts["name"]
+    if kind == "const":
+        want = _claim_int(value)
+        found = [c for c in facts["consts"] if any(_compare(v, op, want) for v in _const_views(c))]
+        if found:
+            shown = ", ".join(hex(c) for c in sorted(found)[:3])
+            return True, f"{len(found)} match(es) of {len(facts['consts'])} constants: {shown}"
+        return False, f"no constant matches ({len(facts['consts'])} scanned)"
+    pat = re.compile(value, re.I)
+    pool = sorted(facts["strings"] if kind == "string" else facts["calls"])
+    if kind == "import":
+        pool = sorted(facts["imports"])
+    hits = [x for x in pool if pat.search(x)]
+    label = {"string": "strings", "calls": "callees", "import": "imports"}[kind]
+    if hits:
+        return True, f"{label}: {hits[0][:60]}"
+    return False, f"no {label} match ({len(pool)} scanned)"
+
+
+def _check_claims(entry, fn, addr_text: str | None, claims: list[str]) -> list[dict[str, Any]]:
+    facts: dict[str, Any] | None = None
+    if fn is not None:
+        try:
+            facts = _claim_facts(entry["program"], fn)
+        except Exception:  # noqa: BLE001 - jpype call, can raise anything
+            facts = None
+    out = []
+    for claim in claims:
+        try:
+            ok, detail = _check_claim(entry, fn, facts, addr_text, claim)
+        except Exception as ex:  # noqa: BLE001 - jpype call, can raise anything
+            ok, detail = None, f"{type(ex).__name__}: {ex}"
+        out.append({"claim": str(claim), "ok": ok, "detail": detail})
+    return out
+
+
+def _claims_status(rows: list[dict[str, Any]]) -> str:
+    if any(r.get("ok") is False for r in rows):
+        return "fail"
+    if any(r.get("ok") is None for r in rows):
+        return "unknown"
+    return "pass"
+
+
 # ------------------------------------------------------------------- findings
 
 
@@ -2079,8 +2266,13 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
     binary = str(a["binary"])
     notes = _load_notes(binary)
     at = a.get("at")
+    claims = _as_list(a.get("assert") or [])
     addr = None
     name = None
+    e = None
+    fn = None
+    if claims and not (at or a.get("addr")):
+        raise ValueError("claims describe a function, so --at ADDR/NAME is required as well")
     if at or a.get("addr"):
         e = _entry(binary)
         target = at or a.get("addr")
@@ -2093,6 +2285,9 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
             bm.setBookmark(_addr(e, addr), "Note", str(a.get("tag") or "ghlab"), str(a["text"]))
         finally:
             e["program"].endTransaction(tx, True)
+    checked: list[dict[str, Any]] = []
+    if e is not None and claims:
+        checked = _check_claims(e, fn, addr, claims)
     note = {
         "id": len(notes) + 1,
         "binary": binary,
@@ -2102,9 +2297,81 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
         "text": str(a["text"]),
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+    if checked:
+        note["claims"] = checked
+        note["check"] = {
+            "at": note["created"],
+            "status": _claims_status(checked),
+            "results": checked,
+        }
     notes.append(note)
     _store_notes(binary, notes)
     return {"note": note, "total": len(notes), "path": str(_notes_file(binary))}
+
+
+def cmd_verify(a: dict[str, Any]) -> dict[str, Any]:
+    """Re-evaluate the claims attached to this binary's findings.
+
+    A note is only worth as much as its ability to survive a re-run: this walks
+    the stored claims, recomputes them from the program, and records pass/fail.
+    """
+    import time
+
+    binary = str(a["binary"])
+    e = _entry(binary)
+    notes = _load_notes(binary)
+    want = a.get("id")
+    ids = {_claim_int(x) for x in _as_list(want)} if want else None
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    rows = []
+    passed = failed = unknown = skipped = 0
+    for n in notes:
+        nid = _claim_int(n.get("id", 0))
+        if ids is not None and nid not in ids:
+            continue
+        claims = list(n.get("claims") or [])
+        if not claims:
+            skipped += 1
+            continue
+        fn = None
+        addr = n.get("addr")
+        if addr:
+            try:
+                fn = _function(e, str(addr))
+            except Exception:  # noqa: BLE001 - jpype call, can raise anything
+                fn = None
+        results = _check_claims(e, fn, addr, [str(c.get("claim")) for c in claims])
+        status = _claims_status(results)
+        n["check"] = {"at": now, "status": status, "results": results}
+        n["claims"] = results
+        passed += sum(1 for r in results if r.get("ok") is True)
+        failed += sum(1 for r in results if r.get("ok") is False)
+        unknown += sum(1 for r in results if r.get("ok") is None)
+        rows.append(
+            {
+                "id": nid,
+                "addr": addr,
+                "function": n.get("function"),
+                "tag": n.get("tag"),
+                "text": n.get("text"),
+                "status": status,
+                "results": results,
+            }
+        )
+    if rows:
+        _store_notes(binary, notes)
+    return {
+        "binary": binary,
+        "checked": len(rows),
+        "passed": passed,
+        "failed": failed,
+        "unknown": unknown,
+        "unchecked_notes": skipped,
+        "status": "fail" if failed else ("unknown" if unknown else "pass"),
+        "notes": rows,
+        "checked_at": now,
+        "path": str(_notes_file(binary)),
+    }
 
 
 def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
@@ -2177,6 +2444,11 @@ def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
     if sizes:
         lines += ["", "## Function sizes", ""]
         lines.append(" | ".join(f"{k}: {v}" for k, v in sizes.items()))
+    claimed = [n for n in notes if n.get("claims")]
+    if claimed:
+        lines.append(f"- claims: {len(claimed)} note(s) carry evidence, see Findings")
+    else:
+        lines.append("- claims: _none — pass `-a const=0x41` to make a finding checkable_")
     lines += ["", "## Findings"]
     if not notes:
         lines += ["", "_none yet — `ghlab note BIN ...` while you work_"]
@@ -2190,6 +2462,10 @@ def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
             fn = n.get("function")
             label = f"`{where}` {fn}" if fn else (f"`{where}`" if where else "(general)")
             lines.append(f"- {label} — {n.get('text')}")
+            for row in n.get("claims") or []:
+                ok = row.get("ok")
+                mark = "OK" if ok is True else ("FAIL" if ok is False else "??")
+                lines.append(f"  - [{mark}] {row.get('claim')} ({row.get('detail')})")
     markdown = chr(10).join(lines) + chr(10)
     return {"markdown": markdown, "notes": len(notes), "binary": binary}
 
@@ -2481,6 +2757,7 @@ HANDLERS = {
     "bookmark": cmd_bookmark,
     "note": cmd_note,
     "notes": cmd_notes,
+    "verify": cmd_verify,
     "report": cmd_report,
     "cross_xref": cmd_cross_xref,
     "slice": cmd_slice,

@@ -125,8 +125,14 @@ _SPECS = [
     Spec(
         "note",
         ("binary", "text"),
-        ("at", "addr", "tag"),
-        "append a durable finding (JSON on disk + bookmark)",
+        ("at", "addr", "tag", "assert"),
+        "append a durable finding (JSON on disk + bookmark), with claims",
+    ),
+    Spec(
+        "verify",
+        ("binary",),
+        ("id",),
+        "re-run the claims of stored findings and report pass/fail",
     ),
     Spec(
         "notes",

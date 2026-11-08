@@ -308,12 +308,44 @@ def fmt_bookmark(r: dict[str, Any]) -> str:
     return f"bookmarked {r['addr']} ({r['type']}, {r['category']})"
 
 
+def _claim_lines(rows: list[dict[str, Any]], indent: str = "  ") -> list[str]:
+    out = []
+    for row in rows or []:
+        ok = row.get("ok")
+        mark = "OK" if ok is True else ("FAIL" if ok is False else "??")
+        out.append(f"{indent}[{mark}] {row.get('claim')} - {row.get('detail')}")
+    return out
+
+
 def fmt_note(r: dict[str, Any]) -> str:
     n = r["note"]
     where = f"{n['addr']} {n.get('function') or ''}".strip() or "(general)"
-    return (
-        f"note #{n['id']} [{n['tag']}] {where}\n  {n['text']}\n  ({r['total']} total, {r['path']})"
+    out = [
+        f"note #{n['id']} [{n['tag']}] {where}",
+        f"  {n['text']}",
+    ]
+    out += _claim_lines(n.get("claims") or [])
+    out.append(f"  ({r['total']} total, {r['path']})")
+    return "\n".join(out)
+
+
+def fmt_verify(r: dict[str, Any]) -> str:
+    if not r["checked"]:
+        return f"(no claims to check; {r['unchecked_notes']} note(s) carry none)"
+    head = (
+        f"{r['binary']}: {r['status'].upper()} - {r['checked']} finding(s), "
+        f"{r['passed']} pass / {r['failed']} fail / {r['unknown']} unknown"
     )
+    out = [head]
+    for n in r["notes"]:
+        where = f"{n.get('addr') or ''} {n.get('function') or ''}".strip() or "(general)"
+        out.append(f"  #{n['id']} [{n.get('status')}] {where} - {n.get('text')}")
+        out += _claim_lines(n.get("results") or [], "      ")
+    if r["failed"]:
+        out.append(
+            "  a FAIL means the claim no longer holds: re-read the function before trusting it"
+        )
+    return "\n".join(out)
 
 
 def fmt_notes(r: dict[str, Any]) -> str:
@@ -414,6 +446,7 @@ FORMATTERS = {
     "set_type": fmt_set_type,
     "bookmark": fmt_bookmark,
     "note": fmt_note,
+    "verify": fmt_verify,
     "notes": fmt_notes,
     "report": fmt_report,
     "cross_xref": fmt_cross_xref,
@@ -849,11 +882,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("text")
     p.add_argument("--at", help="function name or address")
     p.add_argument("--tag", default="note", help="group findings (auth, crypto, bug, ...)")
+    p.add_argument(
+        "-a",
+        "--assert",
+        dest="assert_",
+        action="append",
+        metavar="KIND=VALUE",
+        help="checkable claim, e.g. const=0x41 / string=Autosave / import=RegSetValueExW",
+    )
     p.set_defaults(
         func=lambda a: _call(
-            a, "note", {"binary": a.binary, "text": a.text, "at": a.at, "tag": a.tag}
+            a,
+            "note",
+            {
+                "binary": a.binary,
+                "text": a.text,
+                "at": a.at,
+                "tag": a.tag,
+                "assert": a.assert_,
+            },
         )
     )
+
+    p = sub.add_parser("verify", parents=[common], help="re-check the claims of stored findings")
+    p.add_argument("binary")
+    p.add_argument("--id", action="append", type=int, help="only these note ids")
+    p.set_defaults(func=lambda a: _call(a, "verify", {"binary": a.binary, "id": a.id}))
 
     p = sub.add_parser("notes", parents=[common], help="list recorded findings")
     p.add_argument("binary")
