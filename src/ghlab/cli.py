@@ -54,6 +54,8 @@ def fmt_functions(r: dict[str, Any]) -> str:
 
 
 def fmt_decompile(r: dict[str, Any]) -> str:
+    if not r.get("results"):
+        return "(no function matched; widen -m/-g or raise -n)"
     out = []
     for item in r.get("results") or []:
         if item.get("error"):
@@ -245,6 +247,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", parents=[daemon], help="daemon health")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("ping", parents=[common], help="daemon + project summary")
+    p.set_defaults(func=lambda a: _call(a, "ping"))
 
     p = sub.add_parser("binaries", parents=[common], help="list programs")
     p.set_defaults(func=lambda a: _call(a, "binaries"))

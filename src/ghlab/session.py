@@ -291,7 +291,7 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                 item["matched"] = hits[:20]
             if include_code:
                 if max_lines and len(all_lines) > max_lines:
-                    item["code"] = "\n".join(all_lines[:max_lines]) + "\n/* …truncated */"
+                    item["code"] = "\n".join(all_lines[:max_lines]) + "\n/* ... truncated */"
                 else:
                     item["code"] = code
             if a.get("include_callees"):
