@@ -288,6 +288,33 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(r["addresses"][0]["addr"], "0x1400019d0")
         self.assertEqual(r["functions"], before)
 
+    def test_journal_records_a_mutation(self):
+        before = client.call("journal", binary=BIN, op="comment", limit=1)["total"]
+        client.call("comment", binary=BIN, target="FUN_14001e02c", text="journal probe")
+        r = client.call("journal", binary=BIN, op="comment", limit=5)
+        self.assertGreater(r["total"], 0)
+        self.assertGreaterEqual(r["total"], before)
+        self.assertTrue(any(e["binary"] == BIN for e in r["entries"]))
+        self.assertTrue(all(e["op"] == "comment" for e in r["entries"]))
+
+    def test_overview_lists_every_program(self):
+        r = client.call("overview")
+        names = [b["binary"] for b in r["binaries"]]
+        self.assertIn(BIN, names)
+        row = next(b for b in r["binaries"] if b["binary"] == BIN)
+        self.assertGreater(row["functions"], 100)
+        self.assertGreater(row["imports"], 10)
+        self.assertGreaterEqual(row["notes"], 0)
+
+    def test_audit_reports_claim_health(self):
+        r = client.call("audit", binary=BIN)
+        self.assertEqual(r["binaries"], [BIN])
+        self.assertIn(r["status"], ("pass", "fail", "unknown"))
+        self.assertEqual(
+            r["notes_checked"],
+            sum(1 for n in client.call("notes", binary=BIN)["notes"] if n.get("claims")),
+        )
+
     def test_patch_roundtrip_and_expect_guard(self):
         addr = "1400019d0"
         original = client.call("bytes", binary=BIN, addr=addr, size=4)["hex"]
@@ -435,6 +462,11 @@ class LiveTest(unittest.TestCase):
         self.assertGreaterEqual(r["failed"], 1)
         report = client.call("report", binary=BIN, top=3)["markdown"]
         self.assertIn("[FAIL] string=zzz-no-such-string-zzz", report)
+        # a test that leaves a deliberately wrong claim behind poisons later audits
+        gone = client.call("note", binary=BIN, text="claim probe", delete=note["id"])
+        self.assertEqual(gone["deleted"], [note["id"]])
+        left = [n for n in client.call("notes", binary=BIN)["notes"] if n["id"] == note["id"]]
+        self.assertEqual(left, [])
 
     def test_decompile_cache_round_trip(self):
         cold = client.call("decompile", binary=BIN, target="FUN_140007e1c", refresh=True)

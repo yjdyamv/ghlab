@@ -65,6 +65,9 @@ ghlab decompile notepad.exe -m 'FUN_' -g 'CreateWindow|RegisterClass|GetDlgItem'
 ghlab strings notepad.exe -q txt
 
 # 先看全局，再决定花 token 看哪里
+ghlab overview                                    # 整个项目一行一个程序
+ghlab journal --binary notepad.exe                # 我改过什么（跨会话续接）
+ghlab audit                                       # 全项目复算所有断言，列出不成立的
 ghlab digest notepad.exe
 
 # 按结构缩小候选集：谁既写注册表又碰 Notepad 字符串
@@ -253,6 +256,9 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit` | 调用树 BFS |
+| `overview` | – | **项目总览**：每个程序的函数数/字符串数/导入数/结论数/失败断言数 + 最后一次改动（走索引，实测 3 个程序 2.7s） |
+| `journal` | – / `binary, op, since, limit` | **变更日志**（`.ghlab/journal.jsonl`）：所有写操作自动记录（import/analyze/rename/comment/patch/set_type/types/pdb/note/bookmark），失败也记 |
+| `audit` | – / `binary` | **全项目复算**：把所有结论里的断言重算一遍，列出 FAIL/UNKNOWN |
 | `digest` | `binary` / `top, strings` | **一次性 triage**：入口链、按风险分组的导入、API 组合、字符串分类、调用图枢纽、函数大小分布（实测 notepad ≈450 token / 2.7s） |
 | `index` | `binary` / `refresh` | **持久索引**：一次全扫把每个函数的 strings/imports/callees/常量/大小写进 `<project>/.ghlab/index/<binary>.json`；`find`/`diff`/`similar`/`campaign` 都改读索引，`(md5, modification number)` 变了就自动重建 |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
@@ -262,7 +268,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
-| `note` | `binary, text` / `at, addr, tag, assert` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
+| `note` | `binary, text` / `at, addr, tag, assert, delete` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
 | `map` | `binary` / `from, op, grep, limit, hits` | **批量原语**：`--from` 选函数集（`all`/`name:`/`import:`/`calls:`/`string:`/`const:`/`addr:`），`--op` 取 `decompile`/`strings`/`imports`/`calls`/`consts`，`-g` 只留命中行。4 个函数反编译+过滤 ≈2.6s，回 15 行而不是 4 份源码 |
 | `pdb` | `binary, file` / `untrusted` | **吃调试符号**：`PdbUniversalAnalyzer.doAnalysis` 套壳；PDB 与二进制不匹配时不写入（`functions_before == functions_after`），日志一并返回 |
 | `types` | `binary, from` / `dry_run` | **批量写类型**：签名表（`.json` 分组或 `target = decl` 文本）一次应用，一个事务一次 `save`；`--dry-run` 只列计划；单条失败进 `failed` 不中断 |
@@ -296,6 +302,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
 - **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
 - **索引比命令更值钱**：每次调用都全扫是 agent 用不起的。`index` 把每个函数的事实（字符串、导入、被调函数、常量、大小、指令数、基本块数）落成一份 JSON，`find` 从 2.5s 降到 0.16s、`diff` 从 4.4s 降到 0.8s，`similar`/`campaign` 一并变快。失效判定是 `(md5, modification number)`：任何通过 ghlab 的写操作都会让它加一，旧索引不可能被当成新的；`note` 只写 JSON + 书签，不动程序事实，索引仍然有效。
+- **日志比记忆可靠**：所有写操作落 `.ghlab/journal.jsonl`，`overview` 直接显示每个程序的最后一次改动；agent 换会话后先 `journal` 再动手
 - **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。
 
 ## 开发

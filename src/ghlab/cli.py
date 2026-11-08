@@ -370,6 +370,8 @@ def _claim_lines(rows: list[dict[str, Any]], indent: str = "  ") -> list[str]:
 
 
 def fmt_note(r: dict[str, Any]) -> str:
+    if "deleted" in r:
+        return f"deleted note(s) {', '.join(str(i) for i in r['deleted'])}; {r['remaining']} left"
     n = r["note"]
     where = f"{n['addr']} {n.get('function') or ''}".strip() or "(general)"
     out = [
@@ -532,6 +534,56 @@ def fmt_similar(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_overview(r: dict[str, Any]) -> str:
+    if not r["binaries"]:
+        return "(project is empty; import something first)"
+    out = [f"# {len(r['binaries'])} program(s) in {r['project']}  ({r['elapsed_ms']}ms)"]
+    out.append(f"  {'binary':<24} {'fn':>5} {'str':>5} {'imp':>4} {'notes':>5} {'claims':>6}  last")
+    for b in r["binaries"]:
+        if b.get("error"):
+            out.append(f"  {b['binary']:<24} ! {b['error']}")
+            continue
+        claims = str(b["claims"])
+        if b["failing_claims"]:
+            claims += f" ({b['failing_claims']} FAIL)"
+        last = b.get("last")
+        tail = f"{last['op']} {last['summary']}"[:40] if last else "-"
+        out.append(
+            f"  {b['binary']:<24} {b['functions']:>5} {b['strings']:>5} {b['imports']:>4} "
+            f"{b['notes']:>5} {claims:>6}  {tail}"
+        )
+    return chr(10).join(out)
+
+
+def fmt_audit(r: dict[str, Any]) -> str:
+    head = (
+        f"# audit: {r['notes_checked']} note(s) with claims  "
+        f"{r['claims']['passed']} ok / {r['claims']['failed']} fail / "
+        f"{r['claims']['unknown']} unknown  ({r['elapsed_ms']}ms)"
+    )
+    if not r["findings"]:
+        return head + chr(10) + "every stored claim still holds"
+    out = [head]
+    for f in r["findings"]:
+        out.append(f"  [{f['status'].upper()}] {f['binary']} #{f['id']} {f['function'] or '-'}")
+        out.append(f"        {f['text']}")
+        for row in f["results"]:
+            mark = {True: "OK", False: "FAIL"}.get(row.get("ok"), "??")
+            out.append(f"        {mark} {row['claim']} - {row['detail']}")
+    return chr(10).join(out)
+
+
+def fmt_journal(r: dict[str, Any]) -> str:
+    if not r["entries"]:
+        return "(nothing recorded yet; mutating commands append here automatically)"
+    out = [f"# {r['shown']} of {r['total']} entry(s)  {r['path']}"]
+    for e in r["entries"]:
+        flag = "  ERR" if e.get("error") else ""
+        detail = e.get("summary") or e.get("error") or ""
+        out.append(f"  {e['at']}  {e['op']:<9} {e.get('binary') or '-':<20} {detail}{flag}")
+    return chr(10).join(out)
+
+
 def fmt_family(r: dict[str, Any]) -> str:
     if not r["clusters"]:
         return "(no family found; lower --min-score)"
@@ -600,6 +652,9 @@ FORMATTERS = {
     "similar": fmt_similar,
     "campaign": fmt_campaign,
     "family": fmt_family,
+    "journal": fmt_journal,
+    "overview": fmt_overview,
+    "audit": fmt_audit,
 }
 
 
@@ -625,11 +680,43 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def _pidfile(path: Path) -> dict[str, Any]:
+    """Read the daemon pidfile; tolerate the old plain-pid format."""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if raw.startswith("{"):
+        try:
+            return dict(json.loads(raw))
+        except json.JSONDecodeError:
+            return {}
+    return {"pid": int(raw)} if raw.isdigit() else {}
+
+
 def cmd_start(args) -> int:
     client = Client(f"http://{args.host}:{args.port}/")
-    if client.alive():
-        print(f"already up on {args.host}:{args.port}")
-        return 0
+    pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
+    running = client.alive()
+    if running:
+        info = _pidfile(pid_path)
+        want = session.code_stamp()
+        have = info.get("stamp")
+        if have == want:
+            print(f"already up on {args.host}:{args.port} (pid {info.get('pid')}, code {want})")
+            return 0
+        # a daemon on old code silently answers with old behaviour; restart it
+        print(
+            f"ghlab: running daemon has code {have or 'unknown'}, installed is {want}; restarting"
+        )
+        if info.get("pid"):
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(int(info["pid"]), 15)
+            pid_path.unlink(missing_ok=True)
+            for _ in range(60):
+                if not Client(f"http://{args.host}:{args.port}/").alive():
+                    break
+                time.sleep(0.5)
     if not _ghidra_env_ok():
         return 2
     LOGDIR.mkdir(parents=True, exist_ok=True)
@@ -667,7 +754,8 @@ def cmd_start(args) -> int:
     deadline = time.time() + args.wait
     while time.time() < deadline:
         if client.alive():
-            print(f"ready on http://{args.host}:{args.port}/")
+            real = _pidfile(Path(args.project_dir).expanduser() / ".ghlab.pid").get("pid")
+            print(f"ready on http://{args.host}:{args.port}/ (pid {real or proc.pid})")
             return 0
         if proc.poll() is not None:
             print(f"ghlab: daemon exited with {proc.returncode}", file=sys.stderr)
@@ -678,12 +766,41 @@ def cmd_start(args) -> int:
     return 4
 
 
+def _port_owner(host: str, port: int) -> int | None:
+    """PID listening on host:port, via netstat (no psutil dependency)."""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    needle = f"{host}:{port}"
+    for line in out.splitlines():
+        if needle in line and "LISTENING" in line:
+            tail = line.split()[-1]
+            return int(tail) if tail.isdigit() else None
+    return None
+
+
+def _force_kill(pid: int) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        else:
+            os.kill(pid, 9)
+
+
 def cmd_stop(args) -> int:
     pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
     if not pid_path.exists():
         print("ghlab: no pidfile; nothing to stop")
         return 0
-    pid = int(pid_path.read_text().strip())
+    info = _pidfile(pid_path)
+    if not info.get("pid"):
+        print("ghlab: pidfile is unreadable; nothing to stop")
+        pid_path.unlink(missing_ok=True)
+        return 0
+    pid = int(info["pid"])
     try:
         os.kill(pid, 15)
     except ProcessLookupError:
@@ -693,18 +810,56 @@ def cmd_stop(args) -> int:
         return 1
     else:
         print(f"ghlab: signalled pid {pid}")
+    # the venv python is a shim that re-execs the real interpreter, so the pid we
+    # recorded is the child; wait for the port to actually free, then clean up the
+    # shim parent and anything else still holding the port
+    client = Client(f"http://{args.host}:{args.port}/")
+    for _ in range(30):
+        if not client.alive():
+            break
+        time.sleep(0.5)
+    if client.alive():
+        for extra in (info.get("parent"), _port_owner(args.host, args.port)):
+            if extra and int(extra) != pid:
+                _force_kill(int(extra))
+        for _ in range(20):
+            if not client.alive():
+                break
+            time.sleep(0.25)
     pid_path.unlink(missing_ok=True)
+    if client.alive():
+        print(f"ghlab: still answering on {args.host}:{args.port}", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_status(args) -> int:
     client = Client(f"http://{args.host}:{args.port}/")
+    pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
+    want = session.code_stamp()
     try:
-        print(json.dumps(client.info(), indent=2, ensure_ascii=False))
-        return 0
+        info = client.call("ping")
     except Exception as ex:  # noqa: BLE001
         print(f"ghlab: down ({type(ex).__name__}: {ex})")
         return 1
+    local = _pidfile(pid_path)
+    info["url"] = client.url
+    info["code"] = {
+        "running": local.get("stamp"),
+        "installed": want,
+        "stale": bool(local.get("stamp")) and local.get("stamp") != want,
+    }
+    if args.json:
+        print(json.dumps(info, indent=2, ensure_ascii=False))
+        return 0
+    code = info["code"]
+    state = "STALE (restart with `ghlab start`)" if code["stale"] else "current"
+    print(
+        f"up  {client.url}  project={info.get('project')}  "
+        f"binaries={info.get('binaries')}  loaded={len(info.get('loaded') or [])}  "
+        f"code={code['running'] or 'unknown'} [{state}]"
+    )
+    return 0
 
 
 # --------------------------------------------------------------------- parser
@@ -738,7 +893,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("stop", parents=[daemon], help="stop a detached daemon")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("status", parents=[daemon], help="daemon health")
+    p = sub.add_parser("status", parents=[common, daemon], help="daemon health")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("ping", parents=[common], help="daemon + project summary")
@@ -1097,6 +1252,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--at", help="function name or address")
     p.add_argument("--tag", default="note", help="group findings (auth, crypto, bug, ...)")
     p.add_argument(
+        "--delete", type=int, action="append", metavar="ID", help="retract findings by id"
+    )
+    p.add_argument(
         "-a",
         "--assert",
         dest="assert_",
@@ -1114,6 +1272,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "at": a.at,
                 "tag": a.tag,
                 "assert": a.assert_,
+                "delete": a.delete,
             },
         )
     )
@@ -1166,6 +1325,26 @@ def build_parser() -> argparse.ArgumentParser:
             a,
             "notes",
             {"binary": a.binary, "tag": a.tag, "at": a.at, "query": a.query, "limit": a.limit},
+        )
+    )
+
+    p = sub.add_parser("overview", parents=[common], help="one line per program in the project")
+    p.set_defaults(func=lambda a: _call(a, "overview", {}))
+
+    p = sub.add_parser("audit", parents=[common], help="re-check every stored claim")
+    p.add_argument("binary", nargs="?", help="limit the audit to one program")
+    p.set_defaults(func=lambda a: _call(a, "audit", {"binary": a.binary}))
+
+    p = sub.add_parser("journal", parents=[common], help="what has been changed, and when")
+    p.add_argument("--binary")
+    p.add_argument("--op", help="only this operation (rename, patch, note, ...)")
+    p.add_argument("--since", help="ISO date prefix, e.g. 2026-11-08")
+    p.add_argument("-n", "--limit", type=int, default=50)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "journal",
+            {"binary": a.binary, "op": a.op, "since": a.since, "limit": a.limit},
         )
     )
 

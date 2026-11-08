@@ -868,6 +868,8 @@ def _as_list(value: Any) -> list[str]:
         return []
     if isinstance(value, str):
         return [value]
+    if isinstance(value, (int, float)):
+        return [str(value)]
     return [str(v) for v in value]
 
 
@@ -2248,6 +2250,24 @@ _TYPE_ALIASES = {
 }
 
 
+def code_stamp() -> str:
+    """Fingerprint of the installed package, so a stale daemon is detectable.
+
+    Editing a handler and restarting the daemon used to be the only way to notice
+    that the running process still served the old module; `ghlab start` now
+    compares this stamp and restarts by itself.
+    """
+    root = Path(__file__).resolve().parent
+    parts = []
+    for path in sorted(root.glob("*.py")):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        parts.append(f"{path.name}:{st.st_size}:{int(st.st_mtime)}")
+    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+
+
 def _hex_bytes(text: str) -> bytes:
     """Parse `90 90` / `0x90 0x90` / `9090` into bytes."""
     raw = str(text).replace(" ", "").replace(",", "").replace("0x", "").replace(chr(92) + "x", "")
@@ -2893,10 +2913,26 @@ def _store_notes(binary: str, notes: list[dict[str, Any]]) -> None:
 
 
 def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
-    """Append a durable finding (JSON on disk + a Ghidra bookmark)."""
+    """Append a durable finding (JSON on disk + a Ghidra bookmark), or retract one.
+
+    `delete=ID` removes a finding that turned out to be wrong: an audit that only
+    ever adds is how a findings store rots into noise.
+    """
 
     binary = str(a["binary"])
     notes = _load_notes(binary)
+    if a.get("delete"):
+        gone = {_claim_int(x) for x in _as_list(a["delete"])}
+        keep = [n for n in notes if _claim_int(n.get("id", 0)) not in gone]
+        if len(keep) == len(notes):
+            raise KeyError(f"no note with id {sorted(gone)}")
+        _store_notes(binary, keep)
+        return {
+            "binary": binary,
+            "deleted": sorted(gone),
+            "remaining": len(keep),
+            "path": str(_notes_file(binary)),
+        }
     at = a.get("at")
     claims = _as_list(a.get("assert") or [])
     addr = None
@@ -2920,8 +2956,9 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
     checked: list[dict[str, Any]] = []
     if e is not None and claims:
         checked = _check_claims(e, fn, addr, claims)
+    next_id = max((_claim_int(n.get("id", 0)) for n in notes), default=0) + 1
     note = {
-        "id": len(notes) + 1,
+        "id": next_id,
         "binary": binary,
         "addr": addr,
         "function": name,
@@ -3509,9 +3546,244 @@ def cmd_map(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---- journal: what has been done to this project (agent memory across turns)
+
+MUTATING = (
+    "import",
+    "analyze",
+    "rename",
+    "comment",
+    "patch",
+    "set_type",
+    "bookmark",
+    "note",
+    "types",
+    "pdb",
+)
+
+
+def _journal_file() -> Path:
+    base = _project_dir or (Path.home() / "re" / "proj")
+    d = Path(base) / ".ghlab"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "journal.jsonl"
+
+
+def _journal_summary(cmd: str, params: dict[str, Any], result: Any) -> str:
+    """One line a human (or a later agent turn) can read without the payload."""
+    r = result if isinstance(result, dict) else {}
+    if cmd == "rename":
+        return f"{params.get('target')} -> {r.get('new') or params.get('new')}"
+    if cmd == "patch":
+        return f"{params.get('addr')} {r.get('before')} -> {r.get('after')}"
+    if cmd == "set_type":
+        return f"{params.get('target')} {r.get('decl') or params.get('decl')}"
+    if cmd == "types":
+        return f"{r.get('applied')} applied / {r.get('failed')} failed from {params.get('from')}"
+    if cmd == "pdb":
+        return f"{params.get('file')} applied={r.get('applied')}"
+    if cmd == "note":
+        return f"[{params.get('tag') or '-'}] {str(params.get('text'))[:100]}"
+    if cmd == "bookmark":
+        return f"{params.get('action') or 'set'} {params.get('addr') or params.get('target')}"
+    if cmd == "import":
+        return f"{params.get('path')} analyzed={r.get('analyzed')}"
+    if cmd == "analyze":
+        return f"{r.get('mode')} {params.get('addr') or ''}".strip()
+    return ""
+
+
+def _journal_append(cmd: str, params: dict[str, Any], result: Any, error: str = "") -> None:
+    entry = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "op": cmd,
+        "binary": params.get("binary") or params.get("path"),
+        "summary": _journal_summary(cmd, params, result),
+    }
+    if error:
+        entry["error"] = error
+    try:
+        with open(_journal_file(), "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + chr(10))
+    except OSError:
+        pass  # a missing journal must never break the operation itself
+
+
+def cmd_journal(a: dict[str, Any]) -> dict[str, Any]:
+    """Read the mutation log: what was renamed, patched, typed, noted, and when."""
+    path = _journal_file()
+    entries: list[dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    binary = a.get("binary")
+    op = a.get("op")
+    since = a.get("since")
+    if binary:
+        entries = [e for e in entries if e.get("binary") == binary]
+    if op:
+        entries = [e for e in entries if e.get("op") == op]
+    if since:
+        entries = [e for e in entries if str(e.get("at", "")) >= str(since)]
+    limit = int(a.get("limit") or 50)
+    total = len(entries)
+    entries = entries[-limit:]
+    return {
+        "path": str(path),
+        "total": total,
+        "shown": len(entries),
+        "entries": entries,
+    }
+
+
+def _journal_entries() -> list[dict[str, Any]]:
+    path = _journal_file()
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def cmd_overview(_: dict[str, Any]) -> dict[str, Any]:
+    """One line per program: size, strings, imports, notes, claims, last change.
+
+    `digest` answers "what is this binary"; this answers "what is in this project",
+    so an agent can pick a target without one call per sample.
+    """
+    started = time.time()
+    journal = _journal_entries()
+    rows = []
+    for binary in binary_names():
+        try:
+            e = _entry(binary)
+            program = e["program"]
+            index = load_index(e)
+            strings: set[str] = set()
+            imports: set[str] = set()
+            for fp in (index.get("rows") or {}).values():
+                strings.update(fp.get("strings") or ())
+                imports.update(fp.get("imports") or ())
+            notes = _load_notes(binary)
+            with_claims = [n for n in notes if n.get("claims")]
+            failing = [n for n in with_claims if (n.get("check") or {}).get("status") == "fail"]
+            last = next(
+                (j for j in reversed(journal) if j.get("binary") in (binary, str(binary))), None
+            )
+            rows.append(
+                {
+                    "binary": binary,
+                    "md5": str(program.getExecutableMD5()),
+                    "language": str(program.getLanguageID()),
+                    "compiler": str(program.getCompiler()),
+                    "functions": len(index.get("rows") or {}),
+                    "strings": len(strings),
+                    "imports": len(imports),
+                    "notes": len(notes),
+                    "claims": len(with_claims),
+                    "failing_claims": len(failing),
+                    "index": index.get("index", {}),
+                    "last": {"at": last["at"], "op": last["op"], "summary": last.get("summary")}
+                    if last
+                    else None,
+                }
+            )
+        except Exception as ex:  # noqa: BLE001 - one bad program must not hide the rest
+            rows.append({"binary": binary, "error": f"{type(ex).__name__}: {ex}"})
+    return {
+        "binaries": rows,
+        "project": project_location(),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def cmd_audit(a: dict[str, Any]) -> dict[str, Any]:
+    """Re-check every stored claim in the project and list what no longer holds.
+
+    `verify` is per binary; this is the project-wide question an agent asks after
+    a re-analysis or a patch: which of my beliefs are now wrong?
+    """
+    started = time.time()
+    target = a.get("binary")
+    bins = [str(target)] if target else binary_names()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    findings = []
+    checked = 0
+    passed = failed = unknown = 0
+    for binary in bins:
+        e = _entry(binary)
+        notes = _load_notes(binary)
+        touched = False
+        for note in notes:
+            claims = [str(c.get("claim")) for c in (note.get("claims") or [])]
+            if not claims:
+                continue
+            addr = note.get("addr")
+            fn = None
+            if addr:
+                try:
+                    fn = _function(e, str(addr))
+                except Exception:  # noqa: BLE001 - jpype call, can raise anything
+                    fn = None
+            results = _check_claims(e, fn, addr, claims)
+            status = _claims_status(results)
+            note["check"] = {"at": now, "status": status, "results": results}
+            note["claims"] = results
+            touched = True
+            checked += 1
+            passed += sum(1 for r in results if r.get("ok") is True)
+            failed += sum(1 for r in results if r.get("ok") is False)
+            unknown += sum(1 for r in results if r.get("ok") is None)
+            if status != "pass":
+                findings.append(
+                    {
+                        "binary": binary,
+                        "id": note.get("id"),
+                        "addr": addr,
+                        "function": note.get("function"),
+                        "tag": note.get("tag"),
+                        "text": note.get("text"),
+                        "status": status,
+                        "results": [r for r in results if r.get("ok") is not True],
+                    }
+                )
+        if touched:
+            _store_notes(binary, notes)
+    return {
+        "binaries": bins,
+        "notes_checked": checked,
+        "claims": {"passed": passed, "failed": failed, "unknown": unknown},
+        "status": "fail" if failed else ("unknown" if unknown else "pass"),
+        "findings": findings,
+        "checked_at": now,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
     with LOCK:
-        return HANDLERS[cmd](params)
+        try:
+            result = HANDLERS[cmd](params)
+        except Exception as ex:
+            if cmd in MUTATING:
+                _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
+            raise
+        if cmd in MUTATING:
+            _journal_append(cmd, params, result)
+        return result
 
 
 def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:
@@ -3650,4 +3922,7 @@ HANDLERS = {
     "similar": cmd_similar,
     "campaign": cmd_campaign,
     "family": cmd_family,
+    "journal": cmd_journal,
+    "overview": cmd_overview,
+    "audit": cmd_audit,
 }

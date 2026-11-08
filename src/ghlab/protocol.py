@@ -143,7 +143,7 @@ _SPECS = [
     Spec(
         "note",
         ("binary", "text"),
-        ("at", "addr", "tag", "assert"),
+        ("at", "addr", "tag", "assert", "delete"),
         "append a durable finding (JSON on disk + bookmark), with claims",
     ),
     Spec(
@@ -181,6 +181,19 @@ _SPECS = [
         (),
         ("binary", "min_score", "limit"),
         "cross-sample report for one family: per-program profile, shared evidence, notes",
+    ),
+    Spec("overview", summary="one line per program: size, facts, notes, last change"),
+    Spec(
+        "audit",
+        (),
+        ("binary",),
+        "re-check every stored claim in the project; list what no longer holds",
+    ),
+    Spec(
+        "journal",
+        (),
+        ("binary", "op", "since", "limit"),
+        "mutation log: what was renamed, patched, typed or noted, and when",
     ),
     Spec(
         "report",

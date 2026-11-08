@@ -87,7 +87,16 @@ def serve(host: str, port: int, project_dir: str, project_name: str) -> None:
     session.boot()
     session.project()
     with open(pidfile(), "w", encoding="utf-8") as fh:
-        fh.write(str(os.getpid()))
+        json.dump(
+            {
+                "pid": os.getpid(),
+                "parent": os.getppid(),
+                "stamp": session.code_stamp(),
+                "port": port,
+                "project": str(session.project_location()),
+            },
+            fh,
+        )
     try:
         httpd = Server((host, port), Handler)
     except OSError as ex:
