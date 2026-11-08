@@ -3,8 +3,12 @@
 Unit runs (`tests/test_*.py` without a daemon) skip this module automatically.
 """
 
+import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from ghlab.client import Client, RemoteError
@@ -283,6 +287,65 @@ class LiveTest(unittest.TestCase):
         self.assertEqual(best["name"], "FUN_140021ba8")
         self.assertGreater(best["score"], 0.9)
         self.assertTrue(best["shared_imports"] or best["shared_strings"])
+
+    def test_mcp_stdio_serves_tools_and_a_digest(self):
+        lines = [
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "ghlab_digest", "arguments": {"binary": BIN, "top": 2}},
+                }
+            ),
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "resources/read",
+                    "params": {"uri": f"ghlab://program/{BIN}/notes"},
+                }
+            ),
+        ]
+        payload = "".join(line + "\n" for line in lines)
+        proc = subprocess.run(
+            [sys.executable, "-m", "ghlab.mcp"],
+            input=payload,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=180,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        replies = {json.loads(line)["id"]: json.loads(line) for line in proc.stdout.splitlines() if line.strip()}
+        self.assertEqual(set(replies), {1, 2, 3, 4})
+        self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "ghlab")
+        self.assertGreaterEqual(len(replies[2]["result"]["tools"]), 8)
+        digest = json.loads(replies[3]["result"]["content"][0]["text"])
+        self.assertIn("functions", digest)
+        self.assertIn("notes", json.loads(replies[4]["result"]["content"][0]["text"]))
+
+    def test_run_script_against_the_daemon(self):
+        script_text = "\n".join(["# smoke", "digest $BIN --top 2", "report $BIN > report.md", ""])
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "job.gh")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(script_text)
+            proc = subprocess.run(
+                [sys.executable, "-m", "ghlab.cli", "run", script, "--set", f"BIN={BIN}"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=180,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("2/2 steps ok", proc.stdout)
+            with open(os.path.join(tmp, "report.md"), encoding="utf-8") as fh:
+                self.assertIn("Call-graph hubs", fh.read())
 
     def test_similar_does_not_equate_empty_stubs(self):
         r = client.call("similar", binary=BIN, target="FUN_140007e1c")

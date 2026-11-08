@@ -898,6 +898,16 @@ def build_parser() -> argparse.ArgumentParser:
             },
         )
     )
+    p = sub.add_parser("run", parents=[common], help="replay a script of ghlab commands")
+    p.add_argument("path", help=".gh script: one command per line, $VAR from --set, `>` redirects")
+    p.add_argument("--set", action="append", default=[], metavar="K=V", help="variable for $K")
+    p.add_argument("--keep-going", action="store_true", help="continue after a failing step")
+    p.add_argument("--dry-run", action="store_true", help="parse and print the plan only")
+    p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("mcp", parents=[common], help="serve MCP over stdio (for agent clients)")
+    p.set_defaults(func=cmd_mcp)
+
     return ap
 
 
@@ -916,6 +926,45 @@ def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
     else:
         print(FORMATTERS[cmd](result))
     return 0
+
+
+def cmd_run(a: argparse.Namespace) -> int:
+    from . import pipeline
+
+    variables: dict[str, str] = {}
+    for item in a.set or []:
+        if "=" not in item:
+            print(f"ghlab: --set takes K=V, got {item!r}", file=sys.stderr)
+            return 2
+        key, value = item.split("=", 1)
+        variables[key.strip()] = value
+    try:
+        summary = pipeline.run_file(
+            a.path, variables, keep_going=a.keep_going, dry_run=a.dry_run
+        )
+    except pipeline.PipelineError as ex:
+        print(f"ghlab: {ex}", file=sys.stderr)
+        return 2
+    except OSError as ex:
+        print(f"ghlab: {ex}", file=sys.stderr)
+        return 2
+    if a.json:
+        _print_json(summary)
+    else:
+        spent = sum(int(s.get("ms") or 0) for s in summary["steps"])
+        ok = summary["ran"] - summary["failed"]
+        note = " (dry run)" if summary["dry_run"] else f" in {spent}ms"
+        print(f"{ok}/{summary['total']} steps ok{note}")
+        for s in summary["steps"]:
+            if s["status"] == "failed":
+                print(f"  line {s['line']}: {s['command']} - {s['error']}")
+    return 1 if summary["failed"] else 0
+
+
+def cmd_mcp(a: argparse.Namespace) -> int:
+    from . import mcp
+
+    return mcp.serve()
 
 
 def main(argv: list[str] | None = None) -> int:

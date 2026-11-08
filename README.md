@@ -111,6 +111,61 @@ curl -s localhost:8765/ -d '{"cmd":"decompile","binary":"notepad.exe","targets":
 curl -s localhost:8765/ | jq          # 自描述的命令表
 ```
 
+## 可重放脚本（`ghlab run`）
+
+分析一个样本往往要十几条命令。把顺序写成脚本，下次换个样本只改一个变量：
+
+```
+# ~/re/pipes/triage.gh
+digest $BIN --top 4
+find $BIN -i RegSetValueExW
+slice $BIN RegSetValueExW -n 2
+report $BIN --top 3 > ~/re/pipes/$BIN.md
+```
+
+```bash
+ghlab run ~/re/pipes/triage.gh --set BIN=notepad.exe
+# [1/4] digest: ok (79ms)
+# [2/4] find: ok (31ms)
+# [3/4] slice: ok (62ms)
+# [4/4] report: ok (63ms)
+# 4/4 steps ok in 266ms
+```
+
+规则只有四条：一行一条命令、`#` 注释、`$VAR` 来自 `--set`、`>`/`>>` 把这一步的 stdout 写进文件。
+`--keep-going` 失败继续，`--dry-run` 只解析不执行。中转义只在引号前生效（所以 `C:	mp.md` 不会被吃掉反斜杠）。
+
+## 接 MCP（给别的 agent 用）
+
+```bash
+ghlab mcp          # stdio MCP server，转调本机 daemon
+```
+
+只暴露 10 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+
+| 工具 | 干什么 |
+|---|---|
+| `ghlab_digest` | 一次性 triage（先调这个） |
+| `ghlab_find` | 按导入/字符串/调用者定位候选 |
+| `ghlab_decompile` | 单函数 / 正则批量 / 服务端 grep（走缓存） |
+| `ghlab_diff` | 两个程序的功能级差异 |
+| `ghlab_slice` | 从导入回溯到 entry 的调用链 |
+| `ghlab_emulate` | P-code 模拟执行，取返回值与内存写入 |
+| `ghlab_cross_xref` | 全项目搜字符串，附引用者 |
+| `ghlab_similar` | 跨样本同构函数 |
+| `ghlab_note` / `ghlab_report` | 记结论 / 出报告 |
+
+还有资源：`ghlab://programs`、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
+MCP 进程本身不起 JVM，客户端可以随时重启它；daemon 用 `ghlab start` 管着就行。
+
+pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用 tool_search 按需加载）：
+
+```json
+{"mcpServers": {"ghlab": {"command": "C:\Users\admin\re\.venv\Scripts\python.exe",
+  "args": ["-m", "ghlab.mcp"], "env": {"GHLAB_URL": "http://127.0.0.1:8765"}, "timeout": 600,
+  "exposure": "deferred"}}}
+```
+
 ## 命令一览
 
 | cmd | 参数（必填 / 可选） | 说明 |
@@ -140,6 +195,9 @@ curl -s localhost:8765/ | jq          # 自描述的命令表
 | `slice` | `binary, to` / `from, depth, limit, code` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译 |
 | `similar` | `binary, target` / `against, limit, min_score` | **跨程序同构函数**：字符串/导入/常量/大小四路指纹打分；零特征的 thunk 一律压到 0.3 以下，避免 stub 互相当成 1.00 |
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
+
+| `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
+| `mcp` | – | 以 stdio MCP server 形式暴露 10 个工具 + `ghlab://` 资源 |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。

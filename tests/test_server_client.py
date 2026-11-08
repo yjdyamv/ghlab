@@ -1,11 +1,30 @@
 """End-to-end over real HTTP, with a stub session so no Ghidra is needed."""
 
+import os
 import threading
 import unittest
+from unittest import mock
 
 from ghlab import session
 from ghlab.client import Client, RemoteError
 from ghlab.server import Handler, Server
+
+
+class ClientConfigTest(unittest.TestCase):
+    def test_env_sets_the_default_url_and_timeout(self):
+        with mock.patch.dict(
+            os.environ, {"GHLAB_URL": "http://10.0.0.5:9000/", "GHLAB_TIMEOUT": "42"}, clear=False
+        ):
+            c = Client()
+            self.assertEqual(c.url, "http://10.0.0.5:9000/")
+            self.assertEqual(c.timeout, 42.0)
+            self.assertEqual(Client(timeout=7).timeout, 7.0)
+
+    def test_defaults_when_env_is_absent(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            c = Client()
+            self.assertIn("127.0.0.1", c.url)
+            self.assertEqual(c.timeout, 300.0)
 
 
 class StubSession:

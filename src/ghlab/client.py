@@ -18,11 +18,13 @@ class RemoteError(RuntimeError):
 
 
 class Client:
-    def __init__(self, url: str | None = None, timeout: float = 300.0):
+    def __init__(self, url: str | None = None, timeout: float | None = None):
         self.url = url or os.environ.get(
             "GHLAB_URL", f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/"
         )
-        self.timeout = timeout
+        # GHLAB_TIMEOUT lets an MCP/editor integration set its own budget without
+        # passing it through every call.
+        self.timeout = float(timeout or os.environ.get("GHLAB_TIMEOUT", 300))
 
     def raw(self, request: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(request, ensure_ascii=False).encode()
