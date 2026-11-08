@@ -14,6 +14,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from . import render
+
 MONITOR = None
 LOCK = threading.RLock()
 _proj = None
@@ -410,12 +412,21 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
     if not targets:
         raise ValueError("nothing to decompile: pass targets and/or match")
 
+    want_sig = bool(a.get("sig"))
     results = []
     for t in targets[:limit]:
         try:
             fn = t if not isinstance(t, (str, int)) else _function(e, str(t))
             if fn is None:
-                results.append({"target": str(t), "error": "function not found"})
+                hint = _function_suggestions(program, str(t))
+                results.append({"target": str(t), "error": f"function not found{hint}"})
+                continue
+            if want_sig:
+                # no decompiler: the prototype is already in the database, so a
+                # 476-function sweep costs milliseconds and a few hundred tokens.
+                item = brief(fn)
+                item["signature"] = _prototype(fn)
+                results.append(item)
                 continue
             key = None if a.get("refresh") else _decomp_cache_key(e, fn)
             code = _cache_read(key) if key else None
@@ -714,13 +725,31 @@ def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
         frontier = nxt
         if not frontier:
             break
-    return {
+    result = {
         "binary": a["binary"],
         "direction": direction,
         "root": str(root.getName()),
         "nodes": nodes,
         "edges": edges_out[: cap * 2],
     }
+    fmt = str(a.get("format") or "").lower()
+    if fmt:
+        if fmt not in render.RENDERERS:
+            raise ValueError(
+                f"unknown format {fmt!r}; pick one of {', '.join(sorted(render.RENDERERS))}"
+            )
+        text = render.RENDERERS[fmt](result)
+        result["format"] = fmt
+        result["bytes"] = len(text.encode("utf-8"))
+        out = a.get("out")
+        if out:
+            path = Path(str(out)).expanduser()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8", newline="\n")
+            result["path"] = str(path)
+        else:
+            result["rendered"] = text
+    return result
 
 
 # ------------------------------------------------------------------ triage
@@ -1667,6 +1696,17 @@ def _suggest_symbols(program, name: str, limit: int = 6) -> list[str]:
             if len(hits) >= limit:
                 break
     return hits
+
+
+def _function_suggestions(program, target: str, limit: int = 5) -> str:
+    """`FUN_14001e02` -> "(did you mean FUN_14001e02c, ...)" for a typo'd name."""
+    import difflib
+
+    names = [str(fn.getName()) for fn in program.getFunctionManager().getFunctions(True)]
+    close = difflib.get_close_matches(str(target), names, n=limit, cutoff=0.6)
+    if not close:
+        close = _suggest_symbols(program, str(target), limit)
+    return f" (did you mean {', '.join(close)}?)" if close else ""
 
 
 def _snapshot_writable(program, emu, budget: int = 2 << 20) -> list[tuple[int, bytes]]:

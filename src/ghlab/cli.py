@@ -11,7 +11,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from . import __version__, session
 from .client import Client, RemoteError
@@ -85,6 +85,9 @@ def fmt_decompile(r: dict[str, Any]) -> str:
         if item.get("error"):
             out.append(f"!! {item.get('target')}: {item['error']}")
             continue
+        if item.get("signature") and "lines" not in item:
+            out.append(f"  {item['addr']}  {item['size']:>6}b  {item['signature']}")
+            continue
         out.append(
             f"== {item['name']} @ {item['addr']}  ({item['lines']} lines)  {item['prototype']}"
         )
@@ -141,6 +144,10 @@ def fmt_xrefs(r: dict[str, Any]) -> str:
 
 
 def fmt_graph(r: dict[str, Any]) -> str:
+    if r.get("path"):
+        return f"{r.get('format')} graph written to {r['path']} ({r.get('bytes')} bytes)"
+    if r.get("rendered"):
+        return r["rendered"]
     out = [
         f"# {r['direction']} {r['root']}: {len(r.get('nodes') or [])} node(s)",
     ]
@@ -793,9 +800,9 @@ def cmd_start(args) -> int:
 
 
 def _port_owner(host: str, port: int) -> int | None:
-    """PID listening on host:port, via netstat (no psutil dependency)."""
+    """PID listening on host:port, without a psutil dependency."""
     if os.name != "nt":
-        return None
+        return _port_owner_posix(port)
     try:
         out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
@@ -805,6 +812,27 @@ def _port_owner(host: str, port: int) -> int | None:
         if needle in line and "LISTENING" in line:
             tail = line.split()[-1]
             return int(tail) if tail.isdigit() else None
+    return None
+
+
+def _port_owner_posix(port: int) -> int | None:
+    """lsof (macOS/BSD) or ss (Linux); both optional, so failure is not fatal."""
+    for cmd in (
+        ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+        ["ss", "-ltnp", f"sport = :{port}"],
+    ):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                return int(line)
+            if "pid=" in line:
+                tail = line.split("pid=")[1].split(",")[0]
+                if tail.isdigit():
+                    return int(tail)
     return None
 
 
@@ -891,18 +919,36 @@ def cmd_status(args) -> int:
 # --------------------------------------------------------------------- parser
 
 
+class _Parser(argparse.ArgumentParser):
+    """ArgumentParser that suggests a command on a typo instead of dumping 40 choices."""
+
+    def error(self, message: str) -> NoReturn:
+        import difflib
+
+        choices: list[str] = []
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                choices = list(action.choices)
+        hit = difflib.get_close_matches(
+            message.split("'")[1] if "'" in message else "", choices, n=2
+        )
+        if hit and "invalid choice" in message:
+            message = f"unknown command (did you mean {', '.join(hit)}?)"
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    common = argparse.ArgumentParser(add_help=False)
+    common = _Parser(add_help=False)
     common.add_argument("--url", default=os.environ.get("GHLAB_URL"))
     common.add_argument("--json", action="store_true", help="emit raw JSON")
 
-    daemon = argparse.ArgumentParser(add_help=False)
+    daemon = _Parser(add_help=False)
     daemon.add_argument("--host", default=DEFAULT_HOST)
     daemon.add_argument("--port", type=int, default=DEFAULT_PORT)
     daemon.add_argument("--project-dir", default=str(Path.home() / "re" / "proj"))
     daemon.add_argument("--project-name", default="ghlab")
 
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="ghlab",
         description="Warm Ghidra bridge: persistent headless Ghidra behind a JSON API.",
     )
@@ -970,6 +1016,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--limit", type=int, default=25, help="max functions")
     p.add_argument("--max-lines", type=int, default=0)
     p.add_argument("--refresh", action="store_true", help="ignore the decompiler cache")
+    p.add_argument("--sig", action="store_true", help="signatures only (no decompiler)")
     p.add_argument("--code", action="store_true", help="include full source even when grepping")
     p.add_argument("--callees", action="store_true")
     p.add_argument("--callers", action="store_true")
@@ -984,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "grep": a.grep,
                 "limit": a.limit,
                 "max_lines": a.max_lines,
+                "sig": a.sig,
                 "include_code": True if (a.code or a.max_lines) else None,
                 "include_callees": a.callees,
                 "include_callers": a.callers,
@@ -1010,6 +1058,10 @@ def build_parser() -> argparse.ArgumentParser:
             },
         )
     )
+
+    p = sub.add_parser("use", help="set/show the focus binary (then pass '-' as binary)")
+    p.add_argument("binary", nargs="?", help="program name, e.g. notepad.exe")
+    p.set_defaults(func=cmd_use)
 
     p = sub.add_parser("strings", parents=[common], help="search string data")
     p.add_argument("binary")
@@ -1065,7 +1117,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    p = sub.add_parser("graph", parents=[common], help="call tree")
+    p = sub.add_parser("graph", parents=[common], help="call tree, optionally rendered")
+    p.add_argument("--format", choices=("dot", "mermaid", "svg"), help="render instead of text")
+    p.add_argument("--out", help="write the rendered graph here (svg/dot/mermaid)")
     p.add_argument("binary")
     p.add_argument("target")
     p.add_argument("-d", "--depth", type=int, default=2)
@@ -1079,6 +1133,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "target": a.target,
                 "depth": a.depth,
                 "direction": a.direction,
+                "format": a.format,
+                "out": a.out,
             },
         )
     )
@@ -1531,8 +1587,42 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+FOCUS_FILE = Path.home() / ".ghlab" / "focus"
+
+
+def read_focus() -> str | None:
+    try:
+        name = FOCUS_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return name or None
+
+
+def write_focus(binary: str) -> None:
+    FOCUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FOCUS_FILE.write_text(binary + chr(10), encoding="utf-8", newline=chr(10))
+
+
+def cmd_use(args) -> int:
+    if not args.binary:
+        print(read_focus() or "ghlab: no focus binary set")
+        return 0
+    if args.binary == "-":
+        print("ghlab: `use -` makes no sense", file=sys.stderr)
+        return 2
+    write_focus(args.binary)
+    print(f"focus = {args.binary}  (pass '-' as the binary to reuse it)")
+    return 0
+
+
 def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
     params = {k: v for k, v in (params or {}).items() if v is not None}
+    if params.get("binary") == "-":
+        focus = read_focus()
+        if not focus:
+            print("ghlab: no focus binary; run `ghlab use <binary>` first", file=sys.stderr)
+            return 2
+        params["binary"] = focus
     client = Client(args.url)
     try:
         result = client.call(cmd, **params)

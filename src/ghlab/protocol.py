@@ -77,8 +77,9 @@ _SPECS = [
             "include_code",
             "timeout",
             "refresh",
+            "sig",
         ),
-        "decompile one/many functions, optionally filtered server-side",
+        "decompile one/many functions (sig: signatures only, no decompiler)",
     ),
     Spec(
         "imports",
@@ -96,7 +97,12 @@ _SPECS = [
     Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),
     Spec("rename", ("binary", "target", "new"), summary="rename a function"),
     Spec("comment", ("binary", "target", "text"), ("type",), "set a listing/decompiler comment"),
-    Spec("graph", ("binary", "target"), ("direction", "depth", "limit"), "call tree"),
+    Spec(
+        "graph",
+        ("binary", "target"),
+        ("direction", "depth", "limit", "format", "out"),
+        "call tree, optionally rendered as dot/mermaid/svg",
+    ),
     Spec(
         "digest",
         ("binary",),

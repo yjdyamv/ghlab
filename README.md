@@ -44,7 +44,19 @@ ghlab start                          # 后台常驻，日志 ~/re/logs/ghlab.log
 ghlab status
 ```
 
-Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`。
+Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`，`export GHIDRA_INSTALL_DIR=/opt/ghidra_12.2_PUBLIC`。
+
+### 跨平台状况（说实话版）
+
+| 部分 | Windows | Linux / macOS |
+|---|---|---|
+| 分析（session/server/protocol） | 实测 | 代码里没有 Windows API，只用 jpype + Ghidra Java API |
+| daemon 生命周期 | 实测（`taskkill`、`netstat`、shim 父进程） | `start_new_session=True` spawn、`os.kill` 停止、`lsof`/`ss` 找端口占用者；**未在真机验证** |
+| 出图（`--format svg/dot/mermaid`） | 实测 | 纯 Python 字符串拼接 + `xml.sax.saxutils`，与平台无关 |
+| 路径 | 实测（`C:\...`、venv shim） | 全部走 `pathlib`；`~/.ghlab/focus`、`<project>/.ghlab/*` 用 home 相对路径 |
+| 安装 | 实测（Ghidra 自带 wheel 离线装） | 同样吃 Ghidra 发行包里的 `pypkg/dist`（含该平台 jpype1 wheel）；若目录里没有对应平台 wheel，就只能 `uv pip install pyghidra`（需联网） |
+
+已知未覆盖：Windows 专属的“venv shim 父进程”处理在 POSIX 上是空转；`ghlab stop` 在 POSIX 靠 `lsof`/`ss` 找残留监听进程，两个都没装时只能靠 pidfile 的 pid。
 
 ## 用法
 
@@ -80,6 +92,11 @@ ghlab find notepad.exe -i 'VirtualAlloc|VirtualProtect' --any -n 10
 ghlab xrefs notepad.exe entry
 ghlab graph notepad.exe entry -d 2                # 调用树
 ghlab graph notepad.exe entry --direction called   # 调用者树
+
+# 出图：dot / mermaid / svg（svg 自带布局，不需要 graphviz）
+ghlab graph notepad.exe entry -d 3 --format svg --out ~/re/graphs/entry.svg
+ghlab graph notepad.exe FUN_140021ba8 -d 2 --format mermaid   # 直接贴进 markdown
+ghlab graph notepad.exe entry -d 3 --format dot > entry.dot    # 想用 graphviz 再渲染
 
 # 让函数跑一遍（P-code 模拟，不落盘）：给定参数，看它返回什么、写了哪块内存
 ghlab emulate notepad.exe __security_check_cookie --arg 1
@@ -259,7 +276,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
-| `graph` | `binary, target` / `direction, depth, limit` | 调用树 BFS |
+| `graph` | `binary, target` / `direction, depth, limit, format, out` | 调用树 BFS；`--format dot/mermaid/svg` 出图，`--out` 落盘（svg 是自绘的，无需 graphviz；dot 想再加工就交给 graphviz） |
 | `overview` | – | **项目总览**：每个程序的函数数/字符串数/导入数/结论数/失败断言数 + 最后一次改动（走索引，实测 3 个程序 2.7s） |
 | `journal` | – / `binary, op, since, limit` | **变更日志**（`.ghlab/journal.jsonl`）：所有写操作自动记录（import/analyze/rename/comment/patch/set_type/types/pdb/note/bookmark），失败也记 |
 | `audit` | – / `binary` | **全项目复算**：把所有结论里的断言重算一遍，列出 FAIL/UNKNOWN |
@@ -303,6 +320,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
+- **图要不依赖外部工具也能看**：SVG 自己按 BFS 层次排（列=深度，行=同层节点），不装 graphviz 也能直接丢浏览器/报告；DOT/Mermaid 是给“还要再加工”的场景留的接口
 - **下钻要顺着“谁用了它”走**：`strings --refs` 和 `imports` 把“字符串/API → 函数”这一步做成一次调用。agent 最常做的动作是“找到用它的函数”，而不是“列出所有字符串”
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
 - **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
