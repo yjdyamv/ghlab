@@ -1,0 +1,120 @@
+"""Wire protocol for ghlab: one JSON object per POST, one JSON object back.
+
+Request  {"cmd": "<name>", ...params}
+Success  {"ok": true,  "result": {...}, "ms": 123}
+Failure  {"ok": false, "error": "Type: message", "trace": "..."}
+
+This module has no Ghidra dependency so it can be imported (and unit tested)
+anywhere.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any, Callable
+
+DEFAULT_PORT = 8765
+DEFAULT_HOST = "127.0.0.1"
+
+
+class ProtocolError(ValueError):
+    """Bad request: unknown command, missing/extra parameter, wrong type."""
+
+
+@dataclass(frozen=True)
+class Spec:
+    """Declared parameters of one command."""
+
+    name: str
+    required: tuple[str, ...] = ()
+    optional: tuple[str, ...] = ()
+    summary: str = ""
+
+    def check(self, params: dict[str, Any]) -> dict[str, Any]:
+        missing = [k for k in self.required if k not in params]
+        if missing:
+            raise ProtocolError(f"{self.name}: missing {missing}")
+        allowed = set(self.required) | set(self.optional)
+        unknown = sorted(k for k in params if k not in allowed)
+        if unknown:
+            raise ProtocolError(
+                f"{self.name}: unknown parameter(s) {unknown}; allowed={sorted(allowed)}"
+            )
+        return dict(params)
+
+
+_SPECS = [
+    Spec("ping", summary="liveness + project info"),
+    Spec("binaries", summary="list programs in the project"),
+    Spec("import", ("path",), ("analyze",), "import + analyze a binary"),
+    Spec("info", ("binary",), summary="metadata for one program"),
+    Spec(
+        "functions",
+        ("binary",),
+        ("match", "limit", "offset"),
+        "list functions, optional regex on name",
+    ),
+    Spec(
+        "decompile",
+        ("binary",),
+        (
+            "targets",
+            "target",
+            "match",
+            "limit",
+            "grep",
+            "max_lines",
+            "include_callees",
+            "include_callers",
+            "include_code",
+            "timeout",
+        ),
+        "decompile one/many functions, optionally filtered server-side",
+    ),
+    Spec("strings", ("binary",), ("query", "limit", "offset"), "search string data"),
+    Spec("xrefs", ("binary",), ("target", "targets"), "references to address/function"),
+    Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),
+    Spec("rename", ("binary", "target", "new"), summary="rename a function"),
+    Spec("comment", ("binary", "target", "text"), ("type",), "set a listing/decompiler comment"),
+    Spec("graph", ("binary", "target"), ("direction", "depth", "limit"), "call tree"),
+]
+SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}
+COMMAND_NAMES = sorted(SPECS)
+
+
+def validate(request: dict[str, Any]) -> tuple[Spec, dict[str, Any]]:
+    if not isinstance(request, dict):
+        raise ProtocolError("request must be a JSON object")
+    cmd = request.get("cmd")
+    if not isinstance(cmd, str) or cmd not in SPECS:
+        raise ProtocolError(f"unknown cmd {cmd!r}; known={COMMAND_NAMES}")
+    params = {k: v for k, v in request.items() if k != "cmd"}
+    return SPECS[cmd], SPECS[cmd].check(params)
+
+
+@dataclass
+class Ok:
+    result: Any
+    ms: int = 0
+    ok: bool = field(default=True, init=False)
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(
+            {"ok": True, "ms": self.ms, "result": self.result}, ensure_ascii=False
+        ).encode()
+
+
+@dataclass
+class Err:
+    error: str
+    trace: str = ""
+    ok: bool = field(default=False, init=False)
+
+    def to_bytes(self) -> bytes:
+        return json.dumps(
+            {"ok": False, "error": self.error, "trace": self.trace}, ensure_ascii=False
+        ).encode()
+
+
+Handler = Callable[[dict[str, Any]], Any]

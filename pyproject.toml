@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghlab"
+version = "0.1.0"
+description = "Warm Ghidra bridge: a persistent headless Ghidra JVM behind a small JSON/HTTP API, with batch decompilation built for coding agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "ghlab" }]
+keywords = ["ghidra", "reverse-engineering", "mcp", "agent"]
+dependencies = []
+
+[project.optional-dependencies]
+# pyghidra ships as wheels inside the Ghidra install tree; install offline with:
+#   uv pip install --no-index --find-links "$GHIDRA_INSTALL_DIR/Ghidra/Features/PyGhidra/pypkg/dist" jpype1 pyghidra
+ghidra = ["pyghidra>=3.2", "jpype1>=1.5"]
+
+[project.scripts]
+ghlab = "ghlab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ghlab = ["py.typed"]
