@@ -140,6 +140,10 @@ def fmt_diff(r: dict[str, Any]) -> str:
             vals = d.get(key) or []
             if vals:
                 out.append(f"     {label}{len(vals):>2}: {', '.join(vals)}")
+        for line in c.get("disasm") or []:
+            out.append(f"     {line}")
+        if c.get("disasm_error"):
+            out.append(f"     (disassembly diff failed: {c['disasm_error']})")
     if r.get("added"):
         out.append("only in " + r["b"]["binary"])
         for f in r["added"]:
@@ -791,6 +795,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.55,
         help="similarity floor for the last-resort matcher (0-1)",
     )
+    p.add_argument(
+        "--detail",
+        type=int,
+        default=0,
+        help="include an instruction-level diff for N changed functions",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -801,6 +811,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "match": a.match,
                 "limit": a.limit,
                 "min_score": a.min_score,
+                "detail": a.detail,
             },
         )
     )

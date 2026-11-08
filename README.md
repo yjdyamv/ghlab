@@ -82,6 +82,7 @@ ghlab emulate notepad.exe decrypt_config --arg 0x140038600 --buffer 256 --ms 800
 ghlab import C:/samples/app_v1.exe && ghlab import C:/samples/app_v2.exe
 ghlab diff app_v1.exe app_v2.exe
 ghlab diff app_v1.exe app_v2.exe -m 'decrypt|auth' -n 10
+ghlab diff app_v1.exe app_v2.exe --detail 2      # 再加一层：改动函数的指令级 unified diff
 ghlab bytes notepad.exe 0x1400019d0 --size 32
 ghlab rename notepad.exe FUN_140001008 sub_parse_cmdline
 ghlab comment notepad.exe 0x1400019d0 'entry stub -> 0x140001850'
@@ -242,7 +243,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `index` | `binary` / `refresh` | **持久索引**：一次全扫把每个函数的 strings/imports/callees/常量/大小写进 `<project>/.ghlab/index/<binary>.json`；`find`/`diff`/`similar`/`campaign` 都改读索引，`(md5, modification number)` 变了就自动重建 |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
 | `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因 |
-| `diff` | `a, b` / `match, limit, min_score` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s） |
+| `diff` | `a, b` / `match, limit, min_score, detail` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`） |
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
@@ -277,6 +278,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
+- **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
 - **索引比命令更值钱**：每次调用都全扫是 agent 用不起的。`index` 把每个函数的事实（字符串、导入、被调函数、常量、大小、指令数、基本块数）落成一份 JSON，`find` 从 2.5s 降到 0.16s、`diff` 从 4.4s 降到 0.8s，`similar`/`campaign` 一并变快。失效判定是 `(md5, modification number)`：任何通过 ghlab 的写操作都会让它加一，旧索引不可能被当成新的；`note` 只写 JSON + 书签，不动程序事实，索引仍然有效。
 - **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。
 

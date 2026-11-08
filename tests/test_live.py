@@ -216,6 +216,19 @@ class LiveTest(unittest.TestCase):
         changed = r["changed"][0]
         self.assertEqual(changed["matched_by"], "signature")
         self.assertLess(changed["delta"]["insns"][1], changed["delta"]["insns"][0])
+        self.assertNotIn("disasm", changed)
+
+    def test_diff_can_show_the_changed_instructions(self):
+        binaries = client.call("binaries")["binaries"]
+        if "notepad_p2.exe" not in binaries:
+            self.skipTest("notepad_p2.exe not imported")
+        r = client.call("diff", a=BIN, b="notepad_p2.exe", detail=1)
+        self.assertEqual(r["summary"]["changed"], 1)
+        lines = r["changed"][0].get("disasm") or []
+        self.assertTrue(lines, "expected an instruction-level diff")
+        self.assertTrue(any(line.startswith("-") for line in lines), "expected a removed line")
+        self.assertTrue(any(line.startswith("+") for line in lines), "expected an added line")
+        self.assertIn("ADDR", "".join(lines))
 
     def test_patch_roundtrip_and_expect_guard(self):
         addr = "1400019d0"

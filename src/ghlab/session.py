@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import hashlib
 import json
 import os
@@ -1213,6 +1214,38 @@ def _read_memory(program, start, size: int) -> bytes:
     return bytes((buf[i] & 0xFF) for i in range(read))
 
 
+def _function_at(program, addr_text: Any):
+    """Look a function up by address string, without needing an `_entry` handle."""
+    offset = _hex_addr(addr_text)
+    if offset is None:
+        return None
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    return program.getFunctionManager().getFunctionAt(space.getAddress(offset))
+
+
+def _disasm_lines(program, fn, limit: int = 400) -> list[str]:
+    """Instruction text with absolute addresses blanked, so two builds line up."""
+    base = int(fn.getEntryPoint().getOffset())
+    out: list[str] = []
+    it = program.getListing().getInstructions(fn.getBody(), True)
+    while it.hasNext() and len(out) < limit:
+        insn = it.next()
+        text = str(insn)
+        text = re.sub(r"\b0x[0-9a-fA-F]{4,}\b", "ADDR", text)
+        text = re.sub(r"\b[0-9a-fA-F]{6,}\b", "ADDR", text)
+        offset = int(insn.getAddress().getOffset()) - base
+        out.append(f"{offset:+#06x}  {text}")
+    return out
+
+
+def _disasm_diff(left_program, right_program, left_fn, right_fn, context: int = 2) -> list[str]:
+    """Unified diff of the two functions' instruction streams (bounded)."""
+    a = _disasm_lines(left_program, left_fn)
+    b = _disasm_lines(right_program, right_fn)
+    lines = difflib.unified_diff(a, b, fromfile="a", tofile="b", n=context, lineterm="")
+    return list(lines)[:240]
+
+
 def _sections(program) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     for blk in program.getMemory().getBlocks():
@@ -1291,6 +1324,7 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
     la, lb = left["functions"], right["functions"]
     limit = int(a.get("limit", 25))
     min_score = float(a.get("min_score", 0.55))
+    detail = max(0, int(a.get("detail", 0)))
 
     pattern = None
     if a.get("match"):
@@ -1353,7 +1387,7 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
                 continue
             claim("similarity", round(score, 3), ka, kb)
 
-    changed = []
+    changed: list[dict[str, Any]] = []
     identical = 0
     for ka, kb, how, score in pairs:
         x, y = la[ka], lb[kb]
@@ -1371,6 +1405,17 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
             }
         )
     changed.sort(key=_size_swing)
+
+    if detail:
+        for entry in changed[:detail]:
+            fa = _function_at(left["program"], entry["a"]["addr"])
+            fb = _function_at(right["program"], entry["b"]["addr"])
+            if fa is None or fb is None:
+                continue
+            try:
+                entry["disasm"] = _disasm_diff(left["program"], right["program"], fa, fb)
+            except Exception as exc:  # noqa: BLE001 - diff detail is best effort
+                entry["disasm_error"] = f"{type(exc).__name__}: {exc}"
 
     added = [
         {"name": lb[k]["name"], "addr": lb[k]["addr"], "size": lb[k]["size"]}
