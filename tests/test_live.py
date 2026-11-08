@@ -175,6 +175,27 @@ class LiveTest(unittest.TestCase):
             client.call("emulate", binary=BIN, target="definitely_not_a_function")
         self.assertIn("not found", str(ctx.exception))
 
+    def test_diff_against_self_has_no_changes(self):
+        r = client.call("diff", a=BIN, b=BIN)
+        self.assertEqual(r["summary"]["changed"], 0)
+        self.assertEqual(r["summary"]["added"], 0)
+        self.assertEqual(r["summary"]["removed"], 0)
+        self.assertEqual(r["summary"]["identical"], r["summary"]["matched"])
+        self.assertEqual(r["sections"]["changed"], [])
+
+    def test_diff_reports_a_patched_function(self):
+        binaries = client.call("binaries")["binaries"]
+        patched = [b for b in binaries if b == "notepad_p2.exe"]
+        if not patched:
+            self.skipTest("notepad_p2.exe not imported")
+        r = client.call("diff", a=BIN, b=patched[0])
+        self.assertEqual(r["summary"]["changed"], 1)
+        self.assertEqual(r["summary"]["added"], 1)
+        self.assertIn(".text", r["sections"]["changed"])
+        changed = r["changed"][0]
+        self.assertEqual(changed["matched_by"], "signature")
+        self.assertLess(changed["delta"]["insns"][1], changed["delta"]["insns"][0])
+
 
 @unittest.skipUnless(LIVE and os.environ.get("GHLAB_LIVE_IMPORT"), "set GHLAB_LIVE_IMPORT=1")
 class LiveImportTest(unittest.TestCase):

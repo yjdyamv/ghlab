@@ -101,6 +101,57 @@ def fmt_graph(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_diff(r: dict[str, Any]) -> str:
+    s = r["summary"]
+    by = ", ".join(f"{k}:{v}" for k, v in sorted((s.get("by") or {}).items()))
+    sec = r.get("sections") or {}
+    out = [
+        f"== {r['a']['binary']} -> {r['b']['binary']}  "
+        f"{r['a']['functions']} -> {r['b']['functions']} functions  ({r['elapsed_ms']}ms)",
+        f"   md5 {r['a']['md5'][:12]} -> {r['b']['md5'][:12]}",
+        f"   matched {s['matched']} (identical {s['identical']}, changed {s['changed']}) "
+        f"| only-a {s['removed']} | only-b {s['added']}  [{by}]",
+        "   sections  changed:"
+        f" {', '.join(sec.get('changed') or []) or '-'}"
+        f"  added: {', '.join(sec.get('added') or []) or '-'}"
+        f"  removed: {', '.join(sec.get('removed') or []) or '-'}",
+    ]
+    if r.get("changed"):
+        out.append("changed")
+    for c in r.get("changed") or []:
+        d = c["delta"]
+        sign = d["size"][1] - d["size"][0]
+        out.append(
+            f"   {c['a']['addr']} {c['a']['name']}  {d['size'][0]}b -> {d['size'][1]}b "
+            f"({sign:+d})  insns {d['insns'][0]}->{d['insns'][1]} "
+            f"blocks {d['blocks'][0]}->{d['blocks'][1]}  [{c['matched_by']} {c['score']}]"
+        )
+        if c["a"]["name"] != c["b"]["name"]:
+            out.append(f"     renamed -> {c['b']['name']}")
+        for key, label in (
+            ("strings_added", "strings +"),
+            ("strings_removed", "strings -"),
+            ("imports_added", "imports +"),
+            ("imports_removed", "imports -"),
+            ("consts_added", "consts +"),
+            ("consts_removed", "consts -"),
+        ):
+            vals = d.get(key) or []
+            if vals:
+                out.append(f"     {label}{len(vals):>2}: {', '.join(vals)}")
+    if r.get("added"):
+        out.append("only in " + r["b"]["binary"])
+        for f in r["added"]:
+            out.append(f"   + {f['addr']}  {f['name']}  ({f['size']}b)")
+    if r.get("removed"):
+        out.append("only in " + r["a"]["binary"])
+        for f in r["removed"]:
+            out.append(f"   - {f['addr']}  {f['name']}  ({f['size']}b)")
+    if not (r.get("changed") or r.get("added") or r.get("removed")):
+        out.append("   (no functional difference found)")
+    return "\n".join(out)
+
+
 def fmt_emulate(r: dict[str, Any]) -> str:
     args = "  ".join(
         f"{a['kind']}:{a.get('value')}" + (f"@{a['addr']}" if a.get("addr") else "")
@@ -230,6 +281,7 @@ FORMATTERS = {
     "graph": fmt_graph,
     "digest": fmt_digest,
     "find": fmt_find,
+    "diff": fmt_diff,
     "emulate": fmt_emulate,
 }
 
@@ -491,6 +543,32 @@ def build_parser() -> argparse.ArgumentParser:
             },
         )
     )
+    p = sub.add_parser("diff", parents=[common], help="compare two programs in the project")
+    p.add_argument("a")
+    p.add_argument("b")
+    p.add_argument("-m", "--match", default=None, help="regex over function names (applied to both)")
+    p.add_argument("-n", "--limit", type=int, default=25)
+    p.add_argument(
+        "--min-score",
+        dest="min_score",
+        type=float,
+        default=0.55,
+        help="similarity floor for the last-resort matcher (0-1)",
+    )
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "diff",
+            {
+                "a": a.a,
+                "b": a.b,
+                "match": a.match,
+                "limit": a.limit,
+                "min_score": a.min_score,
+            },
+        )
+    )
+
     p = sub.add_parser("emulate", parents=[common], help="run a function on the P-code emulator")
     p.add_argument("binary")
     p.add_argument("target")

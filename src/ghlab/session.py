@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import threading
@@ -15,6 +16,7 @@ _proj = None
 _project_dir: Path | None = None
 _project_name = "ghlab"
 _programs: dict[str, dict[str, Any]] = {}
+_FP_CACHE: dict[tuple[str, str, int], dict[str, Any]] = {}
 
 
 # --------------------------------------------------------------------------- boot
@@ -821,6 +823,311 @@ PARAM_REGS = ("RCX", "RDX", "R8", "R9")
 MASK64 = (1 << 64) - 1
 
 
+def _is_string_data(data) -> bool:
+    try:
+        tname = str(data.getDataType().getName()).lower()
+    except Exception:  # noqa: BLE001
+        return False
+    return any(k in tname for k in ("string", "unicode", "terminated", "char"))
+
+
+def _string_value(data) -> str | None:
+    try:
+        val = str(data.getValue())
+    except Exception:  # noqa: BLE001
+        try:
+            val = str(data.getDefaultValueRepresentation())
+        except Exception:  # noqa: BLE001
+            return None
+    if not val or val == "None":
+        return None
+    return val[:120]
+
+
+def _fingerprint(program, fn, block_model) -> dict[str, Any]:
+    """One pass over a function collecting everything a diff needs."""
+    insns = 0
+    strings: set[str] = set()
+    consts: set[int] = set()
+    it = program.getListing().getInstructions(fn.getBody(), True)
+    while it.hasNext():
+        insn = it.next()
+        insns += 1
+        for i in range(insn.getNumOperands()):
+            try:
+                scalar = insn.getScalar(i)
+            except Exception:  # noqa: BLE001
+                scalar = None
+            if scalar is None:
+                continue
+            value = int(scalar.getValue())
+            if abs(value) > 0xFF and len(consts) < 512:
+                consts.add(value)
+        if len(strings) < 256:
+            for ref in insn.getReferencesFrom():
+                data = program.getListing().getDataAt(ref.getToAddress())
+                if data is not None and _is_string_data(data):
+                    value = _string_value(data)
+                    if value:
+                        strings.add(value)
+    ext: set[str] = set()
+    calls = 0
+    for callee in fn.getCalledFunctions(MONITOR):
+        calls += 1
+        name = str(callee.getName())
+        if callee.isExternal() or callee.isThunk() or name.startswith("PTR_"):
+            ext.add(_clean_name(name))
+    blocks = 0
+    cit = block_model.getCodeBlocksContaining(fn.getBody(), MONITOR)
+    while cit.hasNext():
+        cit.next()
+        blocks += 1
+    return {
+        "name": str(fn.getName()),
+        "addr": str(fn.getEntryPoint()),
+        "offset": int(fn.getEntryPoint().getOffset()),
+        "size": int(fn.getBody().getNumAddresses()),
+        "insns": insns,
+        "blocks": blocks,
+        "calls": calls,
+        "strings": strings,
+        "consts": consts,
+        "imports": ext,
+    }
+
+
+def _program_fingerprints(binary: str) -> dict[str, Any]:
+    from ghidra.program.model.block import BasicBlockModel
+
+    entry = _entry(binary)
+    program = entry["program"]
+    md5 = str(program.getExecutableMD5() or "")
+    cache_key = (str(binary), md5, int(program.getModificationNumber()))
+    if cache_key in _FP_CACHE:
+        return _FP_CACHE[cache_key]
+    model = BasicBlockModel(program)
+    prints: dict[int, dict[str, Any]] = {}
+    it = program.getFunctionManager().getFunctions(True)
+    while it.hasNext():
+        fn = it.next()
+        try:
+            if fn.isExternal():
+                continue
+            fp = _fingerprint(program, fn, model)
+        except Exception:  # noqa: BLE001
+            continue
+        prints[fp["offset"]] = fp
+    out = {"binary": str(binary), "md5": md5, "program": program, "functions": prints}
+    _FP_CACHE[cache_key] = out
+    return out
+
+
+def _read_memory(program, start, size: int) -> bytes:
+    """Read a range: MemoryMap.getBytes only takes a byte[] sink, not a length."""
+    from jpype import JArray, JByte
+
+    buf = JArray(JByte)(size)
+    read = program.getMemory().getBytes(start, buf)
+    return bytes((buf[i] & 0xFF) for i in range(read))
+
+
+def _sections(program) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for blk in program.getMemory().getBlocks():
+        size = int(blk.getSize())
+        if size <= 0 or size > (16 << 20):
+            continue
+        data = _read_memory(program, blk.getStart(), size)
+        out[str(blk.getName())] = {
+            "size": size,
+            "md5": hashlib.md5(data).hexdigest(),
+            "exec": bool(blk.isExecute()),
+            "write": bool(blk.isWrite()),
+        }
+    return out
+
+
+def _jaccard(left: set, right: set) -> float:
+    if not left and not right:
+        return 1.0
+    union = len(left | right)
+    return len(left & right) / union if union else 0.0
+
+
+def _similarity(x: dict[str, Any], y: dict[str, Any]) -> float:
+    size_ratio = min(x["size"], y["size"]) / max(x["size"], y["size"], 1)
+    return (
+        0.45 * _jaccard(x["strings"], y["strings"])
+        + 0.30 * _jaccard(x["imports"], y["imports"])
+        + 0.15 * _jaccard(x["consts"], y["consts"])
+        + 0.10 * size_ratio
+    )
+
+
+def _delta(x: dict[str, Any], y: dict[str, Any], limit: int) -> dict[str, Any]:
+    def diff_set(left: set, right: set) -> tuple[list, list]:
+        added = sorted(right - left, key=str)[:limit]
+        removed = sorted(left - right, key=str)[:limit]
+        return list(map(str, added)), list(map(str, removed))
+
+    s_add, s_del = diff_set(x["strings"], y["strings"])
+    i_add, i_del = diff_set(x["imports"], y["imports"])
+    c_add, c_del = diff_set(x["consts"], y["consts"])
+    return {
+        "size": [x["size"], y["size"]],
+        "insns": [x["insns"], y["insns"]],
+        "blocks": [x["blocks"], y["blocks"]],
+        "calls": [x["calls"], y["calls"]],
+        "strings_added": s_add,
+        "strings_removed": s_del,
+        "imports_added": i_add,
+        "imports_removed": i_del,
+        "consts_added": [hex(v) for v in c_add],
+        "consts_removed": [hex(v) for v in c_del],
+    }
+
+
+def _changed(x: dict[str, Any], y: dict[str, Any]) -> bool:
+    for key in ("size", "insns", "blocks", "calls"):
+        if x[key] != y[key]:
+            return True
+    for key in ("strings", "consts", "imports"):
+        if x[key] != y[key]:
+            return True
+    return False
+
+
+def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
+    """Compare two programs in the project: what was added, removed, patched."""
+    import time
+
+    started = time.time()
+    left = _program_fingerprints(a["a"])
+    right = _program_fingerprints(a["b"])
+    la, lb = left["functions"], right["functions"]
+    limit = int(a.get("limit", 25))
+    min_score = float(a.get("min_score", 0.55))
+
+    pattern = None
+    if a.get("match"):
+        pattern = re.compile(str(a["match"]), re.I)
+        la = {k: v for k, v in la.items() if pattern.search(v["name"])}
+        lb = {k: v for k, v in lb.items() if pattern.search(v["name"])}
+
+    pairs: list[tuple[int, int, str, float]] = []  # (a offset, b offset, how, score)
+    used_a: set[int] = set()
+    used_b: set[int] = set()
+
+    def claim(how: str, score: float, key_a: int, key_b: int) -> None:
+        pairs.append((key_a, key_b, how, score))
+        used_a.add(key_a)
+        used_b.add(key_b)
+
+    # 1. identical (strings, imports) signature, unique on both sides
+    def sig(fp: dict[str, Any]) -> tuple:
+        return (frozenset(fp["strings"]), frozenset(fp["imports"]))
+
+    bucket_a: dict[tuple, list[int]] = {}
+    bucket_b: dict[tuple, list[int]] = {}
+    for k, fp in la.items():
+        bucket_a.setdefault(sig(fp), []).append(k)
+    for k, fp in lb.items():
+        bucket_b.setdefault(sig(fp), []).append(k)
+    for key, offs in bucket_a.items():
+        others = bucket_b.get(key) or []
+        if len(offs) == 1 and len(others) == 1:
+            claim("signature", 1.0, offs[0], others[0])
+
+    # 2. same entry offset (same image layout, e.g. patched build)
+    for k in list(la):
+        if k in used_a or k not in lb or k in used_b:
+            continue
+        claim("address", 0.9, k, k)
+
+    # 3. same symbol name
+    by_name_b = {v["name"]: k for k, v in lb.items() if k not in used_b}
+    for k, fp in la.items():
+        if k in used_a:
+            continue
+        other = by_name_b.get(fp["name"])
+        if other is not None and other not in used_b:
+            claim("name", 0.85, k, other)
+
+    # 4. greedy similarity for the rest
+    rest_a = [k for k in la if k not in used_a]
+    rest_b = [k for k in lb if k not in used_b]
+    if rest_a and rest_b and len(rest_a) * len(rest_b) <= 4_000_000:
+        scored = []
+        for ka in rest_a:
+            for kb in rest_b:
+                score = _similarity(la[ka], lb[kb])
+                if score >= min_score:
+                    scored.append((score, ka, kb))
+        scored.sort(reverse=True)
+        for score, ka, kb in scored:
+            if ka in used_a or kb in used_b:
+                continue
+            claim("similarity", round(score, 3), ka, kb)
+
+    changed = []
+    identical = 0
+    for ka, kb, how, score in pairs:
+        x, y = la[ka], lb[kb]
+        if not _changed(x, y):
+            identical += 1
+            continue
+        entry_delta = _delta(x, y, limit=6)
+        changed.append(
+            {
+                "a": {"name": x["name"], "addr": x["addr"], "size": x["size"]},
+                "b": {"name": y["name"], "addr": y["addr"], "size": y["size"]},
+                "matched_by": how,
+                "score": score,
+                "delta": entry_delta,
+            }
+        )
+    changed.sort(key=lambda c: -abs(c["delta"]["size"][1] - c["delta"]["size"][0]))
+
+    added = [
+        {"name": lb[k]["name"], "addr": lb[k]["addr"], "size": lb[k]["size"]}
+        for k in lb
+        if k not in used_b
+    ]
+    removed = [
+        {"name": la[k]["name"], "addr": la[k]["addr"], "size": la[k]["size"]}
+        for k in la
+        if k not in used_a
+    ]
+
+    sec_a = _sections(left["program"])
+    sec_b = _sections(right["program"])
+    sections = {
+        "added": sorted(set(sec_b) - set(sec_a)),
+        "removed": sorted(set(sec_a) - set(sec_b)),
+        "changed": sorted(
+            n for n in set(sec_a) & set(sec_b) if sec_a[n]["md5"] != sec_b[n]["md5"]
+        ),
+    }
+
+    return {
+        "a": {"binary": left["binary"], "md5": left["md5"], "functions": len(la)},
+        "b": {"binary": right["binary"], "md5": right["md5"], "functions": len(lb)},
+        "summary": {
+            "matched": len(pairs),
+            "identical": identical,
+            "changed": len(changed),
+            "added": len(added),
+            "removed": len(removed),
+            "by": dict(Counter(p[2] for p in pairs)),
+        },
+        "sections": sections,
+        "changed": changed[:limit],
+        "added": added[:limit],
+        "removed": removed[:limit],
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def parse_arg_spec(text: Any) -> tuple[str, Any]:
     """Classify one argument: `"str"`, `L"wide"`, `0x1234`, `42`, `null`, `*symbol`."""
     t = str(text).strip()
@@ -1352,5 +1659,6 @@ HANDLERS = {
     "graph": cmd_graph,
     "digest": cmd_digest,
     "find": cmd_find,
+    "diff": cmd_diff,
     "emulate": cmd_emulate,
 }

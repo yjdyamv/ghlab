@@ -91,6 +91,12 @@ _SPECS = [
         "locate candidate functions by imports/strings/calls instead of by name",
     ),
     Spec(
+        "diff",
+        ("a", "b"),
+        ("match", "limit", "min_score"),
+        "compare two programs: added/removed/changed functions and sections",
+    ),
+    Spec(
         "emulate",
         ("binary", "target"),
         ("args", "max_insns", "ms", "dump", "buffer"),
