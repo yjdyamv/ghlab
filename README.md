@@ -63,6 +63,9 @@ ghlab decompile notepad.exe -t FUN_140001008 --max-lines 30
 ghlab decompile notepad.exe -m 'FUN_' -g 'CreateWindow|RegisterClass|GetDlgItem' -n 40
 
 ghlab strings notepad.exe -q txt
+ghlab strings notepad.exe -q 'Software\Microsoft' --refs   # 谁用了这个字符串
+ghlab imports notepad.exe -m '^Reg'                        # 每个导入有几个调用者、属于哪个风险组
+ghlab imports notepad.exe --group registry -n 10           # 只看注册表相关
 
 # 先看全局，再决定花 token 看哪里
 ghlab overview                                    # 整个项目一行一个程序
@@ -250,8 +253,9 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `info` | `binary` | 语言、基址、MD5、函数数、段 |
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |
 | `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache`，热查询 2.5s → 0.19s，`--refresh` 强制重算 |
-| `strings` | `binary` / `query, limit, offset` | 字符串数据搜索 |
+| `strings` | `binary` / `query, limit, offset, refs` | 字符串数据搜索；`--refs` 顺带给出引用它的函数（含大小），并在头部汇总“哪个函数用的字符串最多”（实测 0.28s / 4 条） |
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
+| `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
@@ -299,6 +303,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 - **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
+- **下钻要顺着“谁用了它”走**：`strings --refs` 和 `imports` 把“字符串/API → 函数”这一步做成一次调用。agent 最常做的动作是“找到用它的函数”，而不是“列出所有字符串”
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
 - **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
 - **索引比命令更值钱**：每次调用都全扫是 agent 用不起的。`index` 把每个函数的事实（字符串、导入、被调函数、常量、大小、指令数、基本块数）落成一份 JSON，`find` 从 2.5s 降到 0.16s、`diff` 从 4.4s 降到 0.8s，`similar`/`campaign` 一并变快。失效判定是 `(md5, modification number)`：任何通过 ghlab 的写操作都会让它加一，旧索引不可能被当成新的；`note` 只写 JSON + 书签，不动程序事实，索引仍然有效。

@@ -58,6 +58,27 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_imports",
+        "description": (
+            "Drill into imports: for each API, how many distinct functions call it, the biggest "
+            "callers, and its risk group. Use after digest when a group looks interesting "
+            "(e.g. group='registry' or match='^Reg')."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "match": {"type": "string", "description": "regex on import or library name"},
+                "group": {
+                    "type": "string",
+                    "description": "anti, crypto, exec, file, inject, network, registry, ui",
+                },
+                "limit": _LIMIT,
+            },
+            "required": ["binary"],
+        },
+    },
+    {
         "name": "ghlab_decompile",
         "description": (
             "Decompile one function, a name regex, or a batch; `grep` filters server-side and "
@@ -305,6 +326,7 @@ TOOLS: list[dict[str, Any]] = [
 _COMMANDS = {
     "ghlab_digest": "digest",
     "ghlab_find": "find",
+    "ghlab_imports": "imports",
     "ghlab_decompile": "decompile",
     "ghlab_diff": "diff",
     "ghlab_slice": "slice",

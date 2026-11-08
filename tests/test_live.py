@@ -28,6 +28,54 @@ reason = f"no daemon on {client.url} or {BIN} not imported"
 
 
 @unittest.skipUnless(LIVE, reason)
+class LiveDrilldownTest(unittest.TestCase):
+    """imports/strings --refs: the two commands that replace manual xref hunting."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = client
+
+    def setUp(self):
+        if not _alive():
+            self.skipTest(reason)
+
+    def test_imports_counts_callers(self):
+        r = self.client.call("imports", binary=BIN, match="^RegSetValueExW$")
+        self.assertEqual(r["total"], 1)
+        imp = r["imports"][0]
+        self.assertEqual(imp["name"], "RegSetValueExW")
+        self.assertEqual(imp["risk"], "registry")
+        self.assertGreaterEqual(imp["callers"], 1)
+        self.assertTrue(imp["top"][0]["function"])
+
+    def test_imports_rejects_an_unknown_group(self):
+        with self.assertRaises(RemoteError) as ctx:
+            self.client.call("imports", binary=BIN, group="persistence")
+        self.assertIn("unknown group", str(ctx.exception))
+        self.assertIn("registry", str(ctx.exception))
+
+    def test_imports_filters_by_group(self):
+        r = self.client.call("imports", binary=BIN, group="registry", limit=5)
+        self.assertTrue(r["imports"])
+        self.assertTrue(all(i["risk"] == "registry" for i in r["imports"]))
+        self.assertLessEqual(len(r["imports"]), 5)
+
+    def test_strings_refs_name_the_using_functions(self):
+        r = self.client.call("strings", binary=BIN, query="Software", refs=True, limit=20)
+        self.assertTrue(r["strings"])
+        named = [s for s in r["strings"] if s.get("functions")]
+        self.assertTrue(named, "no string was attributed to a function")
+        fn = named[0]["functions"][0]
+        self.assertIn("function", fn)
+        self.assertGreater(fn["size"], 0)
+        self.assertTrue(r["by_function"])
+
+    def test_strings_without_refs_stay_cheap(self):
+        r = self.client.call("strings", binary=BIN, query="Software", limit=3)
+        self.assertNotIn("functions", r["strings"][0])
+        self.assertNotIn("by_function", r)
+
+
 class LiveTest(unittest.TestCase):
     def test_ping_reports_project(self):
         r = client.call("ping")

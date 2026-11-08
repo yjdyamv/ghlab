@@ -159,6 +159,15 @@ class EnvelopeTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "campaign", "threshold": 0.6})
 
+    def test_imports_is_declared_and_validated(self):
+        spec = protocol.SPECS["imports"]
+        self.assertEqual(spec.required, ("binary",))
+        self.assertIn("group", spec.optional)
+        self.assertIn("refs", protocol.SPECS["strings"].optional)
+        protocol.validate({"cmd": "imports", "binary": "x", "group": "registry"})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "imports"})
+
 
 if __name__ == "__main__":
     unittest.main()

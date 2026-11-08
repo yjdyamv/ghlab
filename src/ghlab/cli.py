@@ -100,9 +100,34 @@ def fmt_decompile(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_imports(r: dict[str, Any]) -> str:
+    groups = ", ".join(f"{k} {v}" for k, v in r["groups"].items()) or "-"
+    out = [
+        f"# {r['total']} import(s), {r['with_callers']} with callers  "
+        f"({r['elapsed_ms']}ms)  groups: {groups}"
+    ]
+    for imp in r["imports"]:
+        risk = f" [{imp['risk']}]" if imp["risk"] else ""
+        top = ", ".join(f"{c['function']} ({c['size']}b)" for c in imp["top"]) or "-"
+        out.append(f"  {imp['name']:<34} {imp['lib']:<10} callers {imp['callers']:>3}{risk}  {top}")
+    return chr(10).join(out)
+
+
 def fmt_strings(r: dict[str, Any]) -> str:
-    body = [f"{s['addr']}  {s['value']}" for s in r.get("strings") or []]
+    body = []
+    for s in r.get("strings") or []:
+        fns = s.get("functions")
+        where = ""
+        if fns:
+            where = "  <- " + ", ".join(f"{f['function']} ({f['size']}b)" for f in fns)
+        elif fns == []:
+            where = "  <- (unreferenced)"
+        body.append(f"{s['addr']}  {s['value']}{where}")
     head = f"# {r.get('matched')} match(es), {r.get('defined_data_scanned')} data items scanned"
+    if r.get("by_function"):
+        head += "\n# busiest: " + ", ".join(
+            f"{f['function']} ({f['strings']})" for f in r["by_function"][:5]
+        )
     return "\n".join([head, *body])
 
 
@@ -629,6 +654,7 @@ FORMATTERS = {
     "functions": fmt_functions,
     "decompile": fmt_decompile,
     "strings": fmt_strings,
+    "imports": fmt_imports,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
     "digest": fmt_digest,
@@ -965,12 +991,44 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    p = sub.add_parser("imports", parents=[common], help="imports with callers and risk group")
+    p.add_argument("binary")
+    p.add_argument("-m", "--match", help="regex on import or library name")
+    p.add_argument("-q", "--query", help="alias for --match")
+    p.add_argument("--group", help="only this risk group (inject, network, file, ...)")
+    p.add_argument("-n", "--limit", type=int, default=0, help="max rows (0 = all)")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "imports",
+            {
+                "binary": a.binary,
+                "match": a.match,
+                "query": a.query,
+                "group": a.group,
+                "limit": a.limit,
+            },
+        )
+    )
+
     p = sub.add_parser("strings", parents=[common], help="search string data")
     p.add_argument("binary")
     p.add_argument("-q", "--query", default=None)
     p.add_argument("-n", "--limit", type=int, default=80)
+    p.add_argument("--offset", type=int, default=0, help="skip this many matches")
+    p.add_argument("--refs", action="store_true", help="show which functions use each string")
     p.set_defaults(
-        func=lambda a: _call(a, "strings", {"binary": a.binary, "query": a.query, "limit": a.limit})
+        func=lambda a: _call(
+            a,
+            "strings",
+            {
+                "binary": a.binary,
+                "query": a.query,
+                "limit": a.limit,
+                "offset": a.offset,
+                "refs": a.refs,
+            },
+        )
     )
 
     p = sub.add_parser("xrefs", parents=[common], help="references to address/function")

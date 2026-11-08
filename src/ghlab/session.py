@@ -456,12 +456,111 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
     return {"binary": a["binary"], "decompiled": len(results), "results": results}
 
 
+def _string_refs(program, address, max_refs: int = 8) -> list[dict[str, Any]]:
+    """Functions that reference a string, most useful first (biggest first)."""
+    fm = program.getFunctionManager()
+    rm = program.getReferenceManager()
+    rows: dict[str, dict[str, Any]] = {}
+    try:
+        refs = rm.getReferencesTo(address)
+    except Exception:  # noqa: BLE001 - jpype call, can raise anything
+        return []
+    for ref in refs:
+        try:
+            fn = fm.getFunctionContaining(ref.getFromAddress())
+        except Exception:  # noqa: BLE001
+            continue
+        if fn is None or fn.isExternal() or fn.isThunk():
+            continue
+        key = str(fn.getEntryPoint())
+        if key in rows:
+            continue
+        rows[key] = {
+            "function": str(fn.getName()),
+            "addr": key,
+            "size": int(fn.getBody().getNumAddresses()),
+            "from": str(ref.getFromAddress()),
+        }
+        if len(rows) >= max_refs:
+            break
+    return sorted(rows.values(), key=lambda r: -r["size"])
+
+
+def cmd_imports(a: dict[str, Any]) -> dict[str, Any]:
+    """List imports with caller counts, filtered by name and/or risk group.
+
+    `digest` shows risk groups as counts; this is the drill-down: how many distinct
+    functions call this API, and which group it belongs to.
+    """
+    started = time.time()
+    p = _entry(a["binary"])["program"]
+    pattern = a.get("match") or a.get("query")
+    rx = re.compile(str(pattern), re.I) if pattern else None
+    group = a.get("group")
+    if group and group not in RISK:
+        raise ValueError(f"unknown group {group!r}; pick one of {', '.join(sorted(RISK))}")
+    limit = int(a.get("limit", 0))
+    fm = p.getFunctionManager()
+    rm = p.getReferenceManager()
+    rows: list[dict[str, Any]] = []
+    for imp in _imports(p):
+        name = imp["name"]
+        kind = _classify_import(name)
+        if rx is not None and rx.search(name) is None and rx.search(imp["lib"]) is None:
+            continue
+        if group and kind != group:
+            continue
+        callers: dict[str, dict[str, Any]] = {}
+        try:
+            # external symbols live in their own space: the address string is
+            # "EXTERNAL:00000004", so let the factory parse it (not _hex_addr).
+            addr = p.getAddressFactory().getAddress(imp["addr"])
+        except Exception:  # noqa: BLE001 - jpype call, can raise anything
+            addr = None
+        if addr is not None:
+            try:
+                for ref in rm.getReferencesTo(addr):
+                    fn = fm.getFunctionContaining(ref.getFromAddress())
+                    if fn is None or fn.isExternal() or fn.isThunk():
+                        continue
+                    key = str(fn.getEntryPoint())
+                    callers[key] = {
+                        "function": str(fn.getName()),
+                        "size": int(fn.getBody().getNumAddresses()),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+        top = sorted(callers.values(), key=lambda c: -c["size"])[:3]
+        rows.append(
+            {
+                "name": name,
+                "lib": imp["lib"],
+                "risk": kind,
+                "callers": len(callers),
+                "top": top,
+            }
+        )
+    rows.sort(key=lambda r: (-r["callers"], r["name"]))
+    if limit:
+        rows = rows[:limit]
+    return {
+        "binary": a["binary"],
+        "total": len(rows),
+        "with_callers": sum(1 for r in rows if r["callers"]),
+        "groups": dict(Counter(r["risk"] for r in rows if r["risk"]).most_common()),
+        "imports": rows,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
     p = _entry(a["binary"])["program"]
     q = (a.get("query") or "").lower()
     limit = int(a.get("limit", 200))
     skip = int(a.get("offset", 0))
+    want_refs = bool(a.get("refs"))
     out = []
+    by_function: Counter[str] = Counter()
     seen = 0
     scanned = 0
     it = p.getListing().getDefinedData(True)
@@ -483,15 +582,25 @@ def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
         seen += 1
         if seen <= skip:
             continue
-        out.append({"addr": str(d.getAddress()), "value": val[:400]})
+        row = {"addr": str(d.getAddress()), "value": val[:400]}
+        if want_refs:
+            row["functions"] = _string_refs(p, d.getAddress())
+            for fn in row["functions"]:
+                by_function[fn["function"]] += 1
+        out.append(row)
         if len(out) >= limit:
             break
-    return {
+    result = {
         "binary": a["binary"],
         "matched": seen,
         "defined_data_scanned": scanned,
         "strings": out,
     }
+    if want_refs:
+        result["by_function"] = [
+            {"function": name, "strings": n} for name, n in by_function.most_common(20)
+        ]
+    return result
 
 
 def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
@@ -3896,6 +4005,7 @@ HANDLERS = {
     "functions": cmd_functions,
     "decompile": cmd_decompile,
     "strings": cmd_strings,
+    "imports": cmd_imports,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,
     "rename": cmd_rename,
