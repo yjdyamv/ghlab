@@ -51,6 +51,12 @@ _SPECS = [
     Spec("import", ("path",), ("analyze",), "import + analyze a binary"),
     Spec("info", ("binary",), summary="metadata for one program"),
     Spec(
+        "analyze",
+        ("binary",),
+        ("addr", "full"),
+        "re-analyze a program: everything, or just these addresses",
+    ),
+    Spec(
         "functions",
         ("binary",),
         ("match", "limit", "offset"),

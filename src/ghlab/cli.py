@@ -33,6 +33,28 @@ def fmt_binaries(r: dict[str, Any]) -> str:
     return "\n".join(names) if names else "(project is empty — use `ghlab import PATH`)"
 
 
+def fmt_analyze(r: dict[str, Any]) -> str:
+    if r["mode"] == "full":
+        return (
+            f"# full analysis of {r['binary']}: {r['functions']} function(s) "
+            f"({r['elapsed_ms']}ms, {r['saved_via']})"
+        )
+    out = [
+        f"# targeted analysis of {r['binary']}: {r['functions']} function(s) "
+        f"({r['elapsed_ms']}ms, {r['saved_via']})"
+    ]
+    for row in r["addresses"]:
+        state = []
+        if row["disassembled"]:
+            state.append("disassembled")
+        if row["created"]:
+            state.append("function created")
+        out.append(
+            f"  {row['addr']}  {row['function'] or '-'}  [{', '.join(state) or 'unchanged'}]"
+        )
+    return "\n".join(out)
+
+
 def fmt_info(r: dict[str, Any]) -> str:
     keys = (
         "name",
@@ -551,6 +573,7 @@ def fmt_campaign(r: dict[str, Any]) -> str:
 FORMATTERS = {
     "binaries": fmt_binaries,
     "info": fmt_info,
+    "analyze": fmt_analyze,
     "functions": fmt_functions,
     "decompile": fmt_decompile,
     "strings": fmt_strings,
@@ -728,6 +751,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("path")
     p.add_argument("--no-analyze", action="store_true")
     p.set_defaults(func=lambda a: _call(a, "import", {"path": a.path, "analyze": not a.no_analyze}))
+
+    p = sub.add_parser("analyze", parents=[common], help="re-analyze everything or one address")
+    p.add_argument("binary")
+    p.add_argument(
+        "--addr",
+        dest="addr",
+        action="append",
+        default=[],
+        metavar="ADDR",
+        help="disassemble and create the function here (repeatable)",
+    )
+    p.add_argument("--full", action="store_true", help="run the whole auto-analysis again")
+    p.set_defaults(
+        func=lambda a: _call(a, "analyze", {"binary": a.binary, "addr": a.addr, "full": a.full})
+    )
 
     p = sub.add_parser("info", parents=[common], help="program metadata")
     p.add_argument("binary")

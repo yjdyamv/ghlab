@@ -218,6 +218,70 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     return {"binary": name, "imported": True, "analyzed": bool(a.get("analyze", True))}
 
 
+def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
+    """(Re)analyze a program: everything, or just the addresses you touched.
+
+    Importing a large binary costs a minute of full analysis; patching one
+    function should not. `--addr` disassembles and creates the function at that
+    address, so the rest of the program stays as it was.
+    """
+    from ghidra.app.cmd.disassemble import DisassembleCommand
+    from ghidra.app.cmd.function import CreateFunctionCmd
+    from ghidra.app.script import GhidraScriptUtil
+
+    started = time.time()
+    e = _entry(a["binary"])
+    p = e["program"]
+    if a.get("full"):
+        GhidraScriptUtil.acquireBundleHostReference()
+        try:
+            e["api"].analyzeAll(p)
+        finally:
+            GhidraScriptUtil.releaseBundleHostReference()
+        saved = _save(p, "ghlab analyze (full)")
+        return {
+            "binary": a["binary"],
+            "mode": "full",
+            "functions": int(p.getFunctionManager().getFunctionCount()),
+            "saved_via": saved,
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+    targets = _as_list(a.get("addr"))
+    if not targets:
+        raise ValueError("analyze needs --addr ADDR (repeatable) or --full")
+    space = p.getAddressFactory().getDefaultAddressSpace()
+    rows = []
+    tx = p.startTransaction("ghlab analyze")
+    try:
+        for text in targets:
+            offset = _hex_addr(text)
+            if offset is None:
+                raise KeyError(f"address {text!r} not found")
+            addr = space.getAddress(offset)
+            dis = DisassembleCommand(addr, None, True).applyTo(p)
+            created = CreateFunctionCmd(addr).applyTo(p)
+            fn = p.getFunctionManager().getFunctionAt(addr)
+            rows.append(
+                {
+                    "addr": hex(offset),
+                    "disassembled": bool(dis),
+                    "created": bool(created),
+                    "function": str(fn.getName()) if fn is not None else None,
+                }
+            )
+    finally:
+        p.endTransaction(tx, True)
+    saved = _save(p, "ghlab analyze")
+    return {
+        "binary": a["binary"],
+        "mode": "targeted",
+        "addresses": rows,
+        "functions": int(p.getFunctionManager().getFunctionCount()),
+        "saved_via": saved,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def cmd_info(a: dict[str, Any]) -> dict[str, Any]:
     p = _entry(a["binary"])["program"]
     return {
@@ -3555,6 +3619,7 @@ HANDLERS = {
     "ping": ping,
     "binaries": cmd_binaries,
     "import": cmd_import,
+    "analyze": cmd_analyze,
     "info": cmd_info,
     "functions": cmd_functions,
     "decompile": cmd_decompile,

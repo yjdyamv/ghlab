@@ -50,6 +50,8 @@ Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`。
 
 ```bash
 ghlab import C:/Windows/System32/notepad.exe   # 导入 + 全量分析（约 75s，仅一次）
+ghlab import big.exe --no-analyze              # 只导入：字符串/导入立刻可查，分析稍后补
+ghlab analyze big.exe --addr 0x1400114c4       # 只分析这一段（2.3s），不是整个程序
 ghlab binaries
 ghlab info notepad.exe
 
@@ -241,6 +243,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `ping` | – | 存活 + 项目信息 |
 | `binaries` | – | 项目内程序 |
 | `import` | `path` / `analyze` | 导入并分析 |
+| `analyze` | `binary` / `addr, full` | **增量分析**：`--addr` 只反汇编 + 建函数这一处（实测 2.3s，函数总数不变）；`--full` 重跑全量（notepad 实测 163s，比首次导入还慢——全量分析别当常用操作） |
 | `info` | `binary` | 语言、基址、MD5、函数数、段 |
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |
 | `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache`，热查询 2.5s → 0.19s，`--refresh` 强制重算 |

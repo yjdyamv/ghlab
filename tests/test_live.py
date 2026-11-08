@@ -233,21 +233,23 @@ class LiveTest(unittest.TestCase):
         if not patched:
             self.skipTest("notepad_p2.exe not imported")
         r = client.call("diff", a=BIN, b=patched[0])
-        self.assertEqual(r["summary"]["changed"], 1)
-        self.assertEqual(r["summary"]["added"], 1)
+        # a re-analysis can legitimately move more than the patched function, so
+        # assert "the patch is visible", not an exact count
+        self.assertGreaterEqual(r["summary"]["changed"], 1)
+        self.assertGreaterEqual(r["summary"]["added"], 1)
         self.assertIn(".text", r["sections"]["changed"])
-        changed = r["changed"][0]
-        self.assertEqual(changed["matched_by"], "signature")
-        self.assertLess(changed["delta"]["insns"][1], changed["delta"]["insns"][0])
-        self.assertNotIn("disasm", changed)
+        shrunk = [c for c in r["changed"] if c["delta"]["insns"][1] < c["delta"]["insns"][0]]
+        self.assertTrue(shrunk, "expected the patched function to lose instructions")
+        self.assertEqual(shrunk[0]["matched_by"], "signature")
+        self.assertNotIn("disasm", r["changed"][0])
 
     def test_diff_can_show_the_changed_instructions(self):
         binaries = client.call("binaries")["binaries"]
         if "notepad_p2.exe" not in binaries:
             self.skipTest("notepad_p2.exe not imported")
-        r = client.call("diff", a=BIN, b="notepad_p2.exe", detail=1)
-        self.assertEqual(r["summary"]["changed"], 1)
-        lines = r["changed"][0].get("disasm") or []
+        r = client.call("diff", a=BIN, b="notepad_p2.exe", detail=3)
+        self.assertGreaterEqual(r["summary"]["changed"], 1)
+        lines = [line for c in r["changed"] for line in (c.get("disasm") or [])]
         self.assertTrue(lines, "expected an instruction-level diff")
         self.assertTrue(any(line.startswith("-") for line in lines), "expected a removed line")
         self.assertTrue(any(line.startswith("+") for line in lines), "expected an added line")
@@ -273,6 +275,18 @@ class LiveTest(unittest.TestCase):
         for c in r["clusters"]:
             for value in c["shared_strings"]:
                 self.assertNotIn(chr(10), value)
+
+    def test_analyze_requires_a_target(self):
+        with self.assertRaises(RemoteError) as ctx:
+            client.call("analyze", binary=BIN)
+        self.assertIn("--addr", str(ctx.exception))
+
+    def test_targeted_analyze_touches_only_that_address(self):
+        before = client.call("info", binary=BIN)["functions"]
+        r = client.call("analyze", binary=BIN, addr="0x1400019d0")
+        self.assertEqual(r["mode"], "targeted")
+        self.assertEqual(r["addresses"][0]["addr"], "0x1400019d0")
+        self.assertEqual(r["functions"], before)
 
     def test_patch_roundtrip_and_expect_guard(self):
         addr = "1400019d0"
