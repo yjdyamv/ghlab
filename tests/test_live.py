@@ -288,6 +288,17 @@ class LiveTest(unittest.TestCase):
         self.assertGreater(best["score"], 0.9)
         self.assertTrue(best["shared_imports"] or best["shared_strings"])
 
+    def test_campaign_clusters_the_project(self):
+        r = client.call("campaign", min_score=0.5)
+        self.assertGreaterEqual(r["binaries"], 1)
+        self.assertFalse(r["errors"], r["errors"])
+        sizes = sum(c["size"] for c in r["clusters"])
+        self.assertEqual(sizes, r["binaries"])
+        for c in r["clusters"]:
+            self.assertEqual(c["size"], len(c["members"]))
+            if c["size"] > 1:
+                self.assertTrue(c["shared_imports"] or c["shared_strings"])
+
     def test_mcp_stdio_serves_tools_and_a_digest(self):
         lines = [
             json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),

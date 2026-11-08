@@ -2418,6 +2418,42 @@ def dispatch(cmd: str, params: dict[str, Any]) -> Any:
         return HANDLERS[cmd](params)
 
 
+def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:
+    """Cluster every program in the project by shared imports and strings.
+
+    The unit is the whole program (union of its function fingerprints), so two
+    builds of the same tool collapse into one cluster while an unrelated binary
+    stays alone. Single linkage: a shared loader stub should pull samples together.
+    """
+    import time
+
+    from . import campaign
+
+    started = time.time()
+    min_score = float(a.get("min_score", 0.35))
+    bins = [str(a["binary"])] if a.get("binary") else binary_names()
+    profiles: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    for b in bins:
+        try:
+            prints = _program_fingerprints(b)
+        except Exception as ex:  # noqa: BLE001
+            errors.append({"binary": b, "error": f"{type(ex).__name__}: {ex}"})
+            continue
+        profiles[b] = campaign.profile_from_fingerprints(prints)
+    clusters = campaign.cluster_programs(profiles, min_score)
+    limit = int(a.get("limit") or 0)
+    if limit:
+        clusters = clusters[:limit]
+    return {
+        "binaries": len(profiles),
+        "min_score": min_score,
+        "clusters": clusters,
+        "errors": errors,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 HANDLERS = {
     "ping": ping,
     "binaries": cmd_binaries,
@@ -2444,4 +2480,5 @@ HANDLERS = {
     "cross_xref": cmd_cross_xref,
     "slice": cmd_slice,
     "similar": cmd_similar,
+    "campaign": cmd_campaign,
 }

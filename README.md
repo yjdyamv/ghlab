@@ -135,6 +135,22 @@ ghlab run ~/re/pipes/triage.gh --set BIN=notepad.exe
 规则只有四条：一行一条命令、`#` 注释、`$VAR` 来自 `--set`、`>`/`>>` 把这一步的 stdout 写进文件。
 `--keep-going` 失败继续，`--dry-run` 只解析不执行。中转义只在引号前生效（所以 `C:	mp.md` 不会被吃掉反斜杠）。
 
+## 家族聚类（`ghlab campaign`）
+
+```bash
+$ ghlab campaign
+3 program(s) -> 1 cluster(s) at min_score 0.35
+  [1] 3 member(s), max 1.00
+      notepad.exe, notepad_p2.exe, notepad_patched.exe
+      imports: AbortDoc, AcquireSRWLockExclusive, AcquireSRWLockShared, ...
+      strings: \Microsoft\WindowsApps\Microsoft.WindowsNotepad_8wekyb3d8bbwe
+otepad.exe, ...
+```
+
+单位是**整个程序**（所有函数指纹的并集），不是单个函数：同一工具的不同构建会并成一簇，无关样本各自独立。
+用单链（single linkage）是故意的——中间夹一个 loader stub 也应该把两个样本拉到一起。
+`--min-score` 调松紧，短于 4 字符的字符串（`%s`、填充）不参与展示。
+
 ## 接 MCP（给别的 agent 用）
 
 ```bash
@@ -198,6 +214,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
 | `mcp` | – | 以 stdio MCP server 形式暴露 10 个工具 + `ghlab://` 资源 |
+| `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 
 `target` 可以是符号名或 `0x` 地址；`binary` 支持唯一子串匹配。
 写操作（rename/comment）放在 Ghidra transaction 里并立即 `program.save()`。

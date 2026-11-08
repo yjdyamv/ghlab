@@ -96,6 +96,15 @@ class EnvelopeTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "decompile", "binary": "a.exe", "cached": True})
 
+    def test_campaign_takes_only_optional_filters(self):
+        spec, params = protocol.validate({"cmd": "campaign"})
+        self.assertEqual(spec.required, ())
+        self.assertEqual(params, {})
+        spec, params = protocol.validate({"cmd": "campaign", "min_score": 0.6, "limit": 3})
+        self.assertEqual(params, {"min_score": 0.6, "limit": 3})
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "campaign", "threshold": 0.6})
+
 
 if __name__ == "__main__":
     unittest.main()

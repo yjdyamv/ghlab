@@ -157,6 +157,12 @@ _SPECS = [
         ("against", "limit", "min_score"),
         "rank functions of another program by fingerprint similarity",
     ),
+    Spec(
+        "campaign",
+        (),
+        ("binary", "min_score", "limit"),
+        "cluster all programs by shared imports/strings (family triage)",
+    ),
 ]
 SPECS: dict[str, Spec] = {s.name: s for s in _SPECS}
 COMMAND_NAMES = sorted(SPECS)

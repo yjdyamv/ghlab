@@ -383,6 +383,20 @@ def fmt_similar(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_campaign(r: dict[str, Any]) -> str:
+    out = [f"{r['binaries']} program(s) -> {len(r['clusters'])} cluster(s) at min_score {r['min_score']}"]
+    for i, c in enumerate(r["clusters"], 1):
+        out.append(f"  [{i}] {c['size']} member(s), max {c['max_score']:.2f}")
+        out.append("      " + ", ".join(c["members"]))
+        if c["shared_imports"]:
+            out.append("      imports: " + ", ".join(c["shared_imports"][:6]))
+        if c["shared_strings"]:
+            out.append("      strings: " + ", ".join(c["shared_strings"][:4]))
+    for e in r.get("errors") or []:
+        out.append(f"  {e['binary']}: {e['error']}")
+    return "\n".join(out)
+
+
 FORMATTERS = {
     "binaries": fmt_binaries,
     "info": fmt_info,
@@ -404,6 +418,7 @@ FORMATTERS = {
     "cross_xref": fmt_cross_xref,
     "slice": fmt_slice,
     "similar": fmt_similar,
+    "campaign": fmt_campaign,
 }
 
 
@@ -907,6 +922,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("mcp", parents=[common], help="serve MCP over stdio (for agent clients)")
     p.set_defaults(func=cmd_mcp)
+
+    p = sub.add_parser("campaign", parents=[common], help="cluster programs by shared imports/strings")
+    p.add_argument("--binary", help="restrict the cluster set to one program")
+    p.add_argument("--min-score", type=float, default=0.35)
+    p.add_argument("-n", "--limit", type=int, default=0, help="max clusters to show")
+    p.set_defaults(
+        func=lambda a: _call(
+            a, "campaign", {"binary": a.binary, "min_score": a.min_score, "limit": a.limit}
+        )
+    )
 
     return ap
 
