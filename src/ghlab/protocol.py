@@ -11,8 +11,9 @@ anywhere.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"

@@ -17,6 +17,7 @@ dependencies = []
 # pyghidra ships as wheels inside the Ghidra install tree; install offline with:
 #   uv pip install --no-index --find-links "$GHIDRA_INSTALL_DIR/Ghidra/Features/PyGhidra/pypkg/dist" jpype1 pyghidra
 ghidra = ["pyghidra>=3.2", "jpype1>=1.5"]
+dev = ["ruff>=0.17", "ty>=0.0.99"]
 
 [project.scripts]
 ghlab = "ghlab.cli:main"
@@ -26,3 +27,27 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 ghlab = ["py.typed"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "BLE", "C4", "SIM", "RUF", "PIE", "RET", "ARG"]
+ignore = [
+  "E501",    # the formatter owns line length; long strings are clearer unwrapped
+  "SIM108",  # ternaries are not always clearer than an if/else in dispatch code
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002"]   # fixtures and unused handler args are normal there
+"src/ghlab/__init__.py" = ["F401"]  # re-exported public names
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.rules]
+# Ghidra and jpype are provided by the JVM at runtime, not by an installed package,
+# so there is nothing on disk for the type checker to resolve.
+import-not-found = "ignore"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -9,6 +10,7 @@ import sys
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 
 from . import protocol, session
 
@@ -22,12 +24,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        try:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
         started = time.monotonic()
@@ -43,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
             err = protocol.Err(f"{type(ex).__name__}: {ex}", traceback.format_exc()[-2000:])
             self._send(err.to_bytes(), 500)
 
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         if self.path.rstrip("/") in ("/health", "/ping"):
             try:
                 body = json.dumps({"ok": True, "result": session.ping({})}).encode()
@@ -64,9 +64,9 @@ class Handler(BaseHTTPRequestHandler):
             ).encode()
         self._send(body)
 
-    def log_message(self, fmt: str, *args) -> None:  # quieter default logging
+    def log_message(self, format: str, *args: Any) -> None:
         if os.environ.get("GHLAB_VERBOSE"):
-            sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+            sys.stderr.write(f"{self.address_string()} - {format % args}\n")
 
 
 class Server(HTTPServer):
@@ -76,7 +76,7 @@ class Server(HTTPServer):
     daemon_threads = False
 
 
-def pidfile() -> "os.PathLike[str]":
+def pidfile() -> str:
     base = session._project_dir or "."
     return os.path.join(str(base), ".ghlab.pid")
 
@@ -92,7 +92,7 @@ def serve(host: str, port: int, project_dir: str, project_name: str) -> None:
         httpd = Server((host, port), Handler)
     except OSError as ex:
         print(f"ghlab: cannot bind {host}:{port} ({ex})", file=sys.stderr, flush=True)
-        raise SystemExit(2)
+        raise SystemExit(2) from ex
     print(
         f"ghlab: listening on http://{host}:{port}/ project={session.project_location()} "
         f"binaries={session.binary_names()}",

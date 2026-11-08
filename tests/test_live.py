@@ -5,7 +5,6 @@ Unit runs (`tests/test_*.py` without a daemon) skip this module automatically.
 
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -55,9 +54,7 @@ class LiveTest(unittest.TestCase):
         self.assertLessEqual(item["code"].count("\n"), 22)
 
     def test_batch_decompile_with_server_side_grep(self):
-        r = client.call(
-            "decompile", binary=BIN, match="^FUN_", grep="if \\(", limit=8
-        )
+        r = client.call("decompile", binary=BIN, match="^FUN_", grep="if \\(", limit=8)
         self.assertTrue(r["results"], "expected at least one function with an if")
         for item in r["results"]:
             self.assertGreater(item["grep_hits"], 0)
@@ -104,9 +101,9 @@ class LiveTest(unittest.TestCase):
             hit = client.call("functions", binary=BIN, match="^ghlab_probe$", limit=1)
             self.assertEqual(hit["functions"][0]["name"], "ghlab_probe")
             self.assertTrue(
-                client.call(
-                    "comment", binary=BIN, target="ghlab_probe", text="ghlab live test"
-                )["ok"]
+                client.call("comment", binary=BIN, target="ghlab_probe", text="ghlab live test")[
+                    "ok"
+                ]
             )
         finally:
             client.call("rename", binary=BIN, target="ghlab_probe", new=original)
@@ -134,9 +131,7 @@ class LiveTest(unittest.TestCase):
         self.assertLess(len(str(r)), 40000)
 
     def test_find_locates_registry_writer(self):
-        r = client.call(
-            "find", binary=BIN, **{"import": ["RegSetValue"], "string": ["Notepad"]}
-        )
+        r = client.call("find", binary=BIN, **{"import": ["RegSetValue"], "string": ["Notepad"]})
         self.assertGreater(r["candidates"], 0)
         first = r["functions"][0]
         self.assertIn("RegSetValueExW", first["matched"]["import"])
@@ -148,9 +143,7 @@ class LiveTest(unittest.TestCase):
         self.assertIn("at least one", str(ctx.exception))
 
     def test_emulate_runs_and_reports_stubs(self):
-        r = client.call(
-            "emulate", binary=BIN, target="__security_check_cookie", args=[1], ms=5000
-        )
+        r = client.call("emulate", binary=BIN, target="__security_check_cookie", args=[1], ms=5000)
         self.assertIn(r["stop"], ("returned", "fault", "timeout"))
         self.assertGreater(r["insns"], 0)
         self.assertIn("rax_hex", r["ret"])
@@ -235,12 +228,12 @@ class LiveTest(unittest.TestCase):
 
     def test_bookmark_roundtrip(self):
         addr = "1400019d0"
-        client.call(
-            "bookmark", binary=BIN, addr=addr, category="ghlab-test", comment="unit test"
-        )
+        client.call("bookmark", binary=BIN, addr=addr, category="ghlab-test", comment="unit test")
         listed = client.call("bookmark", binary=BIN, action="list")["bookmarks"]
         self.assertTrue(any(b["category"] == "ghlab-test" for b in listed))
-        removed = client.call("bookmark", binary=BIN, action="remove", addr=addr, category="ghlab-test")
+        removed = client.call(
+            "bookmark", binary=BIN, action="remove", addr=addr, category="ghlab-test"
+        )
         self.assertEqual(removed["removed"], 1)
 
     def test_note_then_report_contains_it(self):
@@ -276,7 +269,7 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(r["paths"])
         self.assertTrue(any(p["reaches_entry"] for p in r["paths"]))
         self.assertIn("RegSetValueExW", r["paths"][0]["via"])
-        reach = [p for p in r["paths"] if p["reaches_entry"]][0]
+        reach = next(p for p in r["paths"] if p["reaches_entry"])
         self.assertGreater(len(reach["path"]), 1)
 
     def test_similar_finds_the_same_function_elsewhere(self):
@@ -339,7 +332,11 @@ class LiveTest(unittest.TestCase):
             timeout=180,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        replies = {json.loads(line)["id"]: json.loads(line) for line in proc.stdout.splitlines() if line.strip()}
+        replies = {
+            json.loads(line)["id"]: json.loads(line)
+            for line in proc.stdout.splitlines()
+            if line.strip()
+        }
         self.assertEqual(set(replies), {1, 2, 3, 4, 5})
         self.assertEqual(replies[1]["result"]["serverInfo"]["name"], "ghlab")
         self.assertGreaterEqual(len(replies[2]["result"]["tools"]), 8)

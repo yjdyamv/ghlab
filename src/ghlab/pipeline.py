@@ -15,14 +15,14 @@ next sample instead of a chat log you have to reconstruct.
 
 from __future__ import annotations
 
-import io
 import re
 import sys
 import time
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, TextIO
 
 VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 
@@ -148,7 +148,7 @@ def run_steps(
     execute: Callable[[list[str]], int] | None = None,
     keep_going: bool = False,
     dry_run: bool = False,
-    progress: io.TextIOBase | None = None,
+    progress: TextIO | None = None,
 ) -> dict[str, Any]:
     execute = execute or _default_execute
     progress = progress or sys.stderr
@@ -166,9 +166,11 @@ def run_steps(
                 path = Path(step.out).expanduser()
                 path.parent.mkdir(parents=True, exist_ok=True)
                 mode = "a" if step.append else "w"
-                with open(path, mode, encoding="utf-8", newline="\n") as fh:
-                    with redirect_stdout(fh):
-                        code = execute(step.argv)
+                with (
+                    open(path, mode, encoding="utf-8", newline="\n") as fh,
+                    redirect_stdout(fh),
+                ):
+                    code = execute(step.argv)
             else:
                 code = execute(step.argv)
             if code:

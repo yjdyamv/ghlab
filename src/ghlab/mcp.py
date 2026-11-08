@@ -9,9 +9,11 @@ killed/restarted by the client at will.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
-from typing import Any, Callable, TextIO
+from collections.abc import Callable
+from typing import Any, TextIO
 
 from . import __version__
 from .client import Client, RemoteError
@@ -68,7 +70,10 @@ TOOLS: list[dict[str, Any]] = [
                 "target": {"type": "string", "description": "function name or 0x address"},
                 "targets": {"type": "array", "items": {"type": "string"}},
                 "match": {"type": "string", "description": "regex over function names"},
-                "grep": {"type": "string", "description": "regex over decompiled text (no code returned)"},
+                "grep": {
+                    "type": "string",
+                    "description": "regex over decompiled text (no code returned)",
+                },
                 "max_lines": {"type": "integer", "minimum": 0},
                 "limit": _LIMIT,
                 "include_callees": {"type": "boolean"},
@@ -211,7 +216,7 @@ _COMMANDS = {
 _LIST_KEYS = {"import", "string", "calls", "targets", "args", "dump"}
 
 
-def _as_params(name: str, args: dict[str, Any]) -> dict[str, Any]:
+def _as_params(_name: str, args: dict[str, Any]) -> dict[str, Any]:
     """Tool arguments are the daemon's parameters, with a few small normalisations."""
     params: dict[str, Any] = {}
     for key, value in (args or {}).items():
@@ -227,7 +232,9 @@ def _as_params(name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _text(payload: Any) -> dict[str, Any]:
-    body = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
+    body = (
+        payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2)
+    )
     return {"content": [{"type": "text", "text": body}]}
 
 
@@ -377,7 +384,9 @@ def get_prompt(name: str, args: dict[str, Any], call: Callable[..., Any]) -> dic
         ]
         return {
             "description": f"triage {binary}",
-            "messages": [{"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}],
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}
+            ],
         }
     if name == "diff-review":
         a, b = str(args.get("a") or ""), str(args.get("b") or "")
@@ -397,7 +406,9 @@ def get_prompt(name: str, args: dict[str, Any], call: Callable[..., Any]) -> dic
         ]
         return {
             "description": f"diff {a} -> {b}",
-            "messages": [{"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}],
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": chr(10).join(lines)}}
+            ],
         }
     raise ValueError(f"unknown prompt {name!r}")
 
@@ -447,7 +458,9 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
         return ok({"prompts": PROMPTS})
     if method == "prompts/get":
         try:
-            return ok(get_prompt(str(params.get("name") or ""), params.get("arguments") or {}, call))
+            return ok(
+                get_prompt(str(params.get("name") or ""), params.get("arguments") or {}, call)
+            )
         except Exception as ex:  # noqa: BLE001
             return fail(-32000, f"{type(ex).__name__}: {ex}")
     if method == "resources/read":
@@ -469,11 +482,11 @@ def serve(
     for stream in (stdout,):
         # MCP is UTF-8 on the wire; a Windows console default (cp936) would raise
         # UnicodeEncodeError the first time a binary contains a non-ASCII string.
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8")
-            except Exception:  # noqa: BLE001
-                pass
+        # Not every TextIO implements reconfigure (a StringIO in tests does not).
+        reconfigure = getattr(stream, "reconfigure", None)
+        with contextlib.suppress(Exception):
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8")
     if call is None:
         client = Client()
         call_fn: Callable[..., Any] = lambda cmd, **params: client.call(cmd, **params)  # noqa: E731

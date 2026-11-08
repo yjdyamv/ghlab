@@ -8,7 +8,8 @@ tools without symbols or database access.
 
 from __future__ import annotations
 
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 
 def jaccard(a: Iterable[Any], b: Iterable[Any]) -> float:
@@ -23,6 +24,18 @@ def pair_score(a: dict[str, Any], b: dict[str, Any], import_weight: float = 0.6)
     imports = jaccard(a.get("imports", ()), b.get("imports", ()))
     strings = jaccard(a.get("strings", ()), b.get("strings", ()))
     return round(import_weight * imports + (1.0 - import_weight) * strings, 4)
+
+
+def _cluster_order(cluster: dict[str, Any]) -> tuple[int, float, str]:
+    """Biggest cluster first, then best internal score, then a stable name."""
+    return (-int(cluster["size"]), -float(cluster["max_score"]), str(cluster["members"][0]))
+
+
+def _string_evidence(values: set[str], limit: int = 5) -> list[str]:
+    """The most telling shared strings: long first, placeholders and padding dropped."""
+    useful = [v for v in values if len(v.strip()) >= 4]
+    useful.sort(key=len, reverse=True)
+    return useful[:limit]
 
 
 def cluster_programs(
@@ -61,13 +74,25 @@ def cluster_programs(
     for name in names:
         groups.setdefault(find(name), []).append(name)
 
-    clusters = []
+    clusters: list[dict[str, Any]] = []
     for members in groups.values():
         members = sorted(members)
-        shared_imports: set[str] = set.intersection(*(set(profiles[m].get("imports", ())) for m in members)) if len(members) > 1 else set()
-        shared_strings: set[str] = set.intersection(*(set(profiles[m].get("strings", ())) for m in members)) if len(members) > 1 else set()
+        shared_imports: set[str] = (
+            set.intersection(*(set(profiles[m].get("imports", ())) for m in members))
+            if len(members) > 1
+            else set()
+        )
+        shared_strings: set[str] = (
+            set.intersection(*(set(profiles[m].get("strings", ())) for m in members))
+            if len(members) > 1
+            else set()
+        )
         best = max(
-            (pair_score(profiles[x], profiles[y]) for i, x in enumerate(members) for y in members[i + 1 :]),
+            (
+                pair_score(profiles[x], profiles[y])
+                for i, x in enumerate(members)
+                for y in members[i + 1 :]
+            ),
             default=0.0,
         )
         clusters.append(
@@ -76,13 +101,10 @@ def cluster_programs(
                 "members": members,
                 "max_score": round(best, 3),
                 "shared_imports": sorted(shared_imports)[:8],
-                # short/blank strings (padding, "%s") say nothing about a family
-                "shared_strings": [
-                    v for v in sorted(shared_strings, key=lambda v: (-len(v), v)) if len(v.strip()) >= 4
-                ][:5],
+                "shared_strings": _string_evidence(shared_strings),
             }
         )
-    clusters.sort(key=lambda c: (-c["size"], -c["max_score"], c["members"][0]))
+    clusters.sort(key=_cluster_order)
     return clusters
 
 

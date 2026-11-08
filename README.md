@@ -261,6 +261,20 @@ src/ghlab/
 tests/          test_protocol.py, test_server_client.py（stub session，真 HTTP）
 ```
 
+## 开发：ruff + ty
+
+```bash
+uv tool install ruff ty        # 一次性
+ruff check . && ruff format --check .   # 或者直接 ruff format .
+ty check                                 # 类型检查
+python -m unittest discover -s tests -q  # 105 个测试
+```
+
+配置在海 `pyproject.toml` 的 `[tool.ruff]` / `[tool.ty.*]`。两条规则值得说明：
+
+- `select` 里带了 `BLE`（禁止裸 `except Exception`）：唯一豁免是 `session.py` 里那些**调用 jpype 反射**的地方，都写了 `# noqa: BLE001` 并注明原因（"a jpype call can raise anything"）。这类豁免是给人看的，不是给检查器看的。
+- `[tool.ty.rules] import-not-found = "ignore"`：`ghidra.*` / `jpype` 是 JVM 运行时才存在的模块，静态检查器没有可解析的包。关掉这条之后 ty 仍然抓到了真问题——比如 `_clean_name(callee)` 收到 `str | None`、`progress: io.TextIOBase` 接不住 `sys.stderr`、以及差集排序键的联合类型推断错误。
+
 ## 已知坑（都已在这里绕过）
 
 1. **Windows `SO_REUSEADDR` 允许同端口双监听** → 旧进程继续服务旧代码。ghlab 显式关掉 `allow_reuse_address`，第二个实例会直接失败而不是静默接管。

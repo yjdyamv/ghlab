@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
@@ -169,7 +170,7 @@ def fmt_emulate(r: dict[str, Any]) -> str:
         seen: dict[str, int] = {}
         for s in r["stubs"]:
             seen[s["fn"]] = seen.get(s["fn"], 0) + 1
-        summary = ", ".join(f"{k}x{v}" for k, v in sorted(seen.items()))
+        summary = ", ".join(f"{k} x{v}" for k, v in sorted(seen.items()))
         out.append(f"   stubs     {len(r['stubs'])} external call(s) answered: {summary}")
     wr = r.get("writes") or {}
     out.append(f"   writes    {wr.get('tracked', 0)} byte(s)")
@@ -221,9 +222,7 @@ def fmt_find(r: dict[str, Any]) -> str:
     if not r.get("functions"):
         out.append("   (nothing matched; loosen the patterns or use --any)")
     for f in r.get("functions") or []:
-        why = " | ".join(
-            f"{k}: {', '.join(v)}" for k, v in (f.get("matched") or {}).items()
-        )
+        why = " | ".join(f"{k}: {', '.join(v)}" for k, v in (f.get("matched") or {}).items())
         out.append(f"   {f['addr']}  {f['size']:>5}b  {f['name']:<28} {why}")
     return "\n".join(out)
 
@@ -271,6 +270,8 @@ def fmt_digest(r: dict[str, Any]) -> str:
         out.append("sizes   " + "  ".join(f"{k}:{v}" for k, v in sizes.items()))
     body = "\n".join(out)
     return f"{body}\n~{len(body) // 4} tokens"
+
+
 def fmt_patch(r: dict[str, Any]) -> str:
     return (
         f"patched {r['size']} byte(s) at {r['addr']}\n"
@@ -311,9 +312,7 @@ def fmt_note(r: dict[str, Any]) -> str:
     n = r["note"]
     where = f"{n['addr']} {n.get('function') or ''}".strip() or "(general)"
     return (
-        f"note #{n['id']} [{n['tag']}] {where}\n"
-        f"  {n['text']}\n"
-        f"  ({r['total']} total, {r['path']})"
+        f"note #{n['id']} [{n['tag']}] {where}\n  {n['text']}\n  ({r['total']} total, {r['path']})"
     )
 
 
@@ -384,7 +383,9 @@ def fmt_similar(r: dict[str, Any]) -> str:
 
 
 def fmt_campaign(r: dict[str, Any]) -> str:
-    out = [f"{r['binaries']} program(s) -> {len(r['clusters'])} cluster(s) at min_score {r['min_score']}"]
+    out = [
+        f"{r['binaries']} program(s) -> {len(r['clusters'])} cluster(s) at min_score {r['min_score']}"
+    ]
     for i, c in enumerate(r["clusters"], 1):
         out.append(f"  [{i}] {c['size']} member(s), max {c['max_score']:.2f}")
         out.append("      " + ", ".join(c["members"]))
@@ -452,7 +453,7 @@ def cmd_start(args) -> int:
     if not _ghidra_env_ok():
         return 2
     LOGDIR.mkdir(parents=True, exist_ok=True)
-    log = open(LOGDIR / "ghlab.log", "ab")
+    log = open(LOGDIR / "ghlab.log", "ab")  # noqa: SIM115 - handed to the detached child
     cmd = [
         sys.executable,
         "-m",
@@ -619,26 +620,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-q", "--query", default=None)
     p.add_argument("-n", "--limit", type=int, default=80)
     p.set_defaults(
-        func=lambda a: _call(
-            a, "strings", {"binary": a.binary, "query": a.query, "limit": a.limit}
-        )
+        func=lambda a: _call(a, "strings", {"binary": a.binary, "query": a.query, "limit": a.limit})
     )
 
     p = sub.add_parser("xrefs", parents=[common], help="references to address/function")
     p.add_argument("binary")
     p.add_argument("target", nargs="+")
-    p.set_defaults(
-        func=lambda a: _call(a, "xrefs", {"binary": a.binary, "targets": a.target})
-    )
+    p.set_defaults(func=lambda a: _call(a, "xrefs", {"binary": a.binary, "targets": a.target}))
 
     p = sub.add_parser("bytes", parents=[common], help="raw memory")
     p.add_argument("binary")
     p.add_argument("addr")
     p.add_argument("--size", type=int, default=64)
     p.set_defaults(
-        func=lambda a: _call(
-            a, "bytes", {"binary": a.binary, "addr": a.addr, "size": a.size}
-        )
+        func=lambda a: _call(a, "bytes", {"binary": a.binary, "addr": a.addr, "size": a.size})
     )
 
     p = sub.add_parser("rename", parents=[common], help="rename a function")
@@ -646,9 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target")
     p.add_argument("new")
     p.set_defaults(
-        func=lambda a: _call(
-            a, "rename", {"binary": a.binary, "target": a.target, "new": a.new}
-        )
+        func=lambda a: _call(a, "rename", {"binary": a.binary, "target": a.target, "new": a.new})
     )
 
     p = sub.add_parser("comment", parents=[common], help="set a comment")
@@ -684,7 +677,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("diff", parents=[common], help="compare two programs in the project")
     p.add_argument("a")
     p.add_argument("b")
-    p.add_argument("-m", "--match", default=None, help="regex over function names (applied to both)")
+    p.add_argument(
+        "-m", "--match", default=None, help="regex over function names (applied to both)"
+    )
     p.add_argument("-n", "--limit", type=int, default=25)
     p.add_argument(
         "--min-score",
@@ -761,12 +756,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("find", parents=[common], help="locate candidates by structure")
     p.add_argument("binary")
-    p.add_argument("-i", "--import", dest="import_", action="append", default=[],
-                   help="regex on imported symbol names (repeatable)")
-    p.add_argument("-s", "--string", action="append", default=[],
-                   help="regex on string data (repeatable)")
-    p.add_argument("-c", "--calls", action="append", default=[],
-                   help="regex on callee names (repeatable)")
+    p.add_argument(
+        "-i",
+        "--import",
+        dest="import_",
+        action="append",
+        default=[],
+        help="regex on imported symbol names (repeatable)",
+    )
+    p.add_argument(
+        "-s", "--string", action="append", default=[], help="regex on string data (repeatable)"
+    )
+    p.add_argument(
+        "-c", "--calls", action="append", default=[], help="regex on callee names (repeatable)"
+    )
     p.add_argument("-n", "--limit", type=int, default=20)
     p.add_argument("--any", action="store_true", help="any filter instead of all")
     p.set_defaults(
@@ -793,7 +796,13 @@ def build_parser() -> argparse.ArgumentParser:
         func=lambda a: _call(
             a,
             "patch",
-            {"binary": a.binary, "addr": a.addr, "bytes": a.bytes, "nop": a.nop, "expect": a.expect},
+            {
+                "binary": a.binary,
+                "addr": a.addr,
+                "bytes": a.bytes,
+                "nop": a.nop,
+                "expect": a.expect,
+            },
         )
     )
 
@@ -802,7 +811,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", help="function name/address, or a data address")
     p.add_argument("decl", help="'int f(char *s, unsigned n)' or 'char[64]' / 'void*'")
     p.set_defaults(
-        func=lambda a: _call(a, "set_type", {"binary": a.binary, "target": a.target, "decl": a.decl})
+        func=lambda a: _call(
+            a, "set_type", {"binary": a.binary, "target": a.target, "decl": a.decl}
+        )
     )
 
     p = sub.add_parser("bookmark", parents=[common], help="Ghidra bookmarks")
@@ -863,7 +874,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=6, help="call-graph hubs to include")
     p.set_defaults(func=lambda a: _call(a, "report", {"binary": a.binary, "top": a.top}))
 
-    p = sub.add_parser("cross-xref", parents=[common], help="search a string/import across all programs")
+    p = sub.add_parser(
+        "cross-xref", parents=[common], help="search a string/import across all programs"
+    )
     p.add_argument("query", help="regex over string data")
     p.add_argument("--binary", help="restrict to one program")
     p.add_argument("-n", "--limit", type=int, default=20)
@@ -876,7 +889,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("slice", parents=[common], help="shortest call path that reaches an import")
     p.add_argument("binary")
     p.add_argument("to", help="import or function name (regex)")
-    p.add_argument("--from", help="stop at a caller matching this (default entry/main/WinMain/DllMain)")
+    p.add_argument(
+        "--from", help="stop at a caller matching this (default entry/main/WinMain/DllMain)"
+    )
     p.add_argument("-d", "--depth", type=int, default=12)
     p.add_argument("-n", "--limit", type=int, default=4)
     p.add_argument("--code", action="store_true", help="include the caller's decompiled body")
@@ -924,7 +939,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("mcp", parents=[common], help="serve MCP over stdio (for agent clients)")
     p.set_defaults(func=cmd_mcp)
 
-    p = sub.add_parser("campaign", parents=[common], help="cluster programs by shared imports/strings")
+    p = sub.add_parser(
+        "campaign", parents=[common], help="cluster programs by shared imports/strings"
+    )
     p.add_argument("--binary", help="restrict the cluster set to one program")
     p.add_argument("--min-score", type=float, default=0.35)
     p.add_argument("-n", "--limit", type=int, default=0, help="max clusters to show")
@@ -965,9 +982,7 @@ def cmd_run(a: argparse.Namespace) -> int:
         key, value = item.split("=", 1)
         variables[key.strip()] = value
     try:
-        summary = pipeline.run_file(
-            a.path, variables, keep_going=a.keep_going, dry_run=a.dry_run
-        )
+        summary = pipeline.run_file(a.path, variables, keep_going=a.keep_going, dry_run=a.dry_run)
     except pipeline.PipelineError as ex:
         print(f"ghlab: {ex}", file=sys.stderr)
         return 2
@@ -988,7 +1003,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     return 1 if summary["failed"] else 0
 
 
-def cmd_mcp(a: argparse.Namespace) -> int:
+def cmd_mcp(_args: argparse.Namespace) -> int:
     from . import mcp
 
     return mcp.serve()
@@ -997,10 +1012,8 @@ def cmd_mcp(a: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     # Piped output is UTF-8 (agents, editors); a real console keeps its codepage.
     if not sys.stdout.isatty():
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):  # a StringIO in tests has no reconfigure
+            sys.stdout.reconfigure(encoding="utf-8")  # ty: ignore[unresolved-attribute]
     argv = list(sys.argv[1:] if argv is None else argv)
     # `--json` is accepted before or after the subcommand.
     global_json = "--json" in argv

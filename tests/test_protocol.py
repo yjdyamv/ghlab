@@ -71,9 +71,9 @@ class EnvelopeTest(unittest.TestCase):
     def test_notes_reject_unknown_parameter(self):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "notes", "binary": "x", "tagz": "y"})
-        spec, params = protocol.validate({"cmd": "digest", "binary": "a.exe", "top": 3})
+        _spec, params = protocol.validate({"cmd": "digest", "binary": "a.exe", "top": 3})
         self.assertEqual(params["top"], 3)
-        spec, params = protocol.validate(
+        _spec, params = protocol.validate(
             {"cmd": "find", "binary": "a.exe", "import": ["VirtualAlloc"], "any": True}
         )
         self.assertEqual(params["import"], ["VirtualAlloc"])

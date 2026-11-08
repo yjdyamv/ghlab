@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -100,9 +101,7 @@ def _addr(entry: dict[str, Any], text: str):
     program = entry["program"]
     text = str(text)
     if text.lower().startswith("0x"):
-        return program.getAddressFactory().getDefaultAddressSpace().getAddress(
-            int(text, 16)
-        )
+        return program.getAddressFactory().getDefaultAddressSpace().getAddress(int(text, 16))
     addr = entry["api"].toAddr(text)
     if addr is None:
         raise KeyError(f"address or symbol {text!r} not found")
@@ -303,10 +302,8 @@ def _cache_read(key: str) -> str | None:
 
 
 def _cache_write(key: str, code: str) -> None:
-    try:
+    with contextlib.suppress(OSError):
         (_cache_dir() / (key + ".c")).write_text(code, encoding="utf-8")
-    except OSError:
-        pass
 
 
 def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
@@ -371,13 +368,9 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                 else:
                     item["code"] = code
             if a.get("include_callees"):
-                item["callees"] = [
-                    str(c.getName()) for c in fn.getCalledFunctions(MONITOR)
-                ][:40]
+                item["callees"] = [str(c.getName()) for c in fn.getCalledFunctions(MONITOR)][:40]
             if a.get("include_callers"):
-                item["callers"] = [
-                    str(c.getName()) for c in fn.getCallingFunctions(MONITOR)
-                ][:40]
+                item["callers"] = [str(c.getName()) for c in fn.getCallingFunctions(MONITOR)][:40]
             results.append(item)
         except Exception as ex:  # noqa: BLE001
             results.append({"target": str(t), "error": f"{type(ex).__name__}: {ex}"})
@@ -404,9 +397,9 @@ def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
                 continue
             try:
                 val = str(d.getValue())
-            except Exception:
+            except Exception:  # noqa: BLE001 - a jpype call can raise anything
                 val = str(d.getDefaultValueRepresentation())
-        except Exception:
+        except Exception:  # noqa: BLE001 - skip data whose type has no value
             continue
         if val in ("", "None") or (q and q not in val.lower()):
             continue
@@ -526,9 +519,7 @@ def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
         for fn in frontier:
             for callee in edges(fn):
                 key = str(callee.getEntryPoint())
-                edges_out.append(
-                    {"from": str(fn.getName()), "to": str(callee.getName())}
-                )
+                edges_out.append({"from": str(fn.getName()), "to": str(callee.getName())})
                 if key in seen or len(nodes) >= cap:
                     continue
                 seen.add(key)
@@ -542,9 +533,8 @@ def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
         "direction": direction,
         "root": str(root.getName()),
         "nodes": nodes,
-        "edges": edges_out[:cap * 2],
+        "edges": edges_out[: cap * 2],
     }
-
 
 
 # ------------------------------------------------------------------ triage
@@ -898,8 +888,6 @@ def cmd_find(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
-
 # --------------------------------------------------------------------- emulate
 
 PARAM_REGS = ("RCX", "RDX", "R8", "R9")
@@ -1074,10 +1062,13 @@ def _changed(x: dict[str, Any], y: dict[str, Any]) -> bool:
     for key in ("size", "insns", "blocks", "calls"):
         if x[key] != y[key]:
             return True
-    for key in ("strings", "consts", "imports"):
-        if x[key] != y[key]:
-            return True
-    return False
+    return any(x[key] != y[key] for key in ("strings", "consts", "imports"))
+
+
+def _size_swing(entry: dict[str, Any]) -> int:
+    """Biggest size change first; the tuple is (before, after) bytes."""
+    before, after = entry["delta"]["size"]
+    return abs(int(after) - int(before))
 
 
 def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
@@ -1169,7 +1160,7 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
                 "delta": entry_delta,
             }
         )
-    changed.sort(key=lambda c: -abs(c["delta"]["size"][1] - c["delta"]["size"][0]))
+    changed.sort(key=_size_swing)
 
     added = [
         {"name": lb[k]["name"], "addr": lb[k]["addr"], "size": lb[k]["size"]}
@@ -1187,9 +1178,7 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
     sections = {
         "added": sorted(set(sec_b) - set(sec_a)),
         "removed": sorted(set(sec_a) - set(sec_b)),
-        "changed": sorted(
-            n for n in set(sec_a) & set(sec_b) if sec_a[n]["md5"] != sec_b[n]["md5"]
-        ),
+        "changed": sorted(n for n in set(sec_a) & set(sec_b) if sec_a[n]["md5"] != sec_b[n]["md5"]),
     }
 
     return {
@@ -1410,7 +1399,7 @@ def _is_external_call(name: str | None) -> bool:
     if not name:
         return False
     low = str(name).lower()
-    return low.startswith("ptr_") or ".dll" in low or low.startswith("thunk_")
+    return low.startswith(("ptr_", "thunk_")) or ".dll" in low
 
 
 def _apply_stub(emu, program, name: str) -> int:
@@ -1533,9 +1522,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
         program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel),
         b"\xcc\xcc\xcc\xcc",
     )
-    emu.setBreakpoint(
-        program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel)
-    )
+    emu.setBreakpoint(program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel))
 
     space = program.getAddressFactory().getDefaultAddressSpace()
     cursor = string_at
@@ -1609,7 +1596,6 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     fault = None
     stubs: list[dict] = []
     skips: list[dict] = []
-    prev_pc = fn.getEntryPoint()
     last_valid_pc = fn.getEntryPoint()
     try:
         while insns < max_insns:
@@ -1619,14 +1605,13 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
                 break
             if program.getMemory().contains(pc):
                 last_valid_pc = pc
-            prev_pc = pc
             if emu.step(monitor):
                 insns += 1
                 continue
             if monitor.didTimeout():
                 stop = "timeout"
                 break
-            callee = _call_target(program, int(last_valid_pc.getOffset()))
+            callee = _call_target(program, int(last_valid_pc.getOffset())) or ""
             stub = _stub_for(callee)
             if stub is None and _is_external_call(callee):
                 stub = "external:" + _clean_name(callee)
@@ -1684,7 +1669,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     for spec in a.get("dump") or []:
         text = str(spec)
         addr_text, _, size_text = text.partition(":")
-        daddr = int(addr_text, 0) if addr_text.lower().startswith("0x") else int(addr_text, 0)
+        daddr = int(addr_text, 0)
         dlen = int(size_text, 0) if size_text else 64
         data = _emu_bytes(emu, daddr, dlen)
         dumps.append(
@@ -1814,13 +1799,13 @@ def _parse_type_spec(text: str) -> tuple[str, int, list[int]]:
 def _datatype(program, text: str):
     """Build a Ghidra DataType from a small C-ish type expression."""
     import jpype
-    from ghidra.program.model.data import ArrayDataType, PointerDataType, StructureDataType
+    from ghidra.program.model.data import ArrayDataType, PointerDataType
 
     base, stars, dims = _parse_type_spec(text)
     dtm = program.getDataTypeManager()
     dt = None
     if base in _PRIMITIVES:
-        dt = getattr(jpype.JClass("ghidra.program.model.data." + _PRIMITIVES[base]), "dataType")
+        dt = jpype.JClass("ghidra.program.model.data." + _PRIMITIVES[base]).dataType
     if dt is None:
         dt = dtm.getDataType("/" + base)
     if dt is None:
@@ -1848,7 +1833,7 @@ def _signature_parser(program, source_type):
     ):
         try:
             return ctor()
-        except Exception:
+        except Exception:  # noqa: BLE001 - the constructor arity changed between versions
             continue
     raise RuntimeError("could not construct FunctionSignatureParser")
 
@@ -1860,7 +1845,7 @@ def _block_writable(block) -> bool:
         if fn is not None:
             try:
                 return bool(fn())
-            except Exception:
+            except Exception:  # noqa: BLE001 - isWriteable/isWrite differ by version
                 continue
     return True
 
@@ -1905,10 +1890,8 @@ def cmd_patch(a: dict[str, Any]) -> dict[str, Any]:
         mem.setBytes(addr, _byte_array(data))
     finally:
         if block is not None and not writable:
-            try:
+            with contextlib.suppress(Exception):  # the block was read-only already
                 block.setWrite(False)
-            except Exception:
-                pass
         p.endTransaction(tx, True)
     from ghidra.app.cmd.disassemble import DisassembleCommand
 
@@ -1933,7 +1916,7 @@ def _prototype(fn) -> str:
     for args in ((True, False), (True,), ()):
         try:
             return str(fn.getPrototypeString(*args))
-        except Exception:
+        except Exception:  # noqa: BLE001 - the overload set differs by version
             continue
     return str(fn.getName())
 
@@ -2062,6 +2045,7 @@ def cmd_bookmark(a: dict[str, Any]) -> dict[str, Any]:
 
 # ------------------------------------------------------------------- findings
 
+
 def _notes_dir() -> Path:
     base = _project_dir or (Path.home() / "re" / "proj")
     d = Path(base) / ".ghlab" / "notes"
@@ -2133,15 +2117,22 @@ def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
     for n in notes:
         if tag and n.get("tag") != tag:
             continue
-        if at and at.lower() not in (n.get("addr") or "").lower() and at.lower() not in (
-            (n.get("function") or "").lower()
+        if (
+            at
+            and at.lower() not in (n.get("addr") or "").lower()
+            and at.lower() not in ((n.get("function") or "").lower())
         ):
             continue
         if query and query.lower() not in (n.get("text") or "").lower():
             continue
         out.append(n)
     cap = int(a.get("limit", 200))
-    return {"notes": out[:cap], "count": len(out), "total": len(notes), "path": str(_notes_file(binary))}
+    return {
+        "notes": out[:cap],
+        "count": len(out),
+        "total": len(notes),
+        "path": str(_notes_file(binary)),
+    }
 
 
 def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
@@ -2179,7 +2170,9 @@ def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
     if hubs:
         lines += ["", "## Call-graph hubs", ""]
         for h in hubs:
-            lines.append(f"- `{h.get('addr')}` {h.get('name')} — {h.get('callers')} callers, {h.get('size')}b")
+            lines.append(
+                f"- `{h.get('addr')}` {h.get('name')} — {h.get('callers')} callers, {h.get('size')}b"
+            )
     sizes = d.get("sizes") or {}
     if sizes:
         lines += ["", "## Function sizes", ""]
@@ -2244,7 +2237,13 @@ def cmd_cross_xref(a: dict[str, Any]) -> dict[str, Any]:
             hits.append({"addr": str(d.getAddress()), "value": value[:120], "refs": refs[:6]})
         if hits:
             out.append(
-                {"binary": b, "matches": hits, "count": len(hits), "scanned": scanned, "errors": errors}
+                {
+                    "binary": b,
+                    "matches": hits,
+                    "count": len(hits),
+                    "scanned": scanned,
+                    "errors": errors,
+                }
             )
     return {"query": a["query"], "searched": len(bins), "binaries": out}
 
@@ -2261,7 +2260,9 @@ def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
     fm = p.getFunctionManager()
     to_pat = re.compile(str(a["to"]), re.I)
     from_pat = re.compile(
-        str(a.get("from") or r"^(entry|main|wmain|winmain|wwinmain|dllmain|_start|maincrtstartup)$"),
+        str(
+            a.get("from") or r"^(entry|main|wmain|winmain|wwinmain|dllmain|_start|maincrtstartup)$"
+        ),
         re.I,
     )
     depth = int(a.get("depth", 12))
@@ -2278,7 +2279,9 @@ def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
 
     def callers(fn) -> list[Any]:
         try:
-            return [c for c in fn.getCallingFunctions(MONITOR) if not c.isExternal() and not c.isThunk()]
+            return [
+                c for c in fn.getCallingFunctions(MONITOR) if not c.isExternal() and not c.isThunk()
+            ]
         except Exception:  # noqa: BLE001
             return []
 
@@ -2368,9 +2371,11 @@ def cmd_similar(a: dict[str, Any]) -> dict[str, Any]:
     mine = _fingerprint(e["program"], fn, BasicBlockModel(e["program"]))
     min_score = float(a.get("min_score", 0.4))
     limit = int(a.get("limit", 10))
-    bins = [str(a["against"])] if a.get("against") else [
-        b for b in binary_names() if b != str(a["binary"])
-    ]
+    bins = (
+        [str(a["against"])]
+        if a.get("against")
+        else [b for b in binary_names() if b != str(a["binary"])]
+    )
     hits: list[dict[str, Any]] = []
     for b in bins:
         try:

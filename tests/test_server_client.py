@@ -45,7 +45,7 @@ class ServerTest(unittest.TestCase):
     def setUpClass(cls):
         cls.stub = StubSession()
         cls._real_dispatch = session.dispatch
-        session.dispatch = cls.stub.dispatch
+        session.dispatch = cls.stub.dispatch  # ty: ignore[invalid-assignment]
         cls.httpd = Server(("127.0.0.1", 0), Handler)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
@@ -56,7 +56,7 @@ class ServerTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.httpd.server_close()
-        session.dispatch = cls._real_dispatch
+        session.dispatch = cls._real_dispatch  # ty: ignore[invalid-assignment]
 
     def test_ping(self):
         self.assertEqual(self.client.call("ping")["service"], "stub")

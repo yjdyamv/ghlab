@@ -78,7 +78,9 @@ class RunTest(unittest.TestCase):
         self.assertEqual(summary["steps"][-1]["error"], "exit 1")
 
         ran.clear()
-        summary = pipeline.run_steps(steps, execute=execute, keep_going=True, progress=io.StringIO())
+        summary = pipeline.run_steps(
+            steps, execute=execute, keep_going=True, progress=io.StringIO()
+        )
         self.assertEqual(ran, ["ping", "bad", "trailing"])
         self.assertEqual(summary["ran"], 3)
 
