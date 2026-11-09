@@ -136,7 +136,7 @@ _SPECS = [
     Spec(
         "diff",
         ("a", "b"),
-        ("match", "limit", "min_score", "detail"),
+        ("match", "limit", "min_score", "detail", "semantic"),
         "compare two programs: added/removed/changed functions and sections",
     ),
     Spec(

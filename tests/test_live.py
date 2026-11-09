@@ -315,6 +315,41 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(any(line.startswith("+") for line in lines), "expected an added line")
         self.assertIn("ADDR", "".join(lines))
 
+    def test_diff_semantic_reports_imports_strings_constants(self):
+        binaries = client.call("binaries")["binaries"]
+        if "notepad_p2.exe" not in binaries:
+            self.skipTest("notepad_p2.exe not imported")
+        r = client.call("diff", a=BIN, b="notepad_p2.exe", semantic=True, limit=5)
+        sem = r["semantic"]
+        for key, sub in (
+            ("imports", ("added", "removed", "counts", "by_risk")),
+            ("strings", ("added", "removed", "counts")),
+            ("constants", ("added", "removed", "counts")),
+        ):
+            self.assertIn(key, sem)
+            for name in sub:
+                self.assertIn(name, sem[key])
+        # the patched copy only changes code, so imports and strings must be untouched
+        self.assertEqual(sem["imports"]["counts"], {"added": 0, "removed": 0})
+        self.assertEqual(sem["strings"]["counts"], {"added": 0, "removed": 0})
+        # by_risk describes the delta, so it is empty when no import changed
+        self.assertEqual(sem["imports"]["by_risk"], {})
+        # and it must not be attached unless asked for
+        plain = client.call("diff", a=BIN, b="notepad_p2.exe", limit=1)
+        self.assertNotIn("semantic", plain)
+
+    def test_diff_semantic_catches_a_changed_string(self):
+        binaries = client.call("binaries")["binaries"]
+        if "notepad_str.exe" not in binaries:
+            self.skipTest("notepad_str.exe not imported")
+        r = client.call("diff", a=BIN, b="notepad_str.exe", semantic=True, limit=50)
+        sem = r["semantic"]
+        self.assertGreater(sem["strings"]["counts"]["added"], 0)
+        self.assertGreater(sem["strings"]["counts"]["removed"], 0)
+        joined = " ".join(sem["strings"]["added"] + sem["strings"]["removed"])
+        self.assertIn("Notepaz", joined, "the patched literal must show up as added")
+        self.assertIn("Notepad", joined, "and its original as removed")
+
     def test_slice_forward_lists_reachable_imports(self):
         r = client.call("slice", binary=BIN, to="FUN_14001e02c", direction="forward")
         self.assertEqual(r["direction"], "forward")

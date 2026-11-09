@@ -1832,11 +1832,18 @@ def _similarity(x: dict[str, Any], y: dict[str, Any]) -> float:
     )
 
 
+def _hex_const(value: Any) -> str:
+    """Constants arrive as ints from the index and as text through a cache round trip."""
+    try:
+        return hex(int(str(value), 0) if isinstance(value, str) else int(value))
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def _delta(x: dict[str, Any], y: dict[str, Any], limit: int) -> dict[str, Any]:
     def diff_set(left: set, right: set) -> tuple[list, list]:
-        added = sorted(right - left, key=str)[:limit]
-        removed = sorted(left - right, key=str)[:limit]
-        return list(map(str, added)), list(map(str, removed))
+        # keep the raw values: strings are compared as text, constants as integers
+        return sorted(right - left, key=str)[:limit], sorted(left - right, key=str)[:limit]
 
     s_add, s_del = diff_set(x["strings"], y["strings"])
     i_add, i_del = diff_set(x["imports"], y["imports"])
@@ -1846,12 +1853,12 @@ def _delta(x: dict[str, Any], y: dict[str, Any], limit: int) -> dict[str, Any]:
         "insns": [x["insns"], y["insns"]],
         "blocks": [x["blocks"], y["blocks"]],
         "calls": [x["calls"], y["calls"]],
-        "strings_added": s_add,
-        "strings_removed": s_del,
-        "imports_added": i_add,
-        "imports_removed": i_del,
-        "consts_added": [hex(v) for v in c_add],
-        "consts_removed": [hex(v) for v in c_del],
+        "strings_added": [str(v) for v in s_add],
+        "strings_removed": [str(v) for v in s_del],
+        "imports_added": [str(v) for v in i_add],
+        "imports_removed": [str(v) for v in i_del],
+        "consts_added": [_hex_const(v) for v in c_add],
+        "consts_removed": [_hex_const(v) for v in c_del],
     }
 
 
@@ -1866,6 +1873,69 @@ def _size_swing(entry: dict[str, Any]) -> int:
     """Biggest size change first; the tuple is (before, after) bytes."""
     before, after = entry["delta"]["size"]
     return abs(int(after) - int(before))
+
+
+def _semantic_profile(entry: dict[str, Any]) -> dict[str, Any]:
+    """What a program is *made of*, at whole-binary granularity.
+
+    Function-level fingerprints answer "which function changed"; this answers "what
+    kind of capability changed" — a new import, a new URL, a new magic constant.
+    """
+    program = entry["program"]
+    imports: dict[str, str | None] = {}
+    for imp in _imports(program):
+        name = str(imp["name"])
+        imports[name] = _classify_import(name)
+    rows = load_strings(entry)["strings"]
+    strings = {str(value) for _addr, value in rows if len(str(value)) >= 4}
+    consts: set[int] = set()
+    for row in _program_fingerprints(str(entry["binary"]))["functions"].values():
+        consts.update(int(c) for c in (row.get("consts") or ()))
+    return {"imports": imports, "strings": strings, "consts": consts}
+
+
+def _semantic_delta(left: dict[str, Any], right: dict[str, Any], limit: int = 40) -> dict[str, Any]:
+    """Compare two ``_semantic_profile`` results. Pure: no Ghidra objects.
+
+    Output is capped but never silently: every list carries its true length in
+    ``counts`` so a caller can tell "3 new imports" from "40 of 900".
+    """
+    l_imp: dict[str, str | None] = left["imports"]
+    r_imp: dict[str, str | None] = right["imports"]
+    imp_added = sorted(set(r_imp) - set(l_imp))
+    imp_removed = sorted(set(l_imp) - set(r_imp))
+    risk: dict[str, dict[str, int]] = {}
+    for name in imp_added + imp_removed:
+        group = r_imp.get(name) or l_imp.get(name) or "other"
+        bucket = risk.setdefault(group or "other", {"added": 0, "removed": 0})
+        bucket["added" if name in imp_added else "removed"] += 1
+    str_added = sorted(right["strings"] - left["strings"])
+    str_removed = sorted(left["strings"] - right["strings"])
+    con_added = sorted(right["consts"] - left["consts"])
+    con_removed = sorted(left["consts"] - right["consts"])
+    return {
+        "imports": {
+            "added": imp_added[:limit],
+            "removed": imp_removed[:limit],
+            "counts": {"added": len(imp_added), "removed": len(imp_removed)},
+            "by_risk": risk,
+        },
+        "strings": {
+            "added": str_added[:limit],
+            "removed": str_removed[:limit],
+            "counts": {"added": len(str_added), "removed": len(str_removed)},
+        },
+        "constants": {
+            "added": [hex(c) for c in con_added[:limit]],
+            "removed": [hex(c) for c in con_removed[:limit]],
+            "counts": {"added": len(con_added), "removed": len(con_removed)},
+            "note": "constants come from the per-function index, which keeps the first 200 per function",
+        },
+        "truncated": any(
+            len(v) > limit
+            for v in (imp_added, imp_removed, str_added, str_removed, con_added, con_removed)
+        ),
+    }
 
 
 def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
@@ -1989,7 +2059,7 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
         "changed": sorted(n for n in set(sec_a) & set(sec_b) if sec_a[n]["md5"] != sec_b[n]["md5"]),
     }
 
-    return {
+    payload: dict[str, Any] = {
         "a": {"binary": left["binary"], "md5": left["md5"], "functions": len(la)},
         "b": {"binary": right["binary"], "md5": right["md5"], "functions": len(lb)},
         "summary": {
@@ -2006,6 +2076,11 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
         "removed": removed[:limit],
         "elapsed_ms": int((time.time() - started) * 1000),
     }
+    if a.get("semantic"):
+        payload["semantic"] = _semantic_delta(
+            _semantic_profile(left), _semantic_profile(right), limit=limit
+        )
+    return payload
 
 
 def parse_arg_spec(text: Any) -> tuple[str, Any]:

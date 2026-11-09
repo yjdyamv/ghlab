@@ -117,6 +117,7 @@ ghlab import C:/samples/app_v1.exe && ghlab import C:/samples/app_v2.exe
 ghlab diff app_v1.exe app_v2.exe
 ghlab diff app_v1.exe app_v2.exe -m 'decrypt|auth' -n 10
 ghlab diff app_v1.exe app_v2.exe --detail 2      # 再加一层：改动函数的指令级 unified diff
+ghlab diff app_v1.exe app_v2.exe --semantic       # 再换一个角度：这个程序"多了什么能力"
 ghlab bytes notepad.exe 0x1400019d0 --size 32
 ghlab rename notepad.exe FUN_140001008 sub_parse_cmdline
 ghlab comment notepad.exe 0x1400019d0 'entry stub -> 0x140001850'
@@ -288,7 +289,7 @@ pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
 | `decrypt` | – / `binary, addr, len, hex, ciphers, min_printable, limit` | **破小块密文**：单字节 xor/add/sub、rol/ror、utf-16le、base64 全试一遍，只留"像字符串"的候选（要求至少一段 4 字母连写），按可打印度 + 字母数字占比 + 配置关键词打分排序。`--hex` 直接给密文，或给 `binary`+`--addr/--len` 从内存读 |
 | `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed, stub` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置），`--stub FN[ARGn=V]=RET` 可跳过某个调用并直接给返回值（按第 1–4 个整数参数匹配），用于"函数读配置再计算"的场景 |
-| `diff` | `a, b` / `match, limit, min_score, detail` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`） |
+| `diff` | `a, b` / `match, limit, min_score, detail, semantic` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`）；`--semantic` 换成整库视角：新增/移除的**导入（带 inject/exec/network… 风险分组）、字符串、常量**，`counts` 永远是真实总数（列表按 `-n` 截断并标 `truncated`） |
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
@@ -333,6 +334,7 @@ ghlab scan sample.exe 0x18 --func decrypt_string --stack
 - **图要不依赖外部工具也能看**：SVG 自己按 BFS 层次排（列=深度，行=同层节点），不装 graphviz 也能直接丢浏览器/报告；DOT/Mermaid 是给“还要再加工”的场景留的接口
 - **下钻要顺着“谁用了它”走**：`strings --refs` 和 `imports` 把“字符串/API → 函数”这一步做成一次调用。agent 最常做的动作是“找到用它的函数”，而不是“列出所有字符串”
 - **批量是原语，不是循环**：agent 最贵的资源是往返次数和上下文，所以 `map` 在服务端选函数、反编译（走缓存）、过滤，只回命中行。"每个候选函数跑一次"这种活不要交给 shell 循环。
+- **差异要分两层看**：`diff` 回答"哪个函数变了"，`--semantic` 回答"多了什么本事"——后者不看函数边界，只看整个二进制的导入/字符串/常量集合，所以能回答"这版是不是加了联网/加了新的命令行参数"，而不必逐个函数读。注意它比的是**值**不是地址（字符串按内容、常量按数值）。
 - **差异要落到指令上**：`diff` 先按指纹回答"哪个函数变了"，`--detail N` 再回答"变成了什么"——指令级 unified diff，绝对地址归一化成 `ADDR`，所以插入/删除指令也能对齐。
 - **位移搜索比类型更早可用**：没有类型信息时，"谁碰了 +0x54" 只能靠扫描指令里的 disp 得到（反编译文本里 float 字段常常被放进 XMM 参数，grep 不到）
 - **索引比命令更值钱**：每次调用都全扫是 agent 用不起的。`index` 把每个函数的事实（字符串、导入、被调函数、常量、大小、指令数、基本块数）落成一份 JSON，`find` 从 2.5s 降到 0.16s、`diff` 从 4.4s 降到 0.8s，`similar`/`campaign` 一并变快。失效判定是 `(md5, modification number)`：任何通过 ghlab 的写操作都会让它加一，旧索引不可能被当成新的；`note` 只写 JSON + 书签，不动程序事实，索引仍然有效。

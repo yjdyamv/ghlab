@@ -241,7 +241,51 @@ def fmt_diff(r: dict[str, Any]) -> str:
             out.append(f"   - {f['addr']}  {f['name']}  ({f['size']}b)")
     if not (r.get("changed") or r.get("added") or r.get("removed")):
         out.append("   (no functional difference found)")
+    sem = r.get("semantic")
+    if sem:
+        out.extend(_semantic_lines(sem))
     return "\n".join(out)
+
+
+def _semantic_lines(sem: dict[str, Any]) -> list[str]:
+    """Render the "what is this binary made of" half of `diff --semantic`."""
+    out = ["semantic"]
+    imp = sem.get("imports") or {}
+    counts = imp.get("counts") or {}
+    if counts.get("added") or counts.get("removed"):
+        out.append(f"   imports +{counts.get('added', 0)} -{counts.get('removed', 0)}")
+        for name in imp.get("added") or []:
+            out.append(f"     api + {name}")
+        for name in imp.get("removed") or []:
+            out.append(f"     api - {name}")
+        risk = imp.get("by_risk") or {}
+        hot = [
+            f"{g} +{v.get('added', 0)} -{v.get('removed', 0)}"
+            for g, v in sorted(risk.items())
+            if v.get("added") or v.get("removed")
+        ]
+        if hot:
+            out.append(f"     by risk: {'; '.join(hot)}")
+    else:
+        out.append("   imports unchanged")
+    st = sem.get("strings") or {}
+    st_counts = st.get("counts") or {}
+    out.append(f"   strings +{st_counts.get('added', 0)} -{st_counts.get('removed', 0)}")
+    for text in st.get("added") or []:
+        out.append(f"     text + {text[:96]}")
+    for text in st.get("removed") or []:
+        out.append(f"     text - {text[:96]}")
+    con = sem.get("constants") or {}
+    con_counts = con.get("counts") or {}
+    if con_counts.get("added") or con_counts.get("removed"):
+        out.append(f"   constants +{con_counts.get('added', 0)} -{con_counts.get('removed', 0)}")
+        for value in con.get("added") or []:
+            out.append(f"     const + {value}")
+        for value in con.get("removed") or []:
+            out.append(f"     const - {value}")
+    if sem.get("truncated"):
+        out.append("   (lists capped; counts above are the true totals)")
+    return out
 
 
 def fmt_decrypt(r: dict[str, Any]) -> str:
@@ -1238,6 +1282,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="include an instruction-level diff for N changed functions",
     )
+    p.add_argument(
+        "--semantic",
+        action="store_true",
+        help="also diff what the binaries are made of: imports, strings, constants",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -1249,6 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "limit": a.limit,
                 "min_score": a.min_score,
                 "detail": a.detail,
+                "semantic": a.semantic,
             },
         )
     )
