@@ -100,6 +100,12 @@ _SPECS = [
         "method names recovered from assertion strings (Class::Method : failure)",
     ),
     Spec(
+        "offsets",
+        ("binary", "target"),
+        ("offset", "limit", "timeout", "debug"),
+        "which parameter or local each struct offset belongs to (offsets alone are not facts)",
+    ),
+    Spec(
         "scan",
         ("binary", "offset"),
         ("range", "func", "limit", "op", "stack", "imm", "writes", "sequence", "window"),

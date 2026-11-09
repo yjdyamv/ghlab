@@ -46,6 +46,14 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54", "nope": 1})
 
+    def test_offsets_needs_a_target(self):
+        self.assertIn("offsets", protocol.COMMAND_NAMES)
+        spec, params = protocol.validate({"cmd": "offsets", "binary": "a.exe", "target": "FUN_1"})
+        self.assertEqual(spec.name, "offsets")
+        self.assertEqual(params["target"], "FUN_1")
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "offsets", "binary": "a.exe"})
+
     def test_scan_accepts_the_imm_and_writes_filters(self):
         spec, params = protocol.validate(
             {"cmd": "scan", "binary": "a.exe", "offset": "0x44", "imm": "0..5", "writes": True}

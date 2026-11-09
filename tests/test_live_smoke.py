@@ -109,6 +109,22 @@ class SmokeTest(unittest.TestCase):
         grouped = self.c.call("imports", binary=BIN, group="file", limit=5)
         self.assertTrue(all(i["risk"] == "file" for i in grouped["imports"]))
 
+    def test_offsets_attributes_a_field_to_its_parameter(self):
+        """The whole point: +0x40 on param_2 is not the same fact as +0x40 on a local."""
+        args = sorted(
+            (row for row in self.c.call("functions", binary=BIN, limit=200)["functions"]),
+            key=lambda row: row["size"],
+            reverse=True,
+        )
+        target = args[0]["name"]
+        r = self.c.call("offsets", binary=BIN, target=target, limit=40)
+        self.assertEqual(r["function"], target)
+        self.assertIsNone(r["error"])
+        self.assertTrue(r["accesses"])
+        for row in r["accesses"]:
+            self.assertIn(row["kind"], ("param", "local"))
+            self.assertTrue(row["offset"].startswith(("0x", "-0x")))
+
     def test_scan_accepts_several_offsets_at_once(self):
         """Several offsets at once keeps only functions that touch all of them."""
         r = self.c.call("scan", binary=BIN, offset="0x8,0x10", func="entry", writes=True, limit=5)
@@ -139,7 +155,8 @@ class SmokeTest(unittest.TestCase):
             self.assertIn("+ 0x8]", site["text"])
 
     def test_index_builds_once_then_is_reused(self):
-        first = self.c.call("index", binary=BIN)
+        # a pinned daemon may already hold the index, so force the build once
+        first = self.c.call("index", binary=BIN, refresh=True)
         self.assertGreater(first["functions"], 0)
         second = self.c.call("index", binary=BIN)
         self.assertTrue(second["cached"])

@@ -344,6 +344,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
 | `scan` | `binary, offset` / `range, func, limit, op, stack, imm, writes` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。实测 650 万条指令 38s |
+| `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit, format, out` | 调用树 BFS；`--format dot/mermaid/svg` 出图，`--out` 落盘（svg 是自绘的，无需 graphviz；dot 想再加工就交给 graphviz） |
@@ -371,7 +372,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 22 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 23 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 | `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 
@@ -494,3 +495,18 @@ GHLAB_LIVE_RICH=1 GHLAB_URL=http://127.0.0.1:8765/ python -m unittest discover -
 ## License
 
 MIT
+
+**偏移不是事实**：同一个 `+0x178` 在 `ctx` 上是 dword 排版模式，在 `doc` 上是指针。
+`ghlab offsets BIN FUN_1813200F0` 直接给出归属：
+
+```
+== wpscore.dll FUN_1813200f0 : undefined FUN_1813200f0() (14ms)
+   param_1 (param)
+         0x128  x1
+         0x12c  x1
+         0x130  x1
+   param_2 (param)
+          0x40  x1
+```
+
+写结论时把对象名带上（`doc+0x128` 而不是 `+0x128`），否则下一个人会拿它去错的结构体上验证。

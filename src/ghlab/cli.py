@@ -151,6 +151,29 @@ def fmt_names(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_offsets(r: dict[str, Any]) -> str:
+    head = (
+        f"== {r['binary']} {r['function']} : {r.get('prototype') or '-'} ({r.get('elapsed_ms')}ms)"
+    )
+    if r.get("error"):
+        return head + chr(10) + f"   decompiler said: {r['error']}"
+    rows = r.get("accesses") or []
+    if not rows:
+        out = [head, "   (no [base + constant] access)"]
+        return chr(10).join(out)
+    out = [head]
+    current = None
+    for row in rows:
+        if row["base"] != current:
+            current = row["base"]
+            kind = "param" if row["kind"] == "param" else "local"
+            out.append(f"   {current} ({kind})")
+        out.append(f"      {row['offset']:>8}  x{row['count']}")
+    if r.get("truncated"):
+        out.append("   [truncated]")
+    return chr(10).join(out)
+
+
 def fmt_scan(r: dict[str, Any]) -> str:
     out = [
         f"== {r['binary']} : {r['scanned']} instruction(s) scanned for {r['pattern']} "
@@ -765,6 +788,7 @@ FORMATTERS = {
     "decompile": fmt_decompile,
     "strings": fmt_strings,
     "scan": fmt_scan,
+    "offsets": fmt_offsets,
     "imports": fmt_imports,
     "names": fmt_names,
     "xrefs": fmt_xrefs,
@@ -1646,6 +1670,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("use", help="set/show the focus binary (then pass '-' as binary)")
     p.add_argument("binary", nargs="?", help="program name, e.g. notepad.exe")
     p.set_defaults(func=cmd_use)
+
+    p = sub.add_parser(
+        "offsets", parents=[common], help="which parameter each struct offset belongs to"
+    )
+    p.add_argument("binary")
+    p.add_argument("target", help="function name or address")
+    p.add_argument("--offset", default=None, help="only this offset, e.g. 0x178")
+    p.add_argument("-n", "--limit", type=int, default=120)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "offsets",
+            {"binary": a.binary, "target": a.target, "offset": a.offset, "limit": a.limit},
+        ),
+    )
 
     p = sub.add_parser(
         "scan", parents=[common], help="instructions that touch a struct field offset"

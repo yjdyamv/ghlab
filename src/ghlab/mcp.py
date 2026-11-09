@@ -98,6 +98,24 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_offsets",
+        "description": (
+            "Attribute every [base + constant] access in a function to the parameter or local "
+            "it comes from. An offset alone is not a fact: ctx+0x178 and doc+0x178 are different "
+            "fields in different objects."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {"type": "string", "description": "function name or 0x address"},
+                "offset": {"type": "string", "description": "only this offset, e.g. 0x178"},
+                "limit": _LIMIT,
+            },
+            "required": ["binary", "target"],
+        },
+    },
+    {
         "name": "ghlab_scan",
         "description": (
             "Displacement search: which instructions read/write struct field +0xNN. Use it when "
@@ -419,6 +437,7 @@ _COMMANDS = {
     "ghlab_names": "names",
     "ghlab_imports": "imports",
     "ghlab_scan": "scan",
+    "ghlab_offsets": "offsets",
     "ghlab_decompile": "decompile",
     "ghlab_diff": "diff",
     "ghlab_slice": "slice",

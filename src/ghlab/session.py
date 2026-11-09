@@ -927,6 +927,205 @@ def _scan_several(
     }
 
 
+def _is_param(high: Any) -> bool:
+    """HighParam is a class, not a flag: `isParameter()` does not exist on it."""
+    if high is None:
+        return False
+    return "HighParam" in str(high.getClass().getSimpleName())
+
+
+def _varnode_constant(var: Any) -> int | None:
+    """Signed 64-bit value of a constant varnode, or None."""
+    if var is None or not var.isConstant():
+        return None
+    raw = int(var.getOffset())
+    return raw - (1 << 64) if raw >= 1 << 63 else raw
+
+
+def _pointer_base(pointer: Any, depth: int = 8) -> tuple[Any, int]:
+    """Peel `base + constant` chains off an address expression.
+
+    At high p-code the displacement is not a separate operand: it is folded into
+    `INT_ADD(base, const)` / `PTRSUB(base, const)` nodes. Walking down to the
+    varnode that carries the parameter is what makes the offset attributable.
+    """
+    from ghidra.program.model.pcode import PcodeOp  # the JVM only exists after boot()
+
+    add = int(PcodeOp.INT_ADD)
+    ptrsub = int(PcodeOp.PTRSUB)
+    ptradd = int(PcodeOp.PTRADD)
+    passthrough = {
+        int(value)
+        for value in (
+            getattr(PcodeOp, "COPY", None),
+            getattr(PcodeOp, "CAST", None),
+            getattr(PcodeOp, "INT_ZEXT", None),
+            getattr(PcodeOp, "INT_SEXT", None),
+        )
+        if value is not None
+    }
+    displacement = 0
+    current = pointer
+    for _ in range(depth):
+        if current is None:
+            return None, displacement
+        definition = current.getDef()
+        if definition is None:
+            return current, displacement
+        kinds = int(definition.getOpcode())
+        ins = list(definition.getInputs())
+        if kinds == add and len(ins) >= 2:
+            left, right = _varnode_constant(ins[0]), _varnode_constant(ins[1])
+            if right is None and left is not None:
+                displacement += left
+                current = ins[1]
+                continue
+            if right is not None:
+                displacement += right
+                current = ins[0]
+                continue
+            return current, displacement
+        if kinds in (ptrsub, ptradd) and len(ins) >= 2:
+            value = _varnode_constant(ins[1])
+            if value is not None and kinds == ptrsub:
+                displacement += value
+            elif value is not None and kinds == ptradd:
+                # PTRADD(base, index, element_size): only the element size is fixed
+                size = _varnode_constant(ins[2]) if len(ins) > 2 else None
+                if size is None:
+                    return current, displacement
+                displacement += size
+            current = ins[0]
+            continue
+        if kinds in passthrough and ins:
+            current = ins[0]
+            continue
+        return current, displacement
+    return current, displacement
+
+
+def _param_accesses(hf: Any) -> list[dict[str, Any]]:
+    """Every `[base+disp]` access in a decompiled function, with its base variable.
+
+    The same offset means different things on different objects -- `ctx+0x178` is a
+    mode int while `doc+0x178` is a pointer -- so an offset alone is not a fact.
+    """
+    from ghidra.program.model.pcode import PcodeOp  # the JVM only exists after boot()
+
+    load = int(PcodeOp.LOAD)
+    store = int(PcodeOp.STORE)
+    rows: list[dict[str, Any]] = []
+    it = hf.getPcodeOps()
+    while it.hasNext():
+        op = it.next()
+        kinds = int(op.getOpcode())
+        if kinds not in (load, store):
+            continue
+        ins = list(op.getInputs())
+        pointer = ins[1] if len(ins) >= 2 else None
+        base, displacement = _pointer_base(pointer)
+        if base is None:
+            continue
+        name = str(base.getHigh().getName()) if base.getHigh() is not None else "?"
+        rows.append(
+            {
+                "offset": f"{displacement:#x}" if displacement >= 0 else f"-{abs(displacement):#x}",
+                "base": name,
+                "kind": "param" if _is_param(base.getHigh()) else "local",
+                "op": "load" if kinds == load else "store",
+            }
+        )
+    return rows
+
+
+def cmd_offsets(a: dict[str, Any]) -> dict[str, Any]:
+    """Which parameter or local does each struct offset belong to?"""
+    binary = a["binary"]
+    e = _entry(binary)
+    target = str(a["target"])
+    fn = _function(e, target)
+    if fn is None:
+        hint = _function_suggestions(e["program"], target)
+        raise KeyError(f"function {target!r} not found{hint}")
+    began = time.monotonic()
+    res = e["decomp"].decompileFunction(fn, int(a.get("timeout", 60)), MONITOR)
+    if not res.decompileCompleted():
+        return {
+            "binary": binary,
+            "function": str(fn.getName()),
+            "error": str(res.getErrorMessage()),
+            "accesses": [],
+            "elapsed_ms": int((time.monotonic() - began) * 1000),
+        }
+    hf = res.getHighFunction()
+    rows = _param_accesses(hf)
+    wanted = str(a.get("offset", "")).strip()
+    if wanted:
+        value = int(wanted, 0)
+        rows = [row for row in rows if row["offset"] in (f"{value:#x}", f"-{value:#x}")]
+    debug: dict[str, Any] = {}
+    if a.get("debug"):
+        hist: dict[int, int] = {}
+        count = 0
+        it = hf.getPcodeOps()
+        while it.hasNext():
+            count += 1
+            code = int(it.next().getOpcode())
+            hist[code] = hist.get(code, 0) + 1
+        from ghidra.program.model.pcode import PcodeOp  # the JVM only exists after boot()
+
+        sample = []
+        it2 = hf.getPcodeOps()
+        while it2.hasNext() and len(sample) < 4:
+            op2 = it2.next()
+            if int(op2.getOpcode()) not in (int(PcodeOp.LOAD), int(PcodeOp.STORE)):
+                continue
+            parts = []
+            for var in list(op2.getInputs()):
+                base = var.getHigh()
+                parts.append(
+                    {
+                        "const": bool(var.isConstant()),
+                        "offset": int(var.getOffset()),
+                        "name": str(base.getName()) if base is not None else "?",
+                        "param": _is_param(base),
+                        "type": str(base.getClass().getSimpleName()) if base is not None else "?",
+                    }
+                )
+            sample.append({"op": int(op2.getOpcode()), "inputs": parts})
+        debug = {
+            "ops": count,
+            "opcodes": hist,
+            "high_ok": hf is not None,
+            "load": int(PcodeOp.LOAD),
+            "store": int(PcodeOp.STORE),
+            "sample": sample,
+        }
+    counts: dict[tuple[str, str, str], int] = {}
+    for row in rows:
+        key = (row["base"], row["kind"], row["offset"])
+        counts[key] = counts.get(key, 0) + 1
+    limit = int(a.get("limit", 120))
+    accesses = [
+        {"base": base, "kind": kind, "offset": offset, "count": count}
+        for (base, kind, offset), count in sorted(
+            counts.items(),
+            key=lambda item: (item[0][1] != "param", item[0][1], item[0][0], item[0][2]),
+        )
+    ]
+    return {
+        "binary": binary,
+        "function": str(fn.getName()),
+        "prototype": _prototype(fn),
+        "error": None,
+        "accesses": accesses[:limit],
+        "truncated": len(accesses) > limit,
+        "sites": rows[:limit],
+        "debug": debug or None,
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
+
+
 def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     """Find the instructions that read or write a given struct field offset.
 
@@ -4923,6 +5122,7 @@ HANDLERS = {
     "strings": cmd_strings,
     "names": cmd_names,
     "scan": cmd_scan,
+    "offsets": cmd_offsets,
     "imports": cmd_imports,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,

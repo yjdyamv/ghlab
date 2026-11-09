@@ -89,12 +89,20 @@ class ServerTest(unittest.TestCase):
             dead.call("ping")
         self.assertIn("ghlab start", str(ctx.exception))
 
+    def _wait_for_line(self, lines: list[str], count: int, timeout: float = 2.0) -> list[str]:
+        """The handler logs after it answers, so a fast client can beat the log."""
+        deadline = time.monotonic() + timeout
+        while len(lines) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return lines
+
     def test_every_request_is_logged(self):
         lines: list[str] = []
         with mock.patch("ghlab.server._log", lines.append):
             self.client.call("ping")
             with self.assertRaises(RemoteError):
                 self.client.call("info", binary="stub.exe")
+            lines = self._wait_for_line(lines, 2)
         self.assertEqual(len(lines), 2)
         self.assertIn("cmd=ping", lines[0])
         self.assertIn("status=200", lines[0])
@@ -119,11 +127,12 @@ class ServerTest(unittest.TestCase):
                 timer.join()
             finally:
                 session.dispatch = self.stub.dispatch  # ty: ignore[invalid-assignment]
-        # The response is written inside the try, the log line inside the finally: the
-        # client can see its answer before the handler has logged. Wait for the line.
-        deadline = time.time() + 5
-        while not lines and time.time() < deadline:
-            time.sleep(0.01)
+            # The response is written inside the try, the log line in a finally on the
+            # handler thread: wait *inside* the patch, or the line lands after _log is
+            # restored and is lost.
+            deadline = time.time() + 5
+            while not any("SLOW" in line for line in lines) and time.time() < deadline:
+                time.sleep(0.01)
         self.assertTrue(any("SLOW" in ln for ln in lines), lines)
 
     def test_status_answers_while_a_long_call_holds_the_lock(self):
