@@ -2,6 +2,7 @@
 
 import os
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -87,6 +88,93 @@ class ServerTest(unittest.TestCase):
         with self.assertRaises(RemoteError) as ctx:
             dead.call("ping")
         self.assertIn("ghlab start", str(ctx.exception))
+
+    def test_every_request_is_logged(self):
+        lines: list[str] = []
+        with mock.patch("ghlab.server._log", lines.append):
+            self.client.call("ping")
+            with self.assertRaises(RemoteError):
+                self.client.call("info", binary="stub.exe")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("cmd=ping", lines[0])
+        self.assertIn("status=200", lines[0])
+        self.assertIn("cmd=info", lines[1])
+        self.assertIn("status=500", lines[1])
+        self.assertIn("KeyError", lines[1])
+
+    def test_slow_requests_are_marked(self):
+        lines: list[str] = []
+        blocker = threading.Event()
+
+        def slow(cmd, params):
+            blocker.wait(2)
+            return {"service": "stub"}
+
+        with mock.patch("ghlab.server._log", lines.append), mock.patch("ghlab.server.SLOW_MS", 1):
+            session.dispatch = slow  # ty: ignore[invalid-assignment]
+            try:
+                timer = threading.Timer(0.05, blocker.set)
+                timer.start()
+                self.client.call("ping")
+                timer.join()
+            finally:
+                session.dispatch = self.stub.dispatch  # ty: ignore[invalid-assignment]
+        # The response is written inside the try, the log line inside the finally: the
+        # client can see its answer before the handler has logged. Wait for the line.
+        deadline = time.time() + 2
+        while not lines and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(any("SLOW" in ln for ln in lines), lines)
+
+    def test_status_answers_while_a_long_call_holds_the_lock(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow(a: dict) -> dict:
+            started.set()
+            release.wait(5)
+            return {"binary": "x", "results": []}
+
+        with mock.patch("ghlab.server._log", lambda _line: None):
+            session.dispatch = type(self)._real_dispatch  # ty: ignore[invalid-assignment]
+            original = session.HANDLERS["decompile"]
+            session.HANDLERS["decompile"] = slow
+            try:
+                worker = threading.Thread(target=lambda: self.client.call("decompile", binary="x"))
+                worker.start()
+                self.assertTrue(started.wait(2))
+                began = time.monotonic()
+                info = self.client.info()  # GET / must not queue behind the lock
+                took = time.monotonic() - began
+                self.assertLess(took, 2.0)
+                self.assertEqual(info["busy"]["cmd"], "decompile")
+                release.set()
+                worker.join(5)
+            finally:
+                release.set()
+                session.HANDLERS["decompile"] = original
+                session.dispatch = self.stub.dispatch  # ty: ignore[invalid-assignment]
+        self.assertEqual(session.in_flight(), {})
+
+    def test_ping_never_reports_itself_as_busy(self):
+        info = self.client.call("ping")
+        self.assertNotIn("busy", info)
+
+    def test_status_view_reports_what_is_running(self):
+        before = session.in_flight()
+        self.assertEqual(before, {})
+        session._INFLIGHT.update({"cmd": "scan", "started": time.monotonic(), "since": "12:00:00"})
+        try:
+            busy = session.in_flight()
+            self.assertEqual(busy["cmd"], "scan")
+            self.assertIsNotNone(busy["elapsed_s"])
+            info = self.client.info()
+            self.assertEqual(info["busy"]["cmd"], "scan")
+            self.assertIn("uptime_s", info)
+            self.assertIn("pid", info)
+        finally:
+            session._INFLIGHT.update({"cmd": None, "started": 0.0, "since": None})
+        self.assertEqual(session.in_flight(), {})
 
 
 if __name__ == "__main__":

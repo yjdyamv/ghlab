@@ -83,7 +83,9 @@ class LiveDrilldownTest(unittest.TestCase):
         self.assertEqual(warm["matched"], first["matched"])
         rebuilt = self.client.call("strings", binary=BIN, query="txt", limit=5, refresh=True)
         self.assertFalse(rebuilt["cached"])
-        self.assertEqual([s["addr"] for s in rebuilt["strings"]], [s["addr"] for s in warm["strings"]])
+        self.assertEqual(
+            [s["addr"] for s in rebuilt["strings"]], [s["addr"] for s in warm["strings"]]
+        )
 
 
 class LiveTest(unittest.TestCase):

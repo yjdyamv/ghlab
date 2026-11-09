@@ -729,6 +729,22 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def _rotate_log(path: Path, limit: int = 8 << 20) -> None:
+    """Keep one previous log file.
+
+    Rotation happens before the detached daemon opens the log: on Windows an
+    open handle cannot be renamed, so the running process must never own it.
+    """
+    try:
+        if not path.exists() or path.stat().st_size <= limit:
+            return
+        backup = path.with_name(path.name + ".1")
+        backup.unlink(missing_ok=True)
+        path.replace(backup)
+    except OSError:
+        pass
+
+
 def _pidfile(path: Path) -> dict[str, Any]:
     """Read the daemon pidfile; tolerate the old plain-pid format."""
     try:
@@ -769,6 +785,7 @@ def cmd_start(args) -> int:
     if not _ghidra_env_ok():
         return 2
     LOGDIR.mkdir(parents=True, exist_ok=True)
+    _rotate_log(LOGDIR / "ghlab.log")
     log = open(LOGDIR / "ghlab.log", "ab")  # noqa: SIM115 - handed to the detached child
     cmd = [
         sys.executable,
@@ -924,10 +941,12 @@ def cmd_status(args) -> int:
         return 0
     code = info["code"]
     state = "STALE (restart with `ghlab start`)" if code["stale"] else "current"
+    busy = info.get("busy") or {}
+    tail = f"  busy={busy['cmd']} {busy.get('elapsed_s')}s" if busy else ""
     print(
         f"up  {client.url}  project={info.get('project')}  "
         f"binaries={info.get('binaries')}  loaded={len(info.get('loaded') or [])}  "
-        f"code={code['running'] or 'unknown'} [{state}]"
+        f"code={code['running'] or 'unknown'} [{state}]{tail}"
     )
     return 0
 

@@ -9,15 +9,45 @@ import socket
 import sys
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import protocol, session
+
+# Requests slower than this get a SLOW marker in the log (milliseconds).
+SLOW_MS = int(os.environ.get("GHLAB_SLOW_MS", "5000"))
+STARTED = time.time()
+
+
+def _log(line: str) -> None:
+    sys.stderr.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {line}\n")
+    sys.stderr.flush()
+
+
+def _describe(params: dict[str, Any]) -> str:
+    """Compact argument summary: keys always, values only when short and safe."""
+    bits = []
+    for key in sorted(params):
+        if key == "binary":
+            continue
+        value = params[key]
+        if isinstance(value, (int, float)) or (isinstance(value, str) and len(value) <= 40):
+            bits.append(f"{key}={value}")
+        elif isinstance(value, list):
+            bits.append(f"{key}[{len(value)}]")
+    return " ".join(bits)
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ghlab/0.1"
+
+    def setup(self) -> None:
+        super().setup()
+        # A client that vanishes mid-response must not pin the single server
+        # thread forever; the timeout also bounds half-open reads.
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(float(os.environ.get("GHLAB_SOCKET_TIMEOUT", "900")))
 
     def _send(self, body: bytes, code: int = 200) -> None:
         self.send_response(code)
@@ -31,17 +61,28 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
         started = time.monotonic()
+        cmd = "?"
+        params: dict[str, Any] = {}
+        status = 200
+        note = ""
         try:
             request = json.loads(raw or b"{}")
+            cmd = str(request.get("cmd") or "?")
             spec, params = protocol.validate(request)
             result = session.dispatch(spec.name, params)
             payload = protocol.Ok(result, int(1000 * (time.monotonic() - started)))
             self._send(payload.to_bytes())
         except protocol.ProtocolError as ex:
-            self._send(protocol.Err(f"ProtocolError: {ex}").to_bytes(), 400)
+            status, note = 400, f"ProtocolError: {ex}"
+            self._send(protocol.Err(note).to_bytes(), 400)
         except Exception as ex:  # noqa: BLE001 - every failure must reach the client
-            err = protocol.Err(f"{type(ex).__name__}: {ex}", traceback.format_exc()[-2000:])
+            status, note = 500, f"{type(ex).__name__}: {ex}"
+            err = protocol.Err(note, traceback.format_exc()[-2000:])
             self._send(err.to_bytes(), 500)
+        finally:
+            ms = int(1000 * (time.monotonic() - started))
+            marker = " SLOW" if ms >= SLOW_MS else ""
+            _log(f"cmd={cmd} ms={ms}{marker} status={status} {_describe(params)} {note}".rstrip())
 
     def do_GET(self) -> None:
         if self.path.rstrip("/") in ("/health", "/ping"):
@@ -54,6 +95,9 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "service": "ghlab",
+                    "pid": os.getpid(),
+                    "uptime_s": round(time.time() - STARTED, 1),
+                    "busy": session.in_flight(),
                     "usage": 'POST / with {"cmd": "<name>", ...}',
                     "cmds": {
                         name: {"required": s.required, "optional": s.optional, "summary": s.summary}
@@ -69,11 +113,14 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write(f"{self.address_string()} - {format % args}\n")
 
 
-class Server(HTTPServer):
+class Server(ThreadingHTTPServer):
     # Windows allows a second bind when SO_REUSEADDR is set; a duplicate daemon
     # silently serving stale code is a nasty failure mode, so refuse it.
     allow_reuse_address = False
-    daemon_threads = False
+    # Requests run on their own threads but every Ghidra call takes session.LOCK,
+    # so the work is still strictly serial. The point of threading is that GET /
+    # (health, busy, command list) answers *while* a long job holds the lock.
+    daemon_threads = True
 
 
 def pidfile() -> str:

@@ -18,6 +18,9 @@ from . import render
 
 MONITOR = None
 LOCK = threading.RLock()
+# What the dispatcher is running right now; the server is single-threaded, so this
+# is also the answer to "why is my request queued?".
+_INFLIGHT: dict[str, Any] = {"cmd": None, "started": 0.0, "since": None}
 _proj = None
 _project_dir: Path | None = None
 _project_name = "ghlab"
@@ -207,12 +210,16 @@ def brief(fn) -> dict[str, Any]:
 
 
 def ping(_: dict[str, Any]) -> dict[str, Any]:
-    return {
+    out = {
         "service": "ghlab",
         "project": project_location(),
         "binaries": len(binary_names()),
         "loaded": sorted(_programs),
     }
+    busy = in_flight()
+    if busy:
+        out["busy"] = busy
+    return out
 
 
 def cmd_binaries(_: dict[str, Any]) -> dict[str, Any]:
@@ -4118,16 +4125,47 @@ def cmd_audit(a: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
-    with LOCK:
-        try:
-            result = HANDLERS[cmd](params)
-        except Exception as ex:
+    # `ping` is served to *ask* what is running, so it must never claim to be the
+    # thing that is running.
+    track = cmd != "ping"
+    if track:
+        _INFLIGHT["cmd"] = cmd
+        _INFLIGHT["started"] = time.monotonic()
+        _INFLIGHT["since"] = time.strftime("%H:%M:%S")
+    try:
+        with LOCK:
+            try:
+                result = HANDLERS[cmd](params)
+            except Exception as ex:
+                if cmd in MUTATING:
+                    _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
+                raise
             if cmd in MUTATING:
-                _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
-            raise
-        if cmd in MUTATING:
-            _journal_append(cmd, params, result)
-        return result
+                _journal_append(cmd, params, result)
+            return result
+    finally:
+        if track:
+            _INFLIGHT["cmd"] = None
+            _INFLIGHT["started"] = 0.0
+            _INFLIGHT["since"] = None
+
+
+def in_flight() -> dict[str, Any]:
+    """What the daemon is doing right now (empty when idle).
+
+    The server is single-threaded, so an abandoned long call blocks every other
+    request. Reporting the running command is how you tell "slow" from "wedged"
+    without attaching a debugger.
+    """
+    cmd = _INFLIGHT.get("cmd")
+    if not cmd:
+        return {}
+    started = float(_INFLIGHT.get("started") or 0.0)
+    return {
+        "cmd": cmd,
+        "elapsed_s": round(time.monotonic() - started, 1) if started else None,
+        "since": _INFLIGHT.get("since"),
+    }
 
 
 def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:

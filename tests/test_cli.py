@@ -55,6 +55,28 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("line 1", out.getvalue())
 
+    def test_log_rotation_keeps_one_previous_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "ghlab.log"
+            log.write_text("x" * 2048, encoding="utf-8")
+            cli._rotate_log(log, limit=1024)
+            self.assertFalse(log.exists())
+            backup = Path(tmp) / "ghlab.log.1"
+            self.assertTrue(backup.exists())
+            self.assertEqual(backup.stat().st_size, 2048)
+            # a fresh log is created by the daemon, so rotate again: one backup only
+            log.write_text("y" * 2048, encoding="utf-8")
+            cli._rotate_log(log, limit=1024)
+            self.assertEqual(backup.read_text(encoding="utf-8")[0], "y")
+
+    def test_small_log_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "ghlab.log"
+            log.write_text("ok", encoding="utf-8")
+            cli._rotate_log(log, limit=1024)
+            self.assertTrue(log.exists())
+            self.assertFalse((Path(tmp) / "ghlab.log.1").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
