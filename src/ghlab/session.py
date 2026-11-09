@@ -727,6 +727,8 @@ def _insn_sites(
             text = str(insn)
             if op is not None and not op.search(text.split(" ", 1)[0]):
                 continue
+            if "[" not in text:  # no memory operand, so no displacement to match
+                continue
             if skip_stack and _STACK_REF.search(text):
                 continue
             if offset not in _displacements(text):
@@ -748,6 +750,121 @@ def _insn_sites(
             if len(out) >= limit:
                 return out, scanned
     return out, scanned
+
+
+def _sequence_hits(
+    events: list[tuple[int, frozenset[int]]],
+    order: list[int],
+    window: int,
+) -> list[dict[str, int]]:
+    """Instruction windows where `order` appears in that order within `window`.
+
+    A struct copy looks like `[obj+0x8]`, `[obj+0x10]`, `[obj+0x18]` in ascending
+    order inside a handful of instructions.  Counting per-offset hits cannot see
+    that shape; the order and the distance are the evidence.
+    """
+    hits: list[dict[str, int]] = []
+    total = len(events)
+    i = 0
+    while i < total:
+        index, offsets = events[i]
+        if order[0] not in offsets:
+            i += 1
+            continue
+        need = 1
+        j = i + 1
+        last = i
+        while j < total and need < len(order):
+            if events[j][0] - index > window:
+                break
+            if order[need] in events[j][1]:
+                need += 1
+                last = j
+            j += 1
+        if need == len(order):
+            hits.append({"start": index, "end": events[last][0]})
+            i = last + 1
+        else:
+            i += 1
+    return hits
+
+
+def _scan_sequence(
+    binary: str,
+    p: Any,
+    offsets: list[int],
+    window: int,
+    start: Any | None,
+    end: Any | None,
+    limit: int,
+    skip_stack: bool,
+    began: float,
+) -> dict[str, Any]:
+    """One pass, then ask for the ordered pattern -- not k separate sweeps."""
+    wanted = set(offsets)
+    listing = p.getListing()
+    fm = p.getFunctionManager()
+    lo = start or p.getMinAddress()
+    hi = end
+    events: list[tuple[int, frozenset[int]]] = []
+    texts: list[str] = []
+    addrs: list[str] = []
+    owners: list[str] = []
+    scanned = 0
+    it = listing.getInstructions(lo, True)
+    index = -1
+    while it.hasNext():
+        insn = it.next()
+        if hi is not None and insn.getAddress().compareTo(hi) > 0:
+            break
+        scanned += 1
+        index += 1
+        text = str(insn)
+        if "[" not in text:  # no memory operand
+            continue
+        if skip_stack and _STACK_REF.search(text):
+            continue
+        found = _displacements(text) & wanted
+        if not found:
+            continue
+        events.append((index, frozenset(found)))
+        texts.append(text)
+        addrs.append(str(insn.getAddress()))
+        fn = fm.getFunctionContaining(insn.getAddress())
+        owners.append(fn.getName() if fn else "")
+    hits = _sequence_hits(events, offsets, window)
+    sites = []
+    for hit in hits:
+        first = next(k for k, event in enumerate(events) if event[0] == hit["start"])
+        last = next(k for k, event in enumerate(events) if event[0] == hit["end"])
+        sites.append(
+            {
+                "addr": addrs[first],
+                "function": owners[first],
+                "text": texts[first],
+                "span": f"{hit['start']}..{hit['end']}",
+                "sequence": texts[first : last + 1],
+            }
+        )
+        if len(sites) >= limit:
+            break
+    return {
+        "binary": binary,
+        "offset": ",".join(f"{value:#x}" for value in offsets),
+        "pattern": "seq " + " -> ".join(f"{value:#x}" for value in offsets),
+        "skip_stack": skip_stack,
+        "imm": None,
+        "writes_only": False,
+        "window": window,
+        "scanned": scanned,
+        "sites": sites,
+        "truncated": len(hits) > len(sites),
+        "matched_functions": [
+            {"function": name, "offsets": sorted({f"{value:#x}" for value in offsets})}
+            for name in sorted({site["function"] for site in sites if site["function"]})
+        ],
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
 
 
 def _scan_several(
@@ -850,6 +967,15 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     began = time.monotonic()
     imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None
     writes = bool(a.get("writes"))
+    if len(offsets) < 2:
+        a["sequence"] = False
+    if a.get("sequence"):
+        window = int(a.get("window", 32))
+        if window < 1:
+            raise ValueError("window must be >= 1")
+        return _scan_sequence(
+            binary, p, offsets, window, start, end, limit, not a.get("stack"), began
+        )
     if len(offsets) > 1:
         return _scan_several(
             binary, p, offsets, start, end, limit, op, not a.get("stack"), imm, writes, began

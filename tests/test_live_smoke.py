@@ -117,6 +117,16 @@ class SmokeTest(unittest.TestCase):
         for row in r["matched_functions"]:
             self.assertEqual(set(row["offsets"]), {"0x8", "0x10"})
 
+    def test_scan_can_ask_for_an_ordered_window(self):
+        """`--sequence` keeps offsets in order: the shape of a struct copy."""
+        r = self.c.call(
+            "scan", binary=BIN, offset="0x8,0x10", func="entry", sequence=True, window=16, limit=5
+        )
+        self.assertIn("seq ", r["pattern"])
+        self.assertEqual(r["window"], 16)
+        for site in r["sites"]:
+            self.assertLessEqual(len(site["sequence"]), 16)
+
     def test_xrefs_and_scan_agree_on_a_function(self):
         xr = self.c.call("xrefs", binary=BIN, target="entry", limit=5)
         self.assertTrue(xr["results"])

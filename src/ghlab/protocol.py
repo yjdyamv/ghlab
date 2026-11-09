@@ -102,8 +102,8 @@ _SPECS = [
     Spec(
         "scan",
         ("binary", "offset"),
-        ("range", "func", "limit", "op", "stack", "imm", "writes"),
-        "instructions that touch a struct field offset (displacement search)",
+        ("range", "func", "limit", "op", "stack", "imm", "writes", "sequence", "window"),
+        "instructions that touch a struct field offset (displacement search; `sequence` asks for an ordered window)",
     ),
     Spec("xrefs", ("binary",), ("target", "targets", "limit"), "references to address/function"),
     Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),

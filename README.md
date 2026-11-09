@@ -413,6 +413,8 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 
 同一偏移在多套结构体里重复出现时，用逗号一次问几个字段：`ghlab scan BIN 0x168,0x170,0x178 --writes` 只保留**同时**碰到这三处的函数——单偏移在 30 MB 的二进制里必然被噪声淹没。
 
+要认“结构体拷贝”这种形状，用 `--sequence`：`ghlab scan BIN 0x8,0x10,0x18 --sequence --window 24` 要求三个偏移按顺序落在一个 24 条指令的窗口里，命中直接打印整段。全库一遍约 50 秒（6.5M 条指令），先 `--range`/`--func` 缩小范围。
+
 ## 开发
 
 ```bash

@@ -9,6 +9,7 @@ from ghlab.session import (
     _imm_of,
     _imm_spec,
     _is_dest_operand,
+    _sequence_hits,
     _split_operands,
 )
 
@@ -126,3 +127,38 @@ class DisplacementTest(unittest.TestCase):
 
     def test_two_operands_are_merged(self):
         self.assertEqual(_displacements("MOV [RAX + 0x10],[RCX + 0x20]"), {0x10, 0x20})
+
+
+class SequenceTest(unittest.TestCase):
+    """Ordered windows are what a struct copy looks like: +0x8 then +0x10 then +0x18."""
+
+    def _events(self, *offsets_per_insn):
+        return [(index, frozenset(values)) for index, values in enumerate(offsets_per_insn)]
+
+    def test_ascending_order_inside_the_window_is_a_hit(self):
+        events = self._events({0x8}, set(), {0x10}, set(), {0x18})
+        hits = _sequence_hits(events, [0x8, 0x10, 0x18], window=8)
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0], {"start": 0, "end": 4})
+
+    def test_wrong_order_is_not_a_hit(self):
+        events = self._events({0x18}, {0x10}, {0x8})
+        self.assertEqual(_sequence_hits(events, [0x8, 0x10, 0x18], window=8), [])
+
+    def test_outside_the_window_is_not_a_hit(self):
+        events = self._events({0x8}, {0x10}, {0x18})
+        self.assertEqual(_sequence_hits(events, [0x8, 0x10, 0x18], window=0), [])
+
+    def test_one_instruction_can_supply_two_offsets(self):
+        events = self._events({0x8}, {0x8, 0x10}, {0x18})
+        self.assertEqual(len(_sequence_hits(events, [0x8, 0x10, 0x18], window=4)), 1)
+
+    def test_hits_do_not_overlap(self):
+        events = self._events({0x8}, {0x10}, {0x18}, {0x8}, {0x10}, {0x18})
+        hits = _sequence_hits(events, [0x8, 0x10, 0x18], window=4)
+        self.assertEqual([hit["start"] for hit in hits], [0, 3])
+
+    def test_a_partial_run_keeps_looking(self):
+        events = self._events({0x8}, {0x10}, set(), {0x8}, {0x10}, {0x18})
+        hits = _sequence_hits(events, [0x8, 0x10, 0x18], window=8)
+        self.assertEqual(hits, [{"start": 0, "end": 5}])

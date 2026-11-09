@@ -170,6 +170,8 @@ def fmt_scan(r: dict[str, Any]) -> str:
         out[0] += "  [" + ", ".join(filters) + "]"
     for s in sites:
         out.append(f"   {s['addr']}  {s['function'] or '-':<24} {s['text']}")
+        for extra in (s.get("sequence") or [])[1:]:
+            out.append(f"   {'':<12}  {'':<24} {extra}")
     return chr(10).join(out)
 
 
@@ -1665,6 +1667,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="only instructions that write the field (offset in the destination operand)",
     )
+    p.add_argument(
+        "--sequence",
+        action="store_true",
+        help="require the listed offsets in this order inside one window (finds struct copies)",
+    )
+    p.add_argument(
+        "--window",
+        type=int,
+        default=32,
+        help="instructions allowed between the offsets (default 32)",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -1679,6 +1692,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "stack": a.stack,
                 "imm": a.imm,
                 "writes": a.writes,
+                "sequence": a.sequence,
+                "window": a.window,
             },
         ),
     )
