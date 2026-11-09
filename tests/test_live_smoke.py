@@ -109,6 +109,14 @@ class SmokeTest(unittest.TestCase):
         grouped = self.c.call("imports", binary=BIN, group="file", limit=5)
         self.assertTrue(all(i["risk"] == "file" for i in grouped["imports"]))
 
+    def test_scan_accepts_several_offsets_at_once(self):
+        """Several offsets at once keeps only functions that touch all of them."""
+        r = self.c.call("scan", binary=BIN, offset="0x8,0x10", func="entry", writes=True, limit=5)
+        self.assertIn("matched_functions", r)
+        self.assertEqual(r["offset"], "0x8,0x10")
+        for row in r["matched_functions"]:
+            self.assertEqual(set(row["offsets"]), {"0x8", "0x10"})
+
     def test_xrefs_and_scan_agree_on_a_function(self):
         xr = self.c.call("xrefs", binary=BIN, target="entry", limit=5)
         self.assertTrue(xr["results"])

@@ -8,6 +8,9 @@ import pathlib
 import shutil
 import tempfile
 import unittest
+
+# A developer usually exports GHLAB_URL while debugging; it collapses the project
+# registry to one target, which is correct behaviour but wrong for config tests.
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -176,6 +179,10 @@ class ConfigIsolationTest(unittest.TestCase):
 class McpSnippetTest(unittest.TestCase):
     """The printed snippet must keep routing working: a pinned GHLAB_URL would not."""
 
+    def setUp(self):
+        os.environ.pop("GHLAB_URL", None)
+        os.environ.pop("GHLAB_CONFIG", None)
+
     def snippet(self, cfg: dict):
         return cli._mcp_snippet(cfg)
 
@@ -209,6 +216,8 @@ class StopByPortTest(unittest.TestCase):
     """
 
     def setUp(self):
+        os.environ.pop("GHLAB_URL", None)
+        os.environ.pop("GHLAB_CONFIG", None)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.one = root / "one"

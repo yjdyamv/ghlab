@@ -409,6 +409,10 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 - **日志比记忆可靠**：所有写操作落 `.ghlab/journal.jsonl`，`overview` 直接显示每个程序的最后一次改动；agent 换会话后先 `journal` 再动手
 - **结论必须可复算**：`note -a` 把"这个函数引用了 Autosave"从一句话变成一条可重算的断言（常量/字符串/导入/调用/大小/字节/符号/名字 八类），`verify` 重新求值。它防的不是恶意，是**自己和 agent 的自信**：我写下 `const=0xffffffff80000001` 时以为对，第一次跑出来是 FAIL，因为 Ghidra 把那个常量存成了负数。
 
+`scan --writes` 只认真正写入内存的指令：`CALL/JMP/PUSH/CMP/TEST/BT/LEA` 的第一个操作数不算写（否则每个间接调用都会冒充字段写者）；位移按**数值**比较，`[RCX + R13*0x1 + -0x40]` 不会被当成 `+0x40`。
+
+同一偏移在多套结构体里重复出现时，用逗号一次问几个字段：`ghlab scan BIN 0x168,0x170,0x178 --writes` 只保留**同时**碰到这三处的函数——单偏移在 30 MB 的二进制里必然被噪声淹没。
+
 ## 开发
 
 ```bash

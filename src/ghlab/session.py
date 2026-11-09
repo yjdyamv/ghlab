@@ -654,21 +654,50 @@ def _imm_spec(text: str) -> Callable[[int], bool]:
     return lambda value: value == wanted
 
 
+_BRACKETS = re.compile(r"\[([^\]]*)\]")
+_DISP_TERM = re.compile(r"([+-])\s*(0x[0-9a-f]+|[0-9]+)", re.I)
+
+
+def _displacements(text: str) -> set[int]:
+    """Signed displacements inside memory operands: `[RAX + -0x40]` is -64, not 64.
+
+    The old code matched `offset` with a signed-hex regex, which happily
+    matched the tail of `[RCX + R13*0x1 + -0x40]` and reported 12 phantom
+    writers of `+0x40`. Numbers beat patterns here.
+    """
+    out: set[int] = set()
+    for body in _BRACKETS.findall(text):
+        for sign, value in _DISP_TERM.findall(body):
+            number = int(value, 0)
+            out.add(-number if sign == "-" else number)
+    return out
+
+
+_NO_DEST_OPS = frozenset({"CALL", "JMP", "PUSH", "CMP", "TEST", "BT", "LEA"})
+
+
 def _is_dest_operand(text: str, offset: int) -> bool:
-    """True when the memory operand carrying `offset` is the one being written."""
-    first = _split_operands(text)[0]
-    return re.search(rf"[+-]\s*{offset:#x}\]", first, re.I) is not None
+    """True when the memory operand carrying `offset` is the one being written.
+
+    `CALL qword ptr [RAX+0x40]` reads, it does not store; `LEA` computes an
+    address without touching memory. Treating the first operand of every
+    instruction as a destination turned virtual calls into false "writers of
+    +0x40" and cost a full sweep to notice.
+    """
+    mnemonic = text.split(None, 1)[0].upper() if text.strip() else ""
+    if mnemonic in _NO_DEST_OPS:
+        return False
+    return offset in _displacements(_split_operands(text)[0])
 
 
 def _insn_sites(
     program: Any,
-    pattern: re.Pattern[str],
+    offset: int,
     start: Any | None = None,
     end: Any | None = None,
     limit: int = 60,
     op: re.Pattern[str] | None = None,
     skip_stack: bool = True,
-    offset: int | None = None,
     imm: Callable[[int], bool] | None = None,
     dest_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -700,9 +729,9 @@ def _insn_sites(
                 continue
             if skip_stack and _STACK_REF.search(text):
                 continue
-            if not pattern.search(text):
+            if offset not in _displacements(text):
                 continue
-            if dest_only and offset is not None and not _is_dest_operand(text, offset):
+            if dest_only and not _is_dest_operand(text, offset):
                 continue
             if imm is not None:
                 value = _imm_of(text)
@@ -721,6 +750,66 @@ def _insn_sites(
     return out, scanned
 
 
+def _scan_several(
+    binary: str,
+    p: Any,
+    offsets: list[int],
+    start: Any | None,
+    end: Any | None,
+    limit: int,
+    op: re.Pattern[str] | None,
+    skip_stack: bool,
+    imm: Callable[[int], bool] | None,
+    writes: bool,
+    began: float,
+) -> dict[str, Any]:
+    """Functions that touch *every* offset, not just one.
+
+    Same-offset-different-struct noise is the reason this exists: `+0x178` is a
+    pointer in one class and a dword in another, and `+0x40` is everywhere. Ask
+    for three fields at once and the wrong structs drop out by themselves.
+    """
+    per_offset: dict[int, list[dict[str, Any]]] = {}
+    scanned = 0
+    for offset in offsets:
+        sites, done = _insn_sites(
+            p, offset, start, end, max(limit, 5000), op, skip_stack, imm, writes
+        )
+        scanned += done
+        per_offset[offset] = sites
+    owners = None
+    for sites in per_offset.values():
+        names = {site["function"] for site in sites}
+        owners = names if owners is None else owners & names
+    keep = owners or set()
+    out: list[dict[str, Any]] = []
+    for offset in offsets:
+        for site in per_offset[offset]:
+            if site["function"] in keep:
+                out.append({**site, "offset": f"{offset:#x}"})
+    out.sort(key=lambda site: (site["function"], int(site["addr"], 16)))
+    summary = [
+        {
+            "function": name,
+            "offsets": sorted({site["offset"] for site in out if site["function"] == name}),
+        }
+        for name in sorted(keep)
+    ]
+    return {
+        "binary": binary,
+        "offset": ",".join(f"{value:#x}" for value in offsets),
+        "pattern": "",
+        "skip_stack": skip_stack,
+        "imm": None,
+        "writes_only": writes,
+        "scanned": scanned,
+        "sites": out[:limit],
+        "truncated": len(out) > limit,
+        "matched_functions": summary,
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
+
+
 def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     """Find the instructions that read or write a given struct field offset.
 
@@ -730,9 +819,12 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     """
     binary = a["binary"]
     p = _entry(binary)["program"]
-    offset = int(str(a["offset"]), 0)
-    if offset < 0:
+    offsets = [int(part, 0) for part in str(a["offset"]).split(",") if part.strip()]
+    if not offsets:
         raise ValueError("offset must be >= 0")
+    if any(value < 0 for value in offsets):
+        raise ValueError("offset must be >= 0")
+    offset = offsets[0]
     limit = int(a.get("limit", 60))
     op = re.compile(str(a["op"]), re.I) if a.get("op") else None
     pattern = re.compile(rf"[+-]\s*{offset:#x}\]", re.I)
@@ -758,9 +850,11 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     began = time.monotonic()
     imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None
     writes = bool(a.get("writes"))
-    sites, scanned = _insn_sites(
-        p, pattern, start, end, limit, op, not a.get("stack"), offset, imm, writes
-    )
+    if len(offsets) > 1:
+        return _scan_several(
+            binary, p, offsets, start, end, limit, op, not a.get("stack"), imm, writes, began
+        )
+    sites, scanned = _insn_sites(p, offset, start, end, limit, op, not a.get("stack"), imm, writes)
     return {
         "binary": binary,
         "offset": f"{offset:#x}",

@@ -70,6 +70,18 @@ def _cleanup() -> None:
     shutil.rmtree(_state.get("project_dir", ""), ignore_errors=True)
 
 
+def live_names(client: Client) -> list[str]:
+    """Program names in a daemon, tolerating both payload shapes (`["x"]` and `[{"name": "x"}]`)."""
+    rows = client.call("binaries").get("binaries", [])
+    out: list[str] = []
+    for row in rows:
+        if isinstance(row, str):
+            out.append(row)
+        elif isinstance(row, dict) and row.get("name"):
+            out.append(str(row["name"]))
+    return out
+
+
 def bootstrap() -> tuple[Client, str] | None:
     """(client, binary name) for the live tests, or None when we cannot run them.
 
@@ -91,8 +103,15 @@ def bootstrap() -> tuple[Client, str] | None:
         client = Client(existing, timeout=600)
         if not client.alive():
             return None
-        _state.update(url=existing, binary=sample.name, owned="0")
-        return client, sample.name
+        # A pinned daemon may hold anything; use the sample when it is there,
+        # otherwise the first program it does have.  Never import into someone
+        # else's project just to make a test run.
+        names = live_names(client)
+        chosen = sample.name if sample.name in names else (names[0] if names else "")
+        if not chosen:
+            return None
+        _state.update(url=existing, binary=chosen, owned="0")
+        return client, chosen
 
     port = _free_port()
     project_dir = Path(tempfile.mkdtemp(prefix="ghlab-smoke-"))
