@@ -102,7 +102,7 @@ _SPECS = [
     Spec(
         "scan",
         ("binary", "offset"),
-        ("range", "func", "limit", "op", "stack"),
+        ("range", "func", "limit", "op", "stack", "imm", "writes"),
         "instructions that touch a struct field offset (displacement search)",
     ),
     Spec("xrefs", ("binary",), ("target", "targets", "limit"), "references to address/function"),

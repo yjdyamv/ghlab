@@ -11,6 +11,7 @@ import re
 import threading
 import time
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -602,6 +603,58 @@ def cmd_imports(a: dict[str, Any]) -> dict[str, Any]:
 
 
 _STACK_REF = re.compile(r"\[(?:RSP|RBP|ESP|EBP)[\s,+\-]")
+# The last operand of an instruction, when it is an immediate: `MOV [RAX+0x8],0x4`.
+_LAST_IMM = re.compile(r",\s*(-?(?:0x)?[0-9a-f]+)\s*$", re.I)
+
+
+def _split_operands(text: str) -> list[str]:
+    """Split an instruction rendering on the commas that are not inside brackets."""
+    parts: list[str] = []
+    depth = 0
+    cur = ""
+    for ch in text:
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        cur += ch
+    parts.append(cur)
+    return parts
+
+
+def _imm_of(text: str) -> int | None:
+    """The integer value of the last operand, or None when it is not an immediate."""
+    found = _LAST_IMM.search(text)
+    if found is None:
+        return None
+    try:
+        return int(found.group(1), 0)
+    except ValueError:
+        return None
+
+
+def _imm_spec(text: str) -> Callable[[int], bool]:
+    """A predicate for `--imm 4`, `--imm 0x4` or a range like `--imm 0..5`."""
+    raw = str(text).strip()
+    if ".." in raw:
+        low_text, _, high_text = raw.partition("..")
+        low = int(low_text, 0) if low_text else -(2**63)
+        high = int(high_text, 0) if high_text else 2**63 - 1
+        if low > high:
+            raise ValueError(f"bad imm range {raw!r}; the low end is above the high end")
+        return lambda value: low <= value <= high
+    wanted = int(raw, 0)
+    return lambda value: value == wanted
+
+
+def _is_dest_operand(text: str, offset: int) -> bool:
+    """True when the memory operand carrying `offset` is the one being written."""
+    first = _split_operands(text)[0]
+    return re.search(rf"[+-]\s*{offset:#x}\]", first, re.I) is not None
 
 
 def _insn_sites(
@@ -612,6 +665,9 @@ def _insn_sites(
     limit: int = 60,
     op: re.Pattern[str] | None = None,
     skip_stack: bool = True,
+    offset: int | None = None,
+    imm: Callable[[int], bool] | None = None,
+    dest_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Instructions whose rendering touches a given displacement, with owner function."""
     listing = program.getListing()
@@ -643,6 +699,12 @@ def _insn_sites(
                 continue
             if not pattern.search(text):
                 continue
+            if dest_only and offset is not None and not _is_dest_operand(text, offset):
+                continue
+            if imm is not None:
+                value = _imm_of(text)
+                if value is None or not imm(value):
+                    continue
             fn = fm.getFunctionContaining(insn.getAddress())
             out.append(
                 {
@@ -685,12 +747,18 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
         fn = _function(_entry(binary), str(a["func"]))
         start, end = fn.getBody().getMinAddress(), fn.getBody().getMaxAddress()
     began = time.monotonic()
-    sites, scanned = _insn_sites(p, pattern, start, end, limit, op, not a.get("stack"))
+    imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None
+    writes = bool(a.get("writes"))
+    sites, scanned = _insn_sites(
+        p, pattern, start, end, limit, op, not a.get("stack"), offset, imm, writes
+    )
     return {
         "binary": binary,
         "offset": f"{offset:#x}",
         "pattern": pattern.pattern,
         "skip_stack": not bool(a.get("stack")),
+        "imm": str(a["imm"]) if a.get("imm") not in (None, "") else None,
+        "writes_only": writes,
         "scanned": scanned,
         "sites": sites,
         "truncated": len(sites) >= limit,

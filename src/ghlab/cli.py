@@ -161,6 +161,13 @@ def fmt_scan(r: dict[str, Any]) -> str:
         out.append("   (no instruction touches this offset)")
         return chr(10).join(out)
     out.append(f"   {len(sites)} hit(s)" + ("  [truncated]" if r.get("truncated") else ""))
+    filters = []
+    if r.get("imm"):
+        filters.append(f"imm {r['imm']}")
+    if r.get("writes_only"):
+        filters.append("writes only")
+    if filters:
+        out[0] += "  [" + ", ".join(filters) + "]"
     for s in sites:
         out.append(f"   {s['addr']}  {s['function'] or '-':<24} {s['text']}")
     return chr(10).join(out)
@@ -1611,6 +1618,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-n", "--limit", type=int, default=60)
     p.add_argument("--op", default=None, help="regex on the mnemonic, e.g. ^MOV")
     p.add_argument("--stack", action="store_true", help="also match [RSP]/[RBP] locals")
+    p.add_argument(
+        "--imm",
+        default=None,
+        help="only instructions whose last operand is this immediate (4, 0x4 or 0..5)",
+    )
+    p.add_argument(
+        "--writes",
+        action="store_true",
+        help="only instructions that write the field (offset in the destination operand)",
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -1623,6 +1640,8 @@ def build_parser() -> argparse.ArgumentParser:
                 "limit": a.limit,
                 "op": a.op,
                 "stack": a.stack,
+                "imm": a.imm,
+                "writes": a.writes,
             },
         ),
     )

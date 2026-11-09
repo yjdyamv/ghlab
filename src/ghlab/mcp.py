@@ -113,6 +113,14 @@ TOOLS: list[dict[str, Any]] = [
                 "func": {"type": "string", "description": "only scan one function's body"},
                 "op": {"type": "string", "description": "regex on the mnemonic, e.g. '^MOVSS$'"},
                 "stack": {"type": "boolean", "description": "also report [RSP/RBP+..] locals"},
+                "imm": {
+                    "type": "string",
+                    "description": "only instructions whose last operand is this immediate: '4', '0x4' or '0..5'",
+                },
+                "writes": {
+                    "type": "boolean",
+                    "description": "only instructions that write the field, not just touch it",
+                },
                 "limit": _LIMIT,
             },
             "required": ["binary", "offset"],

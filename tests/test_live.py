@@ -11,6 +11,7 @@ import tempfile
 import unittest
 
 from ghlab.client import Client, RemoteError
+from ghlab.session import _imm_of
 
 client = Client(os.environ.get("GHLAB_URL"), timeout=600)
 BIN = os.environ.get("GHLAB_TEST_BIN", "notepad.exe")
@@ -697,6 +698,22 @@ class LiveTest(unittest.TestCase):
         wide = client.call("scan", binary=BIN, offset="0x10", limit=3)
         self.assertGreater(wide["scanned"], 100)
         self.assertLessEqual(len(wide["sites"]), 3)
+
+    def test_scan_can_restrict_to_writes_and_immediates(self):
+        """scan --writes/--imm: answer "who stores the constant N at +0xNN" without byte grep."""
+        stacked = client.call("scan", binary=BIN, offset="0x8", stack=True, writes=True, limit=10)
+        self.assertTrue(stacked["writes_only"])
+        self.assertTrue(stacked["sites"])
+        for site in stacked["sites"]:
+            first = site["text"].split(",")[0]
+            self.assertIn("+ 0x8]", first)
+        zeroed = client.call(
+            "scan", binary=BIN, offset="0x8", stack=True, writes=True, imm="0", limit=10
+        )
+        self.assertEqual(zeroed["imm"], "0")
+        self.assertTrue(zeroed["sites"])
+        for site in zeroed["sites"]:
+            self.assertEqual(_imm_of(site["text"]), 0)
 
     def test_scan_range_covers_only_the_named_addresses(self):
         """scan --range: an address window must actually be scanned.

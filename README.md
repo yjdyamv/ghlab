@@ -343,7 +343,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
-| `scan` | `binary, offset` / `range, func, limit, op, stack` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）。实测 650 万条指令 38s |
+| `scan` | `binary, offset` / `range, func, limit, op, stack, imm, writes` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。实测 650 万条指令 38s |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit, format, out` | 调用树 BFS；`--format dot/mermaid/svg` 出图，`--out` 落盘（svg 是自绘的，无需 graphviz；dot 想再加工就交给 graphviz） |
@@ -383,6 +383,8 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 ghlab scan wpscore.dll 0x54 --op '^(MOVSS|MULSS|DIVSS|ADDSS|COMISS)' -n 60
 # 只看某个函数内部，且把栈变量也放进来
 ghlab scan sample.exe 0x18 --func decrypt_string --stack
+# 谁把常量 4 写进结构体的 +0x44？（反编译里看不到立即数写点时用它）
+ghlab scan sample.exe 0x44 --writes --imm 4
 ```
 
 ## 设计要点

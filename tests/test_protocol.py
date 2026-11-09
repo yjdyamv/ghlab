@@ -46,6 +46,15 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54", "nope": 1})
 
+    def test_scan_accepts_the_imm_and_writes_filters(self):
+        spec, params = protocol.validate(
+            {"cmd": "scan", "binary": "a.exe", "offset": "0x44", "imm": "0..5", "writes": True}
+        )
+        self.assertEqual(spec.name, "scan")
+        self.assertIn("imm", spec.optional)
+        self.assertIn("writes", spec.optional)
+        self.assertEqual(params["imm"], "0..5")
+
 
 class EnvelopeTest(unittest.TestCase):
     def test_ok_roundtrip(self):
