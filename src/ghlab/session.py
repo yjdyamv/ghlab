@@ -768,6 +768,155 @@ def load_strings(e, refresh: bool = False) -> dict[str, Any]:
     }
 
 
+_ASSERT_WORDS = (
+    "failure",
+    "failed",
+    "assert",
+    "invalid",
+    "not supported",
+    "unsupported",
+    "unexpected",
+    "should ",
+    "error",
+)
+_ASSERT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_:<>~@$]{2,80}::[A-Za-z_~][A-Za-z0-9_~]{1,60}")
+
+
+def _assert_name(text: str) -> str | None:
+    """`Foo::bar : failure` -> `Foo::bar`.
+
+    Assertions are the cheapest names in a stripped binary: plain C strings,
+    one per call site, and they spell out the method that wrote them.
+    """
+    low = text.lower()
+    if "::" not in text or not any(word in low for word in _ASSERT_WORDS):
+        return None
+    m = _ASSERT_NAME_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _assert_strings(program, min_len: int = 12, budget: int = 64 << 20):
+    """Yield `(address, text)` for printable runs that look like assertions.
+
+    Reads non-executable blocks directly instead of trusting the string typing:
+    only a fraction of the literals get typed, and the untyped ones are exactly
+    the interesting ones.
+    """
+    address_space = program.getAddressFactory().getDefaultAddressSpace()
+    printable = re.compile(b"[ -~]{%d,200}" % min_len)
+    used = 0
+    for blk in program.getMemory().getBlocks():
+        if not blk.isInitialized() or blk.isExecute():
+            continue
+        size = int(blk.getSize())
+        if size <= 0:
+            continue
+        base = int(blk.getStart().getOffset())
+        chunk = 1 << 20
+        offset = 0
+        while offset < size and used < budget:
+            take = min(chunk, size - offset)
+            try:
+                data = _read_memory(program, blk.getStart().add(offset), take)
+            except Exception:  # noqa: BLE001 - unreadable blocks are not fatal
+                offset += take
+                continue
+            used += take
+            for m in printable.finditer(data):
+                text = m.group().decode("latin-1")
+                yield address_space.getAddress(base + offset + m.start()), text
+            offset += take
+
+
+def _names_file(binary: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _ghlab_dir() / "names" / f"{slug}.json"
+
+
+def build_names(entry, min_len: int = 12, budget: int = 64 << 20) -> dict[str, dict[str, Any]]:
+    """Map recovered `Class::Method` names to the functions that assert on them."""
+    program = entry["program"]
+    refman = program.getReferenceManager()
+    fm = program.getFunctionManager()
+    rows: dict[str, dict[str, Any]] = {}
+    for addr, text in _assert_strings(program, min_len=min_len, budget=budget):
+        name = _assert_name(text)
+        if name is None:
+            continue
+        row = rows.setdefault(name, {"text": text[:160], "functions": [], "addrs": [], "sites": 0})
+        row["sites"] += 1
+        for ref in refman.getReferencesTo(addr):
+            holder = fm.getFunctionContaining(ref.getFromAddress())
+            if holder is None:
+                continue
+            holder_name = str(holder.getName())
+            if holder_name in row["functions"]:
+                continue
+            row["functions"].append(holder_name)
+            row["addrs"].append(str(holder.getEntryPoint()))
+    return rows
+
+
+def load_names(entry, refresh: bool = False, min_len: int = 12) -> dict[str, Any]:
+    """Name table of one program, cached on disk per (md5, modification)."""
+    started = time.time()
+    program = entry["program"]
+    meta = _index_meta(program)
+    path = _names_file(str(entry["binary"]))
+    if not refresh and path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cached_meta = raw.get("meta") or {}
+            same = cached_meta.get("md5") == meta["md5"] and cached_meta.get("mods") == meta["mods"]
+        except (OSError, ValueError):
+            same = False
+        if same:
+            return {
+                "names": raw.get("names") or {},
+                "meta": raw["meta"],
+                "cached": True,
+                "path": str(path),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+    names = build_names(entry, min_len=min_len)
+    payload = {
+        "meta": {**meta, "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "names": len(names)},
+        "names": names,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8", newline=chr(10))
+    return {
+        "names": names,
+        "meta": payload["meta"],
+        "cached": False,
+        "path": str(path),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def cmd_names(a: dict[str, Any]) -> dict[str, Any]:
+    """Recover method names from assertion strings."""
+    entry = _entry(a["binary"])
+    table = load_names(entry, refresh=bool(a.get("refresh")), min_len=int(a.get("min_len", 12)))
+    query = a.get("query") or ""
+    pattern = re.compile(query, re.I) if query else None
+    rows = []
+    for name, row in sorted(table["names"].items()):
+        if pattern is not None and not pattern.search(name):
+            continue
+        rows.append({"name": name, **row})
+    limit = int(a.get("limit", 200))
+    return {
+        "binary": a["binary"],
+        "count": len(table["names"]),
+        "matched": len(rows),
+        "names": rows[:limit],
+        "cached": table["cached"],
+        "built_at": table["meta"].get("built_at"),
+        "elapsed_ms": table["elapsed_ms"],
+    }
+
+
 def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
     entry = _entry(a["binary"])
     p = entry["program"]
@@ -4278,6 +4427,7 @@ HANDLERS = {
     "functions": cmd_functions,
     "decompile": cmd_decompile,
     "strings": cmd_strings,
+    "names": cmd_names,
     "scan": cmd_scan,
     "imports": cmd_imports,
     "xrefs": cmd_xrefs,

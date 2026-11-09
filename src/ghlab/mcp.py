@@ -58,6 +58,22 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_names",
+        "description": (
+            "Recover method names from assertion strings (Class::Method : failure). Cheap way "
+            "to turn 70k anonymous functions into a named map; filter with a regex."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "query": {"type": "string", "description": "regex on the recovered name"},
+                "limit": _LIMIT,
+            },
+            "required": ["binary"],
+        },
+    },
+    {
         "name": "ghlab_imports",
         "description": (
             "Drill into imports: for each API, how many distinct functions call it, the biggest "
@@ -347,6 +363,7 @@ TOOLS: list[dict[str, Any]] = [
 _COMMANDS = {
     "ghlab_digest": "digest",
     "ghlab_find": "find",
+    "ghlab_names": "names",
     "ghlab_imports": "imports",
     "ghlab_scan": "scan",
     "ghlab_decompile": "decompile",

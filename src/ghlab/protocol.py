@@ -94,6 +94,12 @@ _SPECS = [
         "search string data (refs: which functions use it)",
     ),
     Spec(
+        "names",
+        ("binary",),
+        ("query", "limit", "min_len", "refresh"),
+        "method names recovered from assertion strings (Class::Method : failure)",
+    ),
+    Spec(
         "scan",
         ("binary", "offset"),
         ("range", "func", "limit", "op", "stack"),

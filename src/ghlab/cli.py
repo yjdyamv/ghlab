@@ -116,6 +116,24 @@ def fmt_imports(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_names(r: dict[str, Any]) -> str:
+    state = "cached" if r.get("cached") else "built"
+    out = [
+        f"== {r['binary']} : {r['count']} name(s) from assertion strings "
+        f"({state}, {r['elapsed_ms']}ms)"
+    ]
+    rows = r.get("names") or []
+    if not rows:
+        out.append("   (no assertion string matched)")
+        return chr(10).join(out)
+    if r["matched"] > len(rows):
+        out[0] += f"  [showing {len(rows)} of {r['matched']}]"
+    for row in rows:
+        fns = ", ".join(row["functions"][:3]) or "?"
+        out.append(f"  {row['name']:<48} {fns}")
+    return chr(10).join(out)
+
+
 def fmt_scan(r: dict[str, Any]) -> str:
     out = [
         f"== {r['binary']} : {r['scanned']} instruction(s) scanned for {r['pattern']} "
@@ -678,6 +696,7 @@ FORMATTERS = {
     "strings": fmt_strings,
     "scan": fmt_scan,
     "imports": fmt_imports,
+    "names": fmt_names,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
     "digest": fmt_digest,
@@ -1090,6 +1109,26 @@ def build_parser() -> argparse.ArgumentParser:
                 "query": a.query,
                 "group": a.group,
                 "limit": a.limit,
+            },
+        )
+    )
+
+    p = sub.add_parser("names", parents=[common], help="method names from assertion strings")
+    p.add_argument("binary")
+    p.add_argument("-q", "--query", help="regex on the recovered name")
+    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
+    p.add_argument("--min-len", type=int, default=12, help="shortest printable run to consider")
+    p.add_argument("--refresh", action="store_true", help="rebuild the cached table")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "names",
+            {
+                "binary": a.binary,
+                "query": a.query,
+                "limit": a.limit,
+                "min_len": a.min_len,
+                "refresh": a.refresh,
             },
         )
     )
