@@ -1,5 +1,7 @@
 """Tests for the graph renderers (pure Python, no JVM) and the focus binary."""
 
+import contextlib
+import io
 import os
 import tempfile
 import unittest
@@ -76,9 +78,12 @@ class FocusTest(unittest.TestCase):
         self.assertEqual(cli.read_focus(), "notepad.exe")
 
     def test_use_command_persists_and_reports(self):
-        code = cli.main(["use", "sample.exe"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.main(["use", "sample.exe"])
         self.assertEqual(code, 0)
         self.assertEqual(cli.read_focus(), "sample.exe")
+        self.assertIn("focus = sample.exe", out.getvalue())
 
     def test_dash_without_focus_explains_itself(self):
         code = cli.main(["digest", "-"])

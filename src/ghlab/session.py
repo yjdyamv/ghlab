@@ -745,6 +745,12 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
         start, end = space.getAddress(lo), space.getAddress(hi)
     if a.get("func"):
         fn = _function(_entry(binary), str(a["func"]))
+        if fn is None:
+            # A miss used to surface as "'NoneType' object has no attribute
+            # 'getBody'", which reads like a bug in scan rather than in the name.
+            wanted = str(a["func"])
+            hint = _function_suggestions(p, wanted, limit=3)
+            raise KeyError(f"no function at or containing {wanted!r}" + hint)
         start, end = fn.getBody().getMinAddress(), fn.getBody().getMaxAddress()
     began = time.monotonic()
     imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None

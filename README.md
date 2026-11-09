@@ -432,11 +432,19 @@ tests/          test_protocol.py, test_server_client.py（stub session，真 HTT
 ## 开发：ruff + ty
 
 ```bash
-uv tool install ruff ty        # 一次性
-ruff check . && ruff format --check .   # 或者直接 ruff format .
+uv tool install ruff ty                  # 一次性
+ruff check . && ruff format --check .    # 或者直接 ruff format .
 ty check                                 # 类型检查
-python -m unittest discover -s tests -q  # 105 个测试
+
+python -m unittest discover -s tests -q  # 单元测试：254 个，约 7 秒，不需要 daemon
+GHLAB_LIVE=1 GHLAB_URL=http://127.0.0.1:8765/   GHLAB_TEST_BIN=notepad.exe   python -m unittest discover -s tests   # 加上端到端测试（要起 daemon，几十秒到几分钟）
 ```
+
+**为什么分成两档**：端到端测试跑的是真反编译器。同一个文件对上 `wpscore.dll`（71304 个函数）
+要几分钟——每一次 `scan` 都是全库指令遍历，每一次失败的 `_function` 都要扫符号表。默认跑法
+必须是几秒钟，否则没人会在改一行代码后跑它。所以 `tests/test_live.py` 里的类全部挂在
+`GHLAB_LIVE` 下：不设这个环境变量时它们**整类跳过**（`skipped` 计数会显示），设了才真跑。
+实测默认档从 300 秒降到 7 秒，`GHLAB_LIVE=1` 档仍是同一批测试。
 
 配置在海 `pyproject.toml` 的 `[tool.ruff]` / `[tool.ty.*]`。两条规则值得说明：
 

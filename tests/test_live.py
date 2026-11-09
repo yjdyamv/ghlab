@@ -24,8 +24,13 @@ def _alive():
         return False
 
 
-LIVE = _alive()
-reason = f"no daemon on {client.url} or {BIN} not imported"
+# Live tests hit a real daemon: one scan over a 34 MB DLL is half a minute, and
+# the whole file against wpscore.dll ran for minutes. So they are opt-in -- a
+# plain `unittest discover` has to stay a few seconds or nobody will run it.
+LIVE = bool(os.environ.get("GHLAB_LIVE")) and _alive()
+reason = (
+    f"set GHLAB_LIVE=1 with a daemon on {client.url} holding {BIN} (import it with `ghlab import`)"
+)
 
 
 @unittest.skipUnless(LIVE, reason)
@@ -89,6 +94,7 @@ class LiveDrilldownTest(unittest.TestCase):
         )
 
 
+@unittest.skipUnless(LIVE, reason)
 class LiveTest(unittest.TestCase):
     def test_ping_reports_project(self):
         r = client.call("ping")
@@ -714,6 +720,17 @@ class LiveTest(unittest.TestCase):
         self.assertTrue(zeroed["sites"])
         for site in zeroed["sites"]:
             self.assertEqual(_imm_of(site["text"]), 0)
+
+    def test_scan_names_the_problem_when_the_function_is_missing(self):
+        """scan --func with a bad name: say so instead of blowing up on None.
+
+        Regression: an unresolved name reached `fn.getBody()` and surfaced as
+        "'NoneType' object has no attribute 'getBody'", which reads like a bug
+        in scan rather than in the argument.
+        """
+        with self.assertRaises(RemoteError) as caught:
+            client.call("scan", binary=BIN, offset="0x8", func="NoSuchFunctionAtIndex")
+        self.assertIn("no function", str(caught.exception))
 
     def test_scan_range_covers_only_the_named_addresses(self):
         """scan --range: an address window must actually be scanned.
