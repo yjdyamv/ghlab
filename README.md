@@ -236,13 +236,46 @@ otepad.exe, ...
 用单链（single linkage）是故意的——中间夹一个 loader stub 也应该把两个样本拉到一起。
 `--min-score` 调松紧，短于 4 字符的字符串（`%s`、填充）不参与展示。
 
+## 多项目路由（一份 MCP 配置，多个 Ghidra 库）
+
+一台机器常有好几个库（notepad 的玩具库、WPS 的反汇编库……）。以前要复制多份 MCP 条目、
+各配一个 URL；现在一个条目就够，`ghlab` 按工具参数里的 `binary` 决定转发给哪个 daemon：
+
+```bash
+ghlab setup --add-project wps --add-port 8766     --project-dir ~/re/wps/proj --project-name wps
+ghlab setup --default-project ghlab          # 不带 binary 的命令打到哪个库
+ghlab projects                                # 每个库的状态 + 里面有什么
+```
+
+```
+# 2 project(s), default = ghlab
+  project    state  binaries  url / dir
+  wps        up        1  http://127.0.0.1:8766  (C:/Users/admin/re/wps/proj)
+      wpscore.dll
+ *ghlab      up        4  http://127.0.0.1:8765  (C:/Users/admin/re/proj)
+      notepad.exe
+```
+
+规则（都在 `src/ghlab/router.py`，18 个单测覆盖，全部不需要 socket）：
+
+1. `project=<名字>` 显式指定，优先级最高（参数不会转给 daemon）。
+2. 有 `binary`（或 `diff` 的 `a`/`b`）：问每个 daemon 有哪些程序，转发给**拥有它的那个**；
+   `-` 表示焦点程序，同样先解析归属。查不到时报错会列出每个库都有什么。
+3. 两个 daemon 都有同名程序：报错要求加 `project=`，不猜。
+4. `diff` 的两个程序必须同库，否则直接告诉你要先导进一个库。
+5. 没有任何 `binary` 的命令（`journal`/`audit`/`import`…）走默认库；`binaries` 与
+   `overview` **跨库聚合**，每行带 `project` 字段——"我手头有什么"本来就该一次问完。
+6. 目标库的 daemon 没起且开了 `GHLAB_AUTOSTART=1`：先把它启动（服务名会说清是哪个库），再重试一次；启动失败只试一次，不循环。
+
+MCP 侧多了一个 `ghlab_projects` 工具（22 个），agent 可以先看"哪个库有这个文件"再动手。
+
 ## 接 MCP（给别的 agent 用）
 
 ```bash
 ghlab mcp          # stdio MCP server，转调本机 daemon
 ```
 
-只暴露 21 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+只暴露 22 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
 
 | 工具 | 干什么 |
 |---|---|
@@ -258,6 +291,7 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_notes` / `ghlab_audit` / `ghlab_overview` | 读回历史结论 / 全项目复算断言 / 项目总览 |
 | `ghlab_decrypt` | 破小块密文（xor/add/rot/utf16/base64） |
 | `ghlab_map` / `ghlab_types` / `ghlab_pdb` | 批量扫函数 / 批量写类型 / 吃 PDB 符号 |
+| `ghlab_projects` | 有哪些库、哪些 daemon 在线、每个库装了什么（多项目路由的入口） |
 
 还有资源：`ghlab://programs`（名字 + md5 + 架构 + 函数数）、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
 

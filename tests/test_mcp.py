@@ -56,7 +56,7 @@ class ProtocolTest(unittest.TestCase):
 
     def test_tools_are_few_and_well_formed(self):
         tools = mcp.TOOLS
-        self.assertLessEqual(len(tools), 21, "MCP facade should stay small")
+        self.assertLessEqual(len(tools), 22, "MCP facade should stay small")
         names = [t["name"] for t in tools]
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:
@@ -74,6 +74,9 @@ class ProtocolTest(unittest.TestCase):
         for tool in mcp.TOOLS:
             self.assertIn(tool["name"], mcp._COMMANDS, tool["name"])
             cmd = mcp._COMMANDS[tool["name"]]
+            # `projects` is answered by the router itself, not by a daemon.
+            if cmd == "projects":
+                continue
             self.assertIn(cmd, protocol.COMMAND_NAMES, tool["name"])
             declared = set(protocol.SPECS[cmd].required) | set(protocol.SPECS[cmd].optional)
             for key in tool["inputSchema"]["properties"]:

@@ -171,3 +171,31 @@ class ConfigIsolationTest(unittest.TestCase):
             cli.main(["setup", "--ghidra", str(ghidra), "--project-dir", tmp])
         after = real.read_text(encoding="utf-8") if real.exists() else None
         self.assertEqual(before, after, "setup escaped GHLAB_CONFIG and wrote the real config")
+
+
+class McpSnippetTest(unittest.TestCase):
+    """The printed snippet must keep routing working: a pinned GHLAB_URL would not."""
+
+    def snippet(self, cfg: dict):
+        return cli._mcp_snippet(cfg)
+
+    def test_one_project_pins_the_url(self):
+        text = self.snippet({"project_dir": "/p", "project_name": "one", "port": 8765})
+        self.assertIn("GHLAB_URL", text)
+        self.assertNotIn("GHLAB_CONFIG", text)
+
+    def test_many_projects_pass_the_config_instead(self):
+        cfg = {
+            "project_dir": "/p",
+            "project_name": "one",
+            "port": 8765,
+            "default": "one",
+            "projects": {
+                "one": {"url": "http://127.0.0.1:8765", "project_dir": "/p", "project_name": "one"},
+                "two": {"url": "http://127.0.0.1:8766", "project_dir": "/q", "project_name": "two"},
+            },
+        }
+        text = self.snippet(cfg)
+        self.assertIn("GHLAB_CONFIG", text)
+        self.assertNotIn('"GHLAB_URL"', text, "a pinned URL would disable routing")
+        self.assertIn("2 project(s)", text)

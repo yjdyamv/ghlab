@@ -1,9 +1,11 @@
 """Tests for the graph renderers (pure Python, no JVM) and the focus binary."""
 
+import os
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from unittest import mock
 
 from ghlab import cli, protocol, render
 
@@ -58,15 +60,16 @@ class RenderTest(unittest.TestCase):
 class FocusTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.old = cli.FOCUS_FILE
-        cli.FOCUS_FILE = Path(self.tmp.name) / "focus"
+        self.old = Path(self.tmp.name) / "focus"
+        self.env = mock.patch.dict(os.environ, {"GHLAB_FOCUS": str(self.old)})
+        self.env.start()
 
     def tearDown(self):
-        cli.FOCUS_FILE = self.old
+        self.env.stop()
         self.tmp.cleanup()
 
     def test_no_focus_is_none(self):
-        self.assertIsNone(cli.read_focus())
+        self.assertFalse(cli.read_focus(), "no focus reads as empty")
 
     def test_write_then_read(self):
         cli.write_focus("notepad.exe")

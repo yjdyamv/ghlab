@@ -17,41 +17,24 @@ from typing import Any, NoReturn
 
 from . import __version__, session
 from .client import Client, RemoteError
+from .config import (  # noqa: F401 - re-exported for callers and tests
+    config_path,
+    default_project,
+    focus_path,
+    ghidra_dir,
+    load_config,
+    projects,
+    read_focus,
+    register_project,
+    remove_project,
+    save_config,
+    write_focus,
+)
 from .protocol import DEFAULT_HOST, DEFAULT_PORT
+from .router import RouteError, from_config
 
 REPO = Path(__file__).resolve().parents[2]
 LOGDIR = Path.home() / "re" / "logs"
-
-
-def config_path() -> Path:
-    """Resolved on every call so tests (and users) can point GHLAB_CONFIG elsewhere."""
-    return Path(os.environ.get("GHLAB_CONFIG") or (Path.home() / ".ghlab" / "config.json"))
-
-
-def load_config() -> dict[str, Any]:
-    """Machine-local setup written by `ghlab setup`, so no env vars are needed.
-
-    Every value here has a CLI flag or an environment variable that wins over it; the
-    file exists so a fresh shell (or an agent's MCP config) just works.
-    """
-    try:
-        data = json.loads(config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def save_config(data: dict[str, Any]) -> Path:
-    path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, indent=2, ensure_ascii=False) + chr(10)
-    path.write_text(text, encoding="utf-8", newline=chr(10))
-    return path
-
-
-def ghidra_dir() -> str:
-    """GHIDRA_INSTALL_DIR from the environment, else from the setup file."""
-    return os.environ.get("GHIDRA_INSTALL_DIR") or str(load_config().get("ghidra") or "")
 
 
 def _print_json(obj: Any) -> None:
@@ -1036,20 +1019,25 @@ def cmd_doctor(args) -> int:
 def _mcp_snippet(cfg: dict[str, Any]) -> str:
     """The two config shapes an agent client needs, filled in from this machine."""
     port = int(cfg.get("port") or DEFAULT_PORT)
-    payload = {
+    known = projects(cfg)
+    env: dict[str, str] = {"GHLAB_TIMEOUT": "900", "GHLAB_AUTOSTART": "1"}
+    if len(known) > 1:
+        # More than one project: the router needs the registry, and a pinned
+        # GHLAB_URL would collapse it back to a single daemon.
+        env["GHLAB_CONFIG"] = str(config_path())
+    else:
+        env["GHLAB_URL"] = f"http://{cfg.get('host') or DEFAULT_HOST}:{port}"
+        env["GHLAB_PROJECT_DIR"] = str(cfg.get("project_dir") or "")
+        env["GHLAB_PROJECT_NAME"] = str(cfg.get("project_name") or "ghlab")
+        env["GHLAB_PORT"] = str(port)
+    payload: dict[str, Any] = {
         "command": sys.executable,
         "args": ["-m", "ghlab.mcp"],
-        "env": {
-            "GHLAB_URL": f"http://{cfg.get('host') or DEFAULT_HOST}:{port}",
-            "GHLAB_TIMEOUT": "900",
-            "GHLAB_AUTOSTART": "1",
-            "GHLAB_PROJECT_DIR": str(cfg.get("project_dir") or ""),
-            "GHLAB_PROJECT_NAME": str(cfg.get("project_name") or "ghlab"),
-            "GHLAB_PORT": str(port),
-        },
+        "env": env,
     }
     return chr(10).join(
         [
+            f"config: {config_path()} ({len(known)} project(s): {', '.join(known)})",
             "pi  (~/.pi/agent/mcp.json):",
             json.dumps({"mcpServers": {"ghlab": {**payload, "exposure": "deferred"}}}, indent=2),
             "",
@@ -1078,14 +1066,47 @@ def cmd_setup(args) -> int:
             return 2
         cfg["ghidra"] = str(candidate)
         changed = True
-    for key, value in (
-        ("project_dir", args.cfg_project_dir),
-        ("project_name", args.cfg_project_name),
-        ("port", args.cfg_port),
-    ):
-        if value:
-            cfg[key] = value
-            changed = True
+    if not args.add_project:
+        # --project-dir/--port describe the default project; when adding a project
+        # they describe the one being added, so they must not touch the legacy keys.
+        for key, value in (
+            ("project_dir", args.cfg_project_dir),
+            ("project_name", args.cfg_project_name),
+            ("port", args.cfg_port),
+        ):
+            if value:
+                cfg[key] = value
+                changed = True
+    if args.add_project:
+        port = args.cfg_port or (args.add_port or 0)
+        if not port:
+            print("ghlab: --add-project needs --port", file=sys.stderr)
+            return 2
+        url = f"http://{getattr(args, 'host', None) or DEFAULT_HOST}:{port}"
+        project_dir = args.cfg_project_dir or str(Path.home() / "re" / "proj")
+        project_name = args.cfg_project_name or args.add_project
+        register_project(
+            args.add_project,
+            url=url,
+            project_dir=project_dir,
+            project_name=project_name,
+            make_default=bool(args.default_project),
+        )
+        cfg = load_config()
+        changed = True
+        print(f"registered project {args.add_project} -> {url} ({project_name})")
+    if args.remove_project:
+        if not remove_project(args.remove_project):
+            print(f"ghlab: no such project {args.remove_project!r}", file=sys.stderr)
+            return 2
+        cfg = load_config()
+        changed = True
+        print(f"removed project {args.remove_project}")
+    if args.default_project:
+        cfg["default"] = args.default_project
+        save_config(cfg)
+        changed = True
+        print(f"default project = {args.default_project}")
     if changed:
         path = save_config(cfg)
         print(f"wrote {path}")
@@ -1103,6 +1124,58 @@ def cmd_setup(args) -> int:
         print("next        ghlab start && ghlab doctor")
         print("")
         print(_mcp_snippet(cfg))
+    return 0
+
+
+def _autostart_enabled() -> bool:
+    return os.environ.get("GHLAB_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _start_target(target: Any) -> bool:
+    """Start a daemon for one configured project (used by --project / autostart)."""
+    port = int(str(target.url).rsplit(":", 1)[-1].strip("/") or DEFAULT_PORT)
+    args = argparse.Namespace(
+        host=str(target.url).split("//")[-1].rsplit(":", 1)[0] or DEFAULT_HOST,
+        port=port,
+        project_dir=target.project_dir or str(Path.home() / "re" / "proj"),
+        project_name=target.project_name or target.name,
+        wait=400,
+    )
+    return cmd_start(args) == 0
+
+
+def fmt_projects(r: dict[str, Any]) -> str:
+    rows = r.get("projects") or []
+    if not rows:
+        return "no projects configured; run `ghlab setup --ghidra DIR --add-project NAME --port N`"
+    out = [f"# {len(rows)} project(s), default = {r.get('default')}"]
+    out.append(f"  {'project':<10} {'state':<6} {'binaries':>4}  url / dir")
+    for row in rows:
+        mark = "*" if row.get("default") else " "
+        state = "up" if row.get("alive") else "down"
+        count = str(len(row.get("binaries") or []))
+        detail = row.get("url") or ""
+        if row.get("project_dir"):
+            detail += f"  ({row['project_dir']})"
+        out.append(f" {mark}{row['project']:<10} {state:<6} {count:>4}  {detail}")
+        for name in (row.get("binaries") or [])[:6]:
+            out.append(f"      {name}")
+        if len(row.get("binaries") or []) > 6:
+            out.append(f"      ... +{len(row['binaries']) - 6} more")
+    return chr(10).join(out)
+
+
+def cmd_projects(args) -> int:
+    router = from_config(start=_start_target, autostart=_autostart_enabled())
+    try:
+        payload = router.describe(refresh=args.refresh)
+    except RouteError as ex:
+        print(f"ghlab: {ex}", file=sys.stderr)
+        return 2
+    if args.json:
+        _print_json(payload)
+    else:
+        print(fmt_projects(payload))
     return 0
 
 
@@ -1360,8 +1433,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project-dir", dest="cfg_project_dir", help="where the Ghidra project lives")
     p.add_argument("--project-name", dest="cfg_project_name", help="Ghidra project name")
     p.add_argument("--port", type=int, dest="cfg_port", help="daemon port")
+    p.add_argument("--add-project", metavar="NAME", help="register another project (needs --port)")
+    p.add_argument("--add-port", type=int, help="port of the project being added")
+    p.add_argument("--remove-project", metavar="NAME", help="forget a registered project")
+    p.add_argument("--default-project", metavar="NAME", help="which project bare commands use")
     p.add_argument("--print-mcp", action="store_true", help="print MCP config snippets and exit")
     p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser(
+        "projects", parents=[common], help="list configured projects, their daemons and binaries"
+    )
+    p.add_argument("--refresh", action="store_true", help="drop the cached binary lists")
+    p.set_defaults(func=cmd_projects, json=False, refresh=False)
 
     p = sub.add_parser(
         "doctor",
@@ -2033,22 +2116,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     return ap
-
-
-FOCUS_FILE = Path.home() / ".ghlab" / "focus"
-
-
-def read_focus() -> str | None:
-    try:
-        name = FOCUS_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    return name or None
-
-
-def write_focus(binary: str) -> None:
-    FOCUS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    FOCUS_FILE.write_text(binary + chr(10), encoding="utf-8", newline=chr(10))
 
 
 def cmd_use(args) -> int:

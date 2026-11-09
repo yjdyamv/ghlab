@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from . import __version__
-from .client import Client, RemoteError
+from . import router as routing
+from .client import RemoteError
 
 PROTOCOL_VERSION = "2025-06-18"
 
@@ -351,6 +352,18 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_projects",
+        "description": (
+            "List the configured Ghidra projects, which daemons are up, and the binaries each "
+            "one owns. Use it to find which project holds a binary before naming it; every other "
+            "tool accepts project=<name> when a binary name exists in more than one project."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"refresh": {"type": "boolean", "description": "drop cached lists"}},
+        },
+    },
+    {
         "name": "ghlab_report",
         "description": "Markdown report for one binary: digest summary, hubs, size buckets and findings.",
         "inputSchema": {
@@ -409,6 +422,7 @@ _COMMANDS = {
     "ghlab_map": "map",
     "ghlab_types": "types",
     "ghlab_pdb": "pdb",
+    "ghlab_projects": "projects",
     "ghlab_decrypt": "decrypt",
     "ghlab_report": "report",
     "ghlab_notes": "notes",
@@ -434,8 +448,8 @@ def _autostart_enabled() -> bool:
     return os.environ.get("GHLAB_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _start_daemon() -> bool:
-    """Bring the daemon up on first use, so an agent needs no shell step.
+def _start_target(target: Any) -> bool:
+    """Bring one project's daemon up on first use, so an agent needs no shell step.
 
     Called only after a call has already failed: starting eagerly would block the
     MCP `initialize` handshake for the 30-45 s of a cold JVM.
@@ -444,19 +458,24 @@ def _start_daemon() -> bool:
 
     from . import cli
 
+    tail = str(target.url).rsplit(":", 1)[-1].strip("/")
     args = Namespace(
-        host=os.environ.get("GHLAB_HOST") or "127.0.0.1",
-        port=int(os.environ.get("GHLAB_PORT") or 8765),
-        project_dir=os.environ.get("GHLAB_PROJECT_DIR") or str(Path.home() / "re" / "proj"),
-        project_name=os.environ.get("GHLAB_PROJECT_NAME") or "ghlab",
+        host=str(target.url).split("//")[-1].rsplit(":", 1)[0] or "127.0.0.1",
+        port=int(tail) if tail.isdigit() else 8765,
+        project_dir=target.project_dir or str(Path.home() / "re" / "proj"),
+        project_name=target.project_name or target.name,
         wait=400,
     )
-    sys.stderr.write("ghlab.mcp: daemon is down, starting it (once per session)\n")
+    sys.stderr.write(
+        f"ghlab.mcp: {target.name} daemon is down, starting it (once per session){chr(10)}"
+    )
     sys.stderr.flush()
     try:
         return cli.cmd_start(args) == 0
     except Exception as ex:  # noqa: BLE001 - a failed autostart must not kill the MCP server
-        sys.stderr.write(f"ghlab.mcp: autostart failed: {type(ex).__name__}: {ex}\n")
+        sys.stderr.write(
+            f"ghlab.mcp: autostart of {target.name} failed: {type(ex).__name__}: {ex}{chr(10)}"
+        )
         sys.stderr.flush()
         return False
 
@@ -733,21 +752,12 @@ def serve(
             if reconfigure is not None:
                 reconfigure(encoding="utf-8")
     if call is None:
-        client = Client()
-
-        def _call(cmd: str, **params: Any) -> Any:
-            try:
-                return client.call(cmd, **params)
-            except (RemoteError, OSError):
-                # A cold session should just work: start the daemon once, then retry.
-                if not _autostart_enabled() or client.alive() or not _start_daemon():
-                    raise
-                return client.call(cmd, **params)
-
-        call_fn: Callable[..., Any] = _call
+        # One MCP entry serves every configured project: the router picks the
+        # daemon from the binary a tool already names, and starts it if it is down.
+        router = routing.from_config(start=_start_target, autostart=_autostart_enabled())
+        call_fn: Callable[..., Any] = router.call
     else:
         call_fn = call
-
     for line in stdin:
         line = line.strip()
         if not line:

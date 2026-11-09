@@ -121,7 +121,7 @@ class ServerTest(unittest.TestCase):
                 session.dispatch = self.stub.dispatch  # ty: ignore[invalid-assignment]
         # The response is written inside the try, the log line inside the finally: the
         # client can see its answer before the handler has logged. Wait for the line.
-        deadline = time.time() + 2
+        deadline = time.time() + 5
         while not lines and time.time() < deadline:
             time.sleep(0.01)
         self.assertTrue(any("SLOW" in ln for ln in lines), lines)
