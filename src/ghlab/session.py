@@ -691,38 +691,96 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _strings_file(binary: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _ghlab_dir() / "strings" / f"{slug}.json"
+
+
+def _string_text(d) -> str:
+    try:
+        return str(d.getValue())[:400]
+    except Exception:  # noqa: BLE001 - a jpype call can raise anything
+        return str(d.getDefaultValueRepresentation())[:400]
+
+
+def _iter_string_data(program):
+    """Yield defined data items whose type reads as a string."""
+    it = program.getListing().getDefinedData(True)
+    while it.hasNext():
+        d = it.next()
+        try:
+            tname = str(d.getDataType().getName()).lower()
+        except Exception:  # noqa: BLE001 - skip data whose type cannot be read
+            continue
+        if any(k in tname for k in ("string", "unicode", "terminated", "char")):
+            yield d
+
+
+def load_strings(e, refresh: bool = False) -> dict[str, Any]:
+    """Whole string table of a program, cached on disk per (md5, modification).
+
+    Building it walks every defined data item (461k on a 34 MB DLL, ~28k of them
+    strings), which cost ~2.2 s on every `strings` call. Rows are `[addr, value]`.
+    """
+    started = time.time()
+    program = e["program"]
+    meta = _index_meta(program)
+    path = _strings_file(str(e["binary"]))
+    if not refresh and path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cached_meta = raw.get("meta") or {}
+            same = cached_meta.get("md5") == meta["md5"] and cached_meta.get("mods") == meta["mods"]
+        except (OSError, ValueError):
+            same = False
+        if same:
+            return {
+                "strings": raw.get("strings") or [],
+                "meta": raw["meta"],
+                "cached": True,
+                "path": str(path),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+    rows = [[str(d.getAddress()), _string_text(d)] for d in _iter_string_data(program)]
+    payload = {
+        "meta": {
+            **meta,
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "strings": len(rows),
+        },
+        "strings": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8", newline=chr(10))
+    return {
+        "strings": rows,
+        "meta": payload["meta"],
+        "cached": False,
+        "path": str(path),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
 def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
-    p = _entry(a["binary"])["program"]
+    entry = _entry(a["binary"])
+    p = entry["program"]
     q = (a.get("query") or "").lower()
     limit = int(a.get("limit", 200))
     skip = int(a.get("offset", 0))
     want_refs = bool(a.get("refs"))
+    table = load_strings(entry, refresh=bool(a.get("refresh")))
     out = []
     by_function: Counter[str] = Counter()
     seen = 0
-    scanned = 0
-    it = p.getListing().getDefinedData(True)
-    while it.hasNext():
-        d = it.next()
-        scanned += 1
-        try:
-            tname = str(d.getDataType().getName()).lower()
-            if not any(k in tname for k in ("string", "unicode", "terminated", "char")):
-                continue
-            try:
-                val = str(d.getValue())
-            except Exception:  # noqa: BLE001 - a jpype call can raise anything
-                val = str(d.getDefaultValueRepresentation())
-        except Exception:  # noqa: BLE001 - skip data whose type has no value
-            continue
-        if val in ("", "None") or (q and q not in val.lower()):
+    for addr, val in table["strings"]:
+        if not val or val == "None" or (q and q not in val.lower()):
             continue
         seen += 1
         if seen <= skip:
             continue
-        row = {"addr": str(d.getAddress()), "value": val[:400]}
+        row = {"addr": addr, "value": val}
         if want_refs:
-            row["functions"] = _string_refs(p, d.getAddress())
+            row["functions"] = _string_refs(p, p.getAddressFactory().getAddress(addr))
             for fn in row["functions"]:
                 by_function[fn["function"]] += 1
         out.append(row)
@@ -731,7 +789,8 @@ def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
     result = {
         "binary": a["binary"],
         "matched": seen,
-        "defined_data_scanned": scanned,
+        "defined_data_scanned": table["meta"].get("strings", 0),
+        "cached": table["cached"],
         "strings": out,
     }
     if want_refs:

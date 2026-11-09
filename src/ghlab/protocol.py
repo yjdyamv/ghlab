@@ -90,7 +90,7 @@ _SPECS = [
     Spec(
         "strings",
         ("binary",),
-        ("query", "limit", "offset", "refs"),
+        ("query", "limit", "offset", "refs", "refresh"),
         "search string data (refs: which functions use it)",
     ),
     Spec(

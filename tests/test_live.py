@@ -75,6 +75,16 @@ class LiveDrilldownTest(unittest.TestCase):
         self.assertNotIn("functions", r["strings"][0])
         self.assertNotIn("by_function", r)
 
+    def test_string_table_is_cached_and_rebuildable(self):
+        first = self.client.call("strings", binary=BIN, query="txt", limit=5)
+        self.client.call("strings", binary=BIN, query="txt", limit=5)
+        warm = self.client.call("strings", binary=BIN, query="txt", limit=5)
+        self.assertTrue(warm["cached"])
+        self.assertEqual(warm["matched"], first["matched"])
+        rebuilt = self.client.call("strings", binary=BIN, query="txt", limit=5, refresh=True)
+        self.assertFalse(rebuilt["cached"])
+        self.assertEqual([s["addr"] for s in rebuilt["strings"]], [s["addr"] for s in warm["strings"]])
+
 
 class LiveTest(unittest.TestCase):
     def test_ping_reports_project(self):
