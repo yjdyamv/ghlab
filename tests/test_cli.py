@@ -1,10 +1,16 @@
 """CLI surface that does not need a daemon: version, help, script errors."""
 
+import contextlib
 import io
+import json
+import os
+import pathlib
+import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from ghlab import cli
 
@@ -80,3 +86,88 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetupConfigTest(unittest.TestCase):
+    """`ghlab setup` must be the only machine-specific step an agent needs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ghlab-cfg-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "config.json")
+        self.env = mock.patch.dict(os.environ, {"GHLAB_CONFIG": self.path})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def run_cli(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = cli.main(list(argv))
+        return code, buf.getvalue()
+
+    def test_setup_rejects_a_fake_ghidra_folder(self):
+        code, out = self.run_cli("setup", "--ghidra", self.tmp)
+        self.assertEqual(code, 2)
+        self.assertIn("does not look like a Ghidra install", out)
+
+    def test_setup_writes_config_and_prints_mcp_snippets(self):
+        ghidra = os.path.join(self.tmp, "ghidra")
+        os.makedirs(os.path.join(ghidra, "support"))
+        pathlib.Path(ghidra, "support", "analyzeHeadless").write_text("#!/bin/sh", encoding="utf-8")
+        code, out = self.run_cli(
+            "setup",
+            "--ghidra",
+            ghidra,
+            "--project-dir",
+            self.tmp,
+            "--project-name",
+            "wps",
+            "--port",
+            "8766",
+        )
+        self.assertEqual(code, 0)
+        cfg = json.loads(pathlib.Path(self.path).read_text(encoding="utf-8"))
+        self.assertEqual(cfg["ghidra"], ghidra)
+        self.assertEqual(cfg["project_name"], "wps")
+        self.assertEqual(cfg["port"], 8766)
+        self.assertIn("mcpServers", out)
+        self.assertIn("GHLAB_AUTOSTART", out)
+        self.assertIn("ghlab.mcp", out)
+
+    def test_doctor_reports_json_and_fails_without_a_daemon(self):
+        code, out = self.run_cli(
+            "doctor", "--url", "http://127.0.0.1:1/", "--json", "--project-dir", self.tmp
+        )
+        self.assertEqual(code, 1)
+        payload = json.loads(out)
+        self.assertFalse(payload["ok"])
+        names = {c["check"]: c for c in payload["checks"]}
+        self.assertEqual(names["daemon"]["status"], "fail")
+        self.assertEqual(names["project dir"]["status"], "ok")
+        self.assertIn("versions", names)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ConfigIsolationTest(unittest.TestCase):
+    """A test that writes config must never touch the real ~/.ghlab/config.json."""
+
+    def test_setup_writes_only_the_configured_path(self):
+        real = pathlib.Path(
+            os.environ.get("GHLAB_CONFIG") or (pathlib.Path.home() / ".ghlab" / "config.json")
+        )
+        before = real.read_text(encoding="utf-8") if real.exists() else None
+        tmp = tempfile.mkdtemp(prefix="ghlab-iso-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        ghidra = pathlib.Path(tmp, "ghidra")
+        (ghidra / "support").mkdir(parents=True)
+        (ghidra / "support" / "analyzeHeadless").write_text("x", encoding="utf-8")
+        with (
+            mock.patch.dict(os.environ, {"GHLAB_CONFIG": str(pathlib.Path(tmp, "c.json"))}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            cli.main(["setup", "--ghidra", str(ghidra), "--project-dir", tmp])
+        after = real.read_text(encoding="utf-8") if real.exists() else None
+        self.assertEqual(before, after, "setup escaped GHLAB_CONFIG and wrote the real config")

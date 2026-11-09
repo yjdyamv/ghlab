@@ -6,6 +6,8 @@ import argparse
 import contextlib
 import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -19,6 +21,37 @@ from .protocol import DEFAULT_HOST, DEFAULT_PORT
 
 REPO = Path(__file__).resolve().parents[2]
 LOGDIR = Path.home() / "re" / "logs"
+
+
+def config_path() -> Path:
+    """Resolved on every call so tests (and users) can point GHLAB_CONFIG elsewhere."""
+    return Path(os.environ.get("GHLAB_CONFIG") or (Path.home() / ".ghlab" / "config.json"))
+
+
+def load_config() -> dict[str, Any]:
+    """Machine-local setup written by `ghlab setup`, so no env vars are needed.
+
+    Every value here has a CLI flag or an environment variable that wins over it; the
+    file exists so a fresh shell (or an agent's MCP config) just works.
+    """
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(data: dict[str, Any]) -> Path:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(data, indent=2, ensure_ascii=False) + chr(10)
+    path.write_text(text, encoding="utf-8", newline=chr(10))
+    return path
+
+
+def ghidra_dir() -> str:
+    """GHIDRA_INSTALL_DIR from the environment, else from the setup file."""
+    return os.environ.get("GHIDRA_INSTALL_DIR") or str(load_config().get("ghidra") or "")
 
 
 def _print_json(obj: Any) -> None:
@@ -774,10 +807,12 @@ FORMATTERS = {
 
 
 def _ghidra_env_ok() -> bool:
-    if os.environ.get("GHIDRA_INSTALL_DIR"):
+    found = ghidra_dir()
+    if found and Path(found).expanduser().is_dir():
+        os.environ["GHIDRA_INSTALL_DIR"] = str(Path(found).expanduser())
         return True
     print(
-        "ghlab: GHIDRA_INSTALL_DIR is not set (e.g. 'C:\\ghidra_12.2_PUBLIC')",
+        "ghlab: GHIDRA_INSTALL_DIR is not set (run `ghlab setup --ghidra <dir>`, or export it)",
         file=sys.stderr,
     )
     return False
@@ -820,6 +855,255 @@ def _pidfile(path: Path) -> dict[str, Any]:
         except json.JSONDecodeError:
             return {}
     return {"pid": int(raw)} if raw.isdigit() else {}
+
+
+def _check(name: str, ok: bool, detail: str, fix: str = "", warn: bool = False) -> dict[str, Any]:
+    return {
+        "check": name,
+        "status": "ok" if ok else ("warn" if warn else "fail"),
+        "detail": detail,
+        "fix": "" if ok else fix,
+    }
+
+
+def cmd_doctor(args) -> int:
+    """Answer "why does this not work on this machine" before the agent has to ask.
+
+    Every check is local and cheap; none of them starts a JVM. Output is meant to be
+    pasted into a bug report, so `--json` carries the same facts.
+    """
+    checks: list[dict[str, Any]] = []
+
+    env_dir = ghidra_dir()
+    source = "env" if os.environ.get("GHIDRA_INSTALL_DIR") else ("setup file" if env_dir else "")
+    install = Path(env_dir).expanduser() if env_dir else None
+    checks.append(
+        _check(
+            "GHIDRA_INSTALL_DIR",
+            bool(install and install.is_dir()),
+            str(install) + f" ({source})" if install else "not set",
+            r"run `ghlab setup --ghidra <dir>` (or export GHIDRA_INSTALL_DIR), e.g. 'C:\ghidra_12.2_PUBLIC'",
+        )
+    )
+    headless = install / "support" / "analyzeHeadless" if install else None
+    checks.append(
+        _check(
+            "ghidra launcher",
+            bool(headless and headless.exists()),
+            str(headless) if headless else "(skipped)",
+            "this does not look like a Ghidra install; check the folder contains support/analyzeHeadless",
+        )
+    )
+
+    java = shutil.which("java") or (
+        str(Path(os.environ["JAVA_HOME"]) / "bin" / "java") if os.environ.get("JAVA_HOME") else ""
+    )
+    checks.append(
+        _check(
+            "java",
+            bool(java and Path(java).exists()),
+            java or "not found",
+            "install a JDK (Ghidra 12 needs 21+) or set JAVA_HOME",
+        )
+    )
+
+    have_jpype = have_pyghidra = False
+    try:
+        import jpype  # noqa: F401
+
+        have_jpype = True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import pyghidra  # noqa: F401
+
+        have_pyghidra = True
+    except Exception:  # noqa: BLE001
+        pass
+    checks.append(
+        _check(
+            "pyghidra + jpype",
+            have_jpype and have_pyghidra,
+            f"jpype={have_jpype} pyghidra={have_pyghidra} ({sys.executable})",
+            "install them offline from the Ghidra bundle: "
+            "uv pip install --python <venv> --no-index --find-links <Ghidra>/Ghidra/Features/PyGhidra/pypkg/dist jpype1 pyghidra",
+        )
+    )
+
+    wheels: list[str] = []
+    if install:
+        dist = install / "Ghidra" / "Features" / "PyGhidra" / "pypkg" / "dist"
+        wheels = [p.name for p in sorted(dist.glob("*.whl"))] if dist.is_dir() else []
+    tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    platform_wheel = any(tag in w or w.endswith("-any.whl") for w in wheels)
+    checks.append(
+        _check(
+            "offline wheels",
+            bool(wheels) and platform_wheel,
+            f"{len(wheels)} wheel(s)"
+            + (f", none for {tag}" if wheels and not platform_wheel else ""),
+            f"the bundle has no wheel for {tag}; either use a matching interpreter or install from PyPI",
+            warn=True,
+        )
+    )
+
+    url = (
+        getattr(args, "url", None)
+        or os.environ.get("GHLAB_URL")
+        or f"http://{args.host}:{args.port}/"
+    )
+    client = Client(url)
+    running = False
+    detail = f"not reachable at {url}"
+    try:
+        ping = client.call("ping")
+        running = True
+        count = ping.get("binaries")
+        if isinstance(count, list):  # older daemons answered with the list itself
+            count = len(count)
+        detail = (
+            f"{url} project={ping.get('project')} binaries={count} busy={ping.get('busy') or '-'}"
+        )
+    except Exception as ex:  # noqa: BLE001
+        detail = f"{type(ex).__name__}: {ex}"
+    checks.append(
+        _check(
+            "daemon",
+            running,
+            detail,
+            f"start one: ghlab start --port {args.port} --project-dir <dir> --project-name <name>",
+        )
+    )
+
+    if running:
+        pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
+        local = _pidfile(pid_path)
+        want = session.code_stamp()
+        have = local.get("stamp")
+        checks.append(
+            _check(
+                "daemon code",
+                have == want,
+                f"running={have or 'unknown'} installed={want}",
+                "the daemon is on older code; ghlab start restarts it",
+                warn=True,
+            )
+        )
+
+    project = Path(args.project_dir).expanduser()
+    writable = False
+    try:
+        project.mkdir(parents=True, exist_ok=True)
+        probe = project / ".ghlab-write-probe"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        writable = True
+    except OSError as ex:
+        detail = f"{project}: {ex}"
+    checks.append(
+        _check(
+            "project dir",
+            writable,
+            detail if not writable else str(project),
+            "pick a writable folder with --project-dir",
+        )
+    )
+
+    checks.append(
+        _check(
+            "versions",
+            True,
+            f"ghlab {__version__} | python {platform.python_version()} | {platform.platform()}",
+        )
+    )
+
+    failures = [c for c in checks if c["status"] == "fail"]
+    if args.json:
+        print(json.dumps({"ok": not failures, "checks": checks}, indent=2, ensure_ascii=False))
+        return 1 if failures else 0
+    mark = {"ok": "ok  ", "warn": "warn", "fail": "FAIL"}
+    for c in checks:
+        print(f"  {mark[c['status']]}  {c['check']:<20} {c['detail']}")
+        if c["fix"]:
+            print(f"        -> {c['fix']}")
+    if failures:
+        print(f"{chr(10)}{len(failures)} check(s) failed")
+        return 1
+    print(f"{chr(10)}all checks passed")
+    return 0
+
+
+def _mcp_snippet(cfg: dict[str, Any]) -> str:
+    """The two config shapes an agent client needs, filled in from this machine."""
+    port = int(cfg.get("port") or DEFAULT_PORT)
+    payload = {
+        "command": sys.executable,
+        "args": ["-m", "ghlab.mcp"],
+        "env": {
+            "GHLAB_URL": f"http://{cfg.get('host') or DEFAULT_HOST}:{port}",
+            "GHLAB_TIMEOUT": "900",
+            "GHLAB_AUTOSTART": "1",
+            "GHLAB_PROJECT_DIR": str(cfg.get("project_dir") or ""),
+            "GHLAB_PROJECT_NAME": str(cfg.get("project_name") or "ghlab"),
+            "GHLAB_PORT": str(port),
+        },
+    }
+    return chr(10).join(
+        [
+            "pi  (~/.pi/agent/mcp.json):",
+            json.dumps({"mcpServers": {"ghlab": {**payload, "exposure": "deferred"}}}, indent=2),
+            "",
+            "Claude Code / other MCP clients (claude_desktop_config.json shape):",
+            json.dumps({"mcpServers": {"ghlab": payload}}, indent=2),
+        ]
+    )
+
+
+def cmd_setup(args) -> int:
+    """Write ~/.ghlab/config.json so no environment variables are needed.
+
+    `--print-mcp` is the useful half for wiring a *different* agent: it prints the
+    config with the real interpreter path, daemon URL and autostart env baked in.
+    """
+    cfg = load_config()
+    changed = False
+    if args.ghidra:
+        candidate = Path(args.ghidra).expanduser()
+        if not (candidate / "support" / "analyzeHeadless").exists():
+            print(
+                f"ghlab: {candidate} does not look like a Ghidra install "
+                "(no support/analyzeHeadless)",
+                file=sys.stderr,
+            )
+            return 2
+        cfg["ghidra"] = str(candidate)
+        changed = True
+    for key, value in (
+        ("project_dir", args.cfg_project_dir),
+        ("project_name", args.cfg_project_name),
+        ("port", args.cfg_port),
+    ):
+        if value:
+            cfg[key] = value
+            changed = True
+    if changed:
+        path = save_config(cfg)
+        print(f"wrote {path}")
+    if not cfg:
+        print("nothing configured yet; try `ghlab setup --ghidra <dir> --project-dir <dir>")
+        return 1
+    if args.print_mcp or not changed:
+        print(_mcp_snippet(cfg))
+    else:
+        print(f"ghidra      {cfg.get('ghidra') or '(unset)'}")
+        print(f"project     {cfg.get('project_dir')} ({cfg.get('project_name')})")
+        print(
+            f"daemon      http://{cfg.get('host') or DEFAULT_HOST}:{cfg.get('port') or DEFAULT_PORT}/"
+        )
+        print("next        ghlab start && ghlab doctor")
+        print("")
+        print(_mcp_snippet(cfg))
+    return 0
 
 
 def cmd_start(args) -> int:
@@ -1040,11 +1324,16 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--url", default=os.environ.get("GHLAB_URL"))
     common.add_argument("--json", action="store_true", help="emit raw JSON")
 
+    # Defaults come from `ghlab setup` so a fresh shell (or an agent) needs no flags;
+    # anything typed on the command line still wins.
+    cfg = load_config()
     daemon = _Parser(add_help=False)
-    daemon.add_argument("--host", default=DEFAULT_HOST)
-    daemon.add_argument("--port", type=int, default=DEFAULT_PORT)
-    daemon.add_argument("--project-dir", default=str(Path.home() / "re" / "proj"))
-    daemon.add_argument("--project-name", default="ghlab")
+    daemon.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
+    daemon.add_argument("--port", type=int, default=int(cfg.get("port") or DEFAULT_PORT))
+    daemon.add_argument(
+        "--project-dir", default=str(cfg.get("project_dir") or (Path.home() / "re" / "proj"))
+    )
+    daemon.add_argument("--project-name", default=str(cfg.get("project_name") or "ghlab"))
 
     ap = _Parser(
         prog="ghlab",
@@ -1065,6 +1354,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("status", parents=[common, daemon], help="daemon health")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("setup", parents=[common], help="remember this machine's Ghidra + project")
+    p.add_argument("--ghidra", help="Ghidra install folder (contains support/analyzeHeadless)")
+    p.add_argument("--project-dir", dest="cfg_project_dir", help="where the Ghidra project lives")
+    p.add_argument("--project-name", dest="cfg_project_name", help="Ghidra project name")
+    p.add_argument("--port", type=int, dest="cfg_port", help="daemon port")
+    p.add_argument("--print-mcp", action="store_true", help="print MCP config snippets and exit")
+    p.set_defaults(func=cmd_setup)
+
+    p = sub.add_parser(
+        "doctor",
+        parents=[daemon],
+        help="check this machine: Ghidra, JDK, pyghidra, daemon, project dir",
+    )
+    p.add_argument("--url", help="daemon URL to probe (default: GHLAB_URL or host:port)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("ping", parents=[common], help="daemon + project summary")
     p.set_defaults(func=lambda a: _call(a, "ping"))

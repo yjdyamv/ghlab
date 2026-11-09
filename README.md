@@ -9,7 +9,7 @@ ghlab 把 Ghidra 的 headless JVM 变成**常驻进程**：一次导入、分析
 agent / shell / 脚本
         │  POST {"cmd": "decompile", "binary": "notepad.exe", "match": "WinMain", "grep": "CreateWindow"}
         ▼
-  ghlab daemon (常驻, 单线程)  ──→  Ghidra 12.x headless  (pyghidra 3.2 / jpype 1.5)
+  ghlab daemon (常驻 JVM, 请求串行)  ──→  Ghidra 12.x headless  (pyghidra 3.2 / jpype 1.5)
         ▲                               │
         └── ~/re/proj (Ghidra project, 分析结果已保存，重启不重跑)
 ```
@@ -38,10 +38,26 @@ uv pip install --python ~/re/.venv/Scripts/python.exe --no-index \
 # 2. 安装本项目（editable）
 uv pip install --python ~/re/.venv/Scripts/python.exe --no-build-isolation -e .
 
-# 3. 启动
-export GHIDRA_INSTALL_DIR="$GHD"     # Windows: setx GHIDRA_INSTALL_DIR C:\ghidra_12.2_PUBLIC
+# 3. 记住这台机器的 Ghidra 与项目位置（写 ~/.ghlab/config.json，之后不必再设环境变量）
+ghlab setup --ghidra "$GHD" --project-dir ~/re/proj --project-name ghlab --port 8765
+
+# 4. 启动并自检
 ghlab start                          # 后台常驻，日志 ~/re/logs/ghlab.log
-ghlab status
+ghlab doctor                         # 逐项检查 Ghidra/JDK/pyghidra/wheels/daemon/项目目录
+```
+
+`ghlab doctor` 每一项失败都附一句可执行的修法，输出可直接贴进 issue：
+
+```
+  ok    GHIDRA_INSTALL_DIR   C:\ghidra_12.2_PUBLIC (setup file)
+  ok    ghidra launcher      C:\ghidra_12.2_PUBLIC\support\analyzeHeadless
+  ok    java                 C:\Program Files\...\bin\java.EXE
+  ok    pyghidra + jpype     jpype=True pyghidra=True (...\python.exe)
+  ok    offline wheels       25 wheel(s)
+  ok    daemon               http://127.0.0.1:8765/ project=... binaries=4 busy=-
+  warn  daemon code          running=3b57affee3fa installed=210d7b59c8bb
+  ok    project dir          C:\Users\admin\re\proj
+  ok    versions             ghlab 0.1.0 | python 3.12.16 | Windows-11-...
 ```
 
 Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`，`export GHIDRA_INSTALL_DIR=/opt/ghidra_12.2_PUBLIC`。
@@ -226,7 +242,7 @@ otepad.exe, ...
 ghlab mcp          # stdio MCP server，转调本机 daemon
 ```
 
-只暴露 15 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+只暴露 21 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
 
 | 工具 | 干什么 |
 |---|---|
@@ -239,6 +255,7 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_cross_xref` | 全项目搜字符串，附引用者 |
 | `ghlab_similar` | 跨样本同构函数 |
 | `ghlab_note` / `ghlab_verify` / `ghlab_report` | 记结论（带断言） / 重算断言 / 出报告 |
+| `ghlab_notes` / `ghlab_audit` / `ghlab_overview` | 读回历史结论 / 全项目复算断言 / 项目总览 |
 | `ghlab_decrypt` | 破小块密文（xor/add/rot/utf16/base64） |
 | `ghlab_map` / `ghlab_types` / `ghlab_pdb` | 批量扫函数 / 批量写类型 / 吃 PDB 符号 |
 
@@ -254,13 +271,20 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 prompt 里内联的是 CLI 的人读格式而不是 JSON——同一份 digest，JSON 美化后 5935 字符，人读格式 2453 字符。
 MCP 进程本身不起 JVM，客户端可以随时重启它；daemon 用 `ghlab start` 管着就行。
 
-pi 里注册（已写入 `~/.pi/agent/mcp.json`，`exposure: deferred` 表示用 tool_search 按需加载）：
+pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接粘贴的版本；`exposure: deferred` 表示用 tool_search 按需加载）：
 
 ```json
 {"mcpServers": {"ghlab": {"command": "C:\Users\admin\re\.venv\Scripts\python.exe",
-  "args": ["-m", "ghlab.mcp"], "env": {"GHLAB_URL": "http://127.0.0.1:8765"}, "timeout": 600,
+  "args": ["-m", "ghlab.mcp"],
+  "env": {"GHLAB_URL": "http://127.0.0.1:8765", "GHLAB_TIMEOUT": "900",
+          "GHLAB_AUTOSTART": "1", "GHLAB_PROJECT_DIR": "C:/Users/admin/re/proj",
+          "GHLAB_PROJECT_NAME": "ghlab", "GHLAB_PORT": "8765"},
   "exposure": "deferred"}}}
 ```
+
+- **`GHLAB_AUTOSTART=1`**：daemon 没起时首次工具调用自己把它拉起来（冷启 30–45s，之后毫秒级），agent 不需要先开 shell。
+- **一个 MCP 条目 = 一个 daemon**：换项目就再写一个条目（不同 `GHLAB_PORT` / `GHLAB_PROJECT_DIR`）。
+- 其他 MCP 客户端（Claude Code 等）用同一个块，删掉 `exposure` 即可；`ghlab doctor` 负责回答"这台机器为什么跑不起来"。
 
 ## 命令一览
 

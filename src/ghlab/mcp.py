@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, TextIO
 
 from . import __version__
@@ -357,6 +359,36 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["binary"],
         },
     },
+    {
+        "name": "ghlab_notes",
+        "description": (
+            "Read back stored findings (the project's long-term memory) with filters. "
+            "Use this before re-deriving something an earlier session already established."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "tag": {"type": "string", "description": "only findings with this tag"},
+                "at": {"type": "string", "description": "only findings at this address/symbol"},
+                "query": {"type": "string", "description": "regex over the finding text"},
+                "limit": _LIMIT,
+            },
+        },
+    },
+    {
+        "name": "ghlab_audit",
+        "description": (
+            "Re-check every stored claim across the project and list the ones that no longer "
+            "hold: the evidence layer's own regression test."
+        ),
+        "inputSchema": {"type": "object", "properties": {"binary": _BIN}},
+    },
+    {
+        "name": "ghlab_overview",
+        "description": "One line per program in the project: facts, notes, failing claims, last change.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 # tool name -> daemon command
@@ -379,6 +411,9 @@ _COMMANDS = {
     "ghlab_pdb": "pdb",
     "ghlab_decrypt": "decrypt",
     "ghlab_report": "report",
+    "ghlab_notes": "notes",
+    "ghlab_audit": "audit",
+    "ghlab_overview": "overview",
 }
 
 _LIST_KEYS = {
@@ -393,6 +428,37 @@ _LIST_KEYS = {
     "seed",
     "stub",
 }
+
+
+def _autostart_enabled() -> bool:
+    return os.environ.get("GHLAB_AUTOSTART", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _start_daemon() -> bool:
+    """Bring the daemon up on first use, so an agent needs no shell step.
+
+    Called only after a call has already failed: starting eagerly would block the
+    MCP `initialize` handshake for the 30-45 s of a cold JVM.
+    """
+    from argparse import Namespace
+
+    from . import cli
+
+    args = Namespace(
+        host=os.environ.get("GHLAB_HOST") or "127.0.0.1",
+        port=int(os.environ.get("GHLAB_PORT") or 8765),
+        project_dir=os.environ.get("GHLAB_PROJECT_DIR") or str(Path.home() / "re" / "proj"),
+        project_name=os.environ.get("GHLAB_PROJECT_NAME") or "ghlab",
+        wait=400,
+    )
+    sys.stderr.write("ghlab.mcp: daemon is down, starting it (once per session)\n")
+    sys.stderr.flush()
+    try:
+        return cli.cmd_start(args) == 0
+    except Exception as ex:  # noqa: BLE001 - a failed autostart must not kill the MCP server
+        sys.stderr.write(f"ghlab.mcp: autostart failed: {type(ex).__name__}: {ex}\n")
+        sys.stderr.flush()
+        return False
 
 
 def _as_params(_name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -668,7 +734,17 @@ def serve(
                 reconfigure(encoding="utf-8")
     if call is None:
         client = Client()
-        call_fn: Callable[..., Any] = lambda cmd, **params: client.call(cmd, **params)  # noqa: E731
+
+        def _call(cmd: str, **params: Any) -> Any:
+            try:
+                return client.call(cmd, **params)
+            except (RemoteError, OSError):
+                # A cold session should just work: start the daemon once, then retry.
+                if not _autostart_enabled() or client.alive() or not _start_daemon():
+                    raise
+                return client.call(cmd, **params)
+
+        call_fn: Callable[..., Any] = _call
     else:
         call_fn = call
 

@@ -56,7 +56,7 @@ class ProtocolTest(unittest.TestCase):
 
     def test_tools_are_few_and_well_formed(self):
         tools = mcp.TOOLS
-        self.assertLessEqual(len(tools), 18, "MCP facade should stay small")
+        self.assertLessEqual(len(tools), 21, "MCP facade should stay small")
         names = [t["name"] for t in tools]
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:
