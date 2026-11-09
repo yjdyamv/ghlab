@@ -168,3 +168,33 @@ class Int32Test(unittest.TestCase):
         # RAX often carries garbage in the upper half; only the low 32 bits matter.
         self.assertEqual(_int32(0xDEADBEEF00000001), 1)
         self.assertEqual(_int32(0x11111111FFFFFEFC), -260)
+
+
+class StubSpecTest(unittest.TestCase):
+    """`emulate --stub` specs: plain returns and argument-dependent returns."""
+
+    def test_plain_and_conditional_specs(self):
+        from ghlab.session import _parse_stub_spec
+
+        self.assertEqual(_parse_stub_spec("0x180f5b0a0=0"), ("0x180f5b0a0", None, None, 0))
+        target, arg, value, ret = _parse_stub_spec("FUN_1800058c0[arg2=0xe000000b]=120")
+        self.assertEqual((target, arg, value, ret), ("FUN_1800058c0", 2, 0xE000000B, 120))
+
+    def test_negative_returns_are_kept_signed(self):
+        from ghlab.session import _parse_stub_spec
+
+        self.assertEqual(_parse_stub_spec("FUN_x[arg1=5]=-100")[3], -100)
+
+    def test_bad_specs_are_rejected(self):
+        from ghlab.session import _parse_stub_spec
+
+        for bad in ("nope", "FUN_x=", "FUN_x[arg9=1]=2", "=1"):
+            with self.subTest(spec=bad), self.assertRaises(ValueError):
+                _parse_stub_spec(bad)
+
+    def test_signed_64_wrapping_for_register_writes(self):
+        from ghlab.session import _s64
+
+        self.assertEqual(_s64(-100), -100)
+        self.assertEqual(_s64(0xFFFF_FFFF_FFFF_FF9C), -100)
+        self.assertEqual(_s64(1), 1)

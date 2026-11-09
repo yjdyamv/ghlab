@@ -1289,6 +1289,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ADDR=HEX",
         help="preload bytes into emulator memory before the run (repeatable)",
     )
+    p.add_argument(
+        "--stub",
+        dest="stub",
+        action="append",
+        default=[],
+        metavar="FN[ARGn=V]=RET",
+        help=(
+            "skip a call and pretend it returned RET, optionally only when the n-th "
+            "integer argument equals V (repeatable, e.g. FUN_x[arg2=0xe000000b]=120)"
+        ),
+    )
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -1302,6 +1313,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "dump": a.dump,
                 "buffer": a.buffer,
                 "seed": a.seed,
+                "stub": a.stub,
             },
         )
     )

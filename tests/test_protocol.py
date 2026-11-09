@@ -112,6 +112,17 @@ class EnvelopeTest(unittest.TestCase):
         )
         self.assertEqual(params["seed"], ["0x140000000=4142"])
 
+    def test_emulate_accepts_call_stubs(self):
+        _spec, params = protocol.validate(
+            {
+                "cmd": "emulate",
+                "binary": "x",
+                "target": "f",
+                "stub": ["FUN_1800058c0[arg2=0xe000000b]=120"],
+            }
+        )
+        self.assertEqual(params["stub"], ["FUN_1800058c0[arg2=0xe000000b]=120"])
+
     def test_note_accepts_claims_and_verify_takes_ids(self):
         _spec, params = protocol.validate(
             {"cmd": "note", "binary": "x", "text": "t", "at": "entry", "assert": ["const=1"]}

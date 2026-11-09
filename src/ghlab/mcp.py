@@ -381,7 +381,18 @@ _COMMANDS = {
     "ghlab_report": "report",
 }
 
-_LIST_KEYS = {"import", "string", "calls", "targets", "args", "dump", "assert", "id"}
+_LIST_KEYS = {
+    "import",
+    "string",
+    "calls",
+    "targets",
+    "args",
+    "dump",
+    "assert",
+    "id",
+    "seed",
+    "stub",
+}
 
 
 def _as_params(_name: str, args: dict[str, Any]) -> dict[str, Any]:

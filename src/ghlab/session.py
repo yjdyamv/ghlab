@@ -2306,6 +2306,110 @@ def _skip_instruction(emu, program, addr) -> bool:
     return True
 
 
+def _stub_int(text: str) -> int | None:
+    """Stub values accept decimal, `0x` hex and negative numbers."""
+    raw = str(text).strip().replace("_", "")
+    try:
+        return int(raw, 0)
+    except ValueError:
+        return None
+
+
+def _parse_stub_spec(text: str) -> tuple[str, int | None, int | None, int]:
+    """Split ``TARGET=RET`` / ``TARGET[ARGn=VAL]=RET`` into its four fields.
+
+    ``TARGET`` is an address or a symbol name, ``ARGn`` is 1..4 for the Windows x64
+    integer argument registers, and both ``VAL`` and ``RET`` accept ``0x`` prefixes.
+    """
+    spec = str(text).strip()
+    head, sep, ret_text = spec.rpartition("=")
+    if not sep or not head:
+        raise ValueError(f"bad stub {text!r}; expected TARGET=RET or TARGET[ARGn=VAL]=RET")
+    target = head.strip()
+    arg: int | None = None
+    arg_value: int | None = None
+    if target.endswith("]") and "[" in target:
+        target, _, cond = target.partition("[")
+        cond = cond[:-1].strip()
+        name, sep2, val_text = cond.partition("=")
+        if not sep2 or not name.lower().startswith("arg"):
+            raise ValueError(f"bad stub condition {cond!r}; expected ARGn=VALUE")
+        index = name[3:].strip()
+        if index not in ("1", "2", "3", "4"):
+            raise ValueError(f"bad argument index in {cond!r}; use ARG1..ARG4")
+        arg = int(index)
+        arg_value = _stub_int(val_text.strip())
+        if arg_value is None:
+            raise ValueError(f"bad argument value in {cond!r}")
+    target = target.strip()
+    if not target:
+        raise ValueError(f"bad stub {text!r}; no target")
+    ret = _stub_int(ret_text.strip())
+    if ret is None:
+        raise ValueError(f"bad return value in {text!r}")
+    return target, arg, arg_value, ret
+
+
+def _resolve_stubs(program, specs: list[Any] | None) -> list[dict[str, Any]]:
+    """Turn ``--stub`` strings into ``{addr, arg, arg_value, ret, spec}`` records."""
+    out: list[dict[str, Any]] = []
+    for text in specs or []:
+        target, arg, arg_value, ret = _parse_stub_spec(str(text))
+        offset = _hex_addr(target)
+        if offset is None:
+            offset = _symbol_addr(program, target)
+        if offset is None:
+            raise ValueError(f"stub target {target!r} is neither an address nor a symbol")
+        out.append(
+            {"addr": offset, "arg": arg, "arg_value": arg_value, "ret": ret, "spec": str(text)}
+        )
+    return out
+
+
+def _stub_hit(program, emu, insn, stubs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the stub that replaces this call, if any."""
+    if not stubs:
+        return None
+    flows = insn.getFlows()
+    if flows is None or len(flows) != 1:
+        return None
+    target = int(flows[0].getOffset())
+    for spec in stubs:
+        if spec["addr"] != target:
+            continue
+        if spec["arg"] is not None:
+            reg = program.getRegister(PARAM_REGS[spec["arg"] - 1])
+            if reg is None:
+                continue
+            have = _u64(emu.readRegister(reg)) & 0xFFFFFFFF
+            if have != spec["arg_value"] & 0xFFFFFFFF:
+                continue
+        return spec
+    return None
+
+
+def _s64(value: int) -> int:
+    """Wrap ``value`` into the signed 64-bit range.
+
+    JPype raises OverflowError for anything above ``2**63-1``, so a stub returning
+    -100 must be written as -100, not as ``0xFFFF_FFFF_FFFF_FF9C``.
+    """
+    low = value & MASK64
+    return low - (1 << 64) if low >= (1 << 63) else low
+
+
+def _apply_call_stub(emu, program, insn, spec: dict[str, Any]) -> bool:
+    """Skip a call and pretend it returned ``spec['ret']`` in RAX."""
+    target = insn.getFallThrough()
+    if target is None:
+        target = insn.getAddress().add(int(insn.getLength()))
+    rax = program.getRegister("RAX")
+    if rax is not None:
+        emu.writeRegister(rax, _s64(spec["ret"]))
+    emu.writeRegister(emu.getPCRegister(), int(target.getOffset()))
+    return True
+
+
 def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     """Run one function on the P-code emulator and report writes + return value.
 
@@ -2426,6 +2530,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
 
     monitor = TimeoutTaskMonitor.timeoutIn(max(1, ms), TimeUnit.MILLISECONDS)
     sentinel_addr = space.getAddress(sentinel)
+    stubs_cfg = _resolve_stubs(program, a.get("stub"))
     stop = "max-insns"
     insns = 0
     fault = None
@@ -2440,6 +2545,14 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
                 break
             if program.getMemory().contains(pc):
                 last_valid_pc = pc
+            if stubs_cfg:
+                here = program.getListing().getInstructionAt(pc)
+                if here is not None and str(here.getMnemonicString()).upper() == "CALL":
+                    hit = _stub_hit(program, emu, here, stubs_cfg)
+                    if hit is not None and _apply_call_stub(emu, program, here, hit):
+                        stubs.append({"at": str(pc), "fn": hit["spec"]})
+                        insns += 1
+                        continue
             if emu.step(monitor):
                 insns += 1
                 continue
