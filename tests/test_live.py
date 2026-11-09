@@ -638,6 +638,9 @@ class LiveTest(unittest.TestCase):
             ),
         ]
         payload = "".join(line + "\n" for line in lines)
+        # Pin the child to the daemon under test: without GHLAB_URL it would read the
+        # machine's project registry and could find the binary in several projects.
+        env = {**os.environ, "GHLAB_URL": client.url}
         proc = subprocess.run(
             [sys.executable, "-m", "ghlab.mcp"],
             input=payload,
@@ -645,6 +648,7 @@ class LiveTest(unittest.TestCase):
             text=True,
             encoding="utf-8",
             timeout=180,
+            env=env,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         replies = {

@@ -258,5 +258,74 @@ class ConfigProjectsTest(unittest.TestCase):
         self.assertFalse(config.remove_project("a"))
 
 
+class DiscoverTest(unittest.TestCase):
+    """Finding projects Ghidra (or a human) already created, without hand-typed paths."""
+
+    def setUp(self):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="ghlab-disc-"))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def project(self, name: str, *, rep: bool = True, sub: str = "") -> pathlib.Path:
+        d = self.root / sub / name if sub else self.root / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"{name}.gpr").write_text("", encoding="utf-8")
+        if rep:
+            (d / f"{name}.rep").mkdir()
+        return d
+
+    def test_finds_a_project_only_when_gpr_and_rep_are_both_there(self):
+        good = self.project("good")
+        self.project("stray", rep=False)
+        found = config.discover_projects([self.root], known={}, base_port=8700)
+        self.assertEqual([t.name for t in found], ["good"])
+        self.assertEqual(found[0].project_dir, str(good))
+        self.assertEqual(found[0].project_name, "good")
+
+    def test_nested_projects_are_found(self):
+        self.project("deep", sub="a/b/c")
+        found = config.discover_projects([self.root], known={}, base_port=8700)
+        self.assertEqual([t.name for t in found], ["deep"])
+
+    def test_already_registered_directories_and_names_are_skipped(self):
+        d = self.project("known")
+        self.project("samename")
+        known = {
+            "renamed": config.Target(
+                name="renamed",
+                url="http://127.0.0.1:8700",
+                project_dir=str(d),
+                project_name="known",
+            ),
+            "samename": config.Target(
+                name="samename",
+                url="http://127.0.0.1:8701",
+                project_dir="/elsewhere",
+                project_name="samename",
+            ),
+        }
+        self.assertEqual(config.discover_projects([self.root], known=known, base_port=8700), [])
+
+    def test_ports_skip_registered_and_busy_ones(self):
+        self.project("a")
+        self.project("b")
+        known = {
+            "other": config.Target(
+                name="other", url="http://127.0.0.1:8701", project_dir="/x", project_name="other"
+            )
+        }
+        with mock.patch.object(config, "port_free", side_effect=lambda port, *_: port != 8702):
+            found = config.discover_projects([self.root], known=known, base_port=8701)
+        self.assertEqual([t.url.rsplit(":", 1)[-1] for t in found], ["8703", "8704"])
+
+    def test_limit_stops_the_scan(self):
+        for name in ("a", "b", "c"):
+            self.project(name)
+        found = config.discover_projects([self.root], known={}, base_port=8700, limit=2)
+        self.assertEqual(len(found), 2)
+
+    def test_missing_root_is_not_an_error(self):
+        self.assertEqual(config.discover_projects([self.root / "nope"], known={}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

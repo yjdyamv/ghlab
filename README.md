@@ -242,10 +242,18 @@ otepad.exe, ...
 各配一个 URL；现在一个条目就够，`ghlab` 按工具参数里的 `binary` 决定转发给哪个 daemon：
 
 ```bash
-ghlab setup --add-project wps --add-port 8766     --project-dir ~/re/wps/proj --project-name wps
-ghlab setup --default-project ghlab          # 不带 binary 的命令打到哪个库
+ghlab setup --discover                        # 扫描 ~/re，把已有的 Ghidra 项目都认出来
+ghlab setup --discover ~/work/binaries --dry-run   # 只看不注册
+ghlab setup --add-project wps --add-port 8766 \      # 手工指定也行
+    --project-dir ~/re/wps/proj --project-name wps
+ghlab setup --default-project ghlab           # 不带 binary 的命令打到哪个库
 ghlab projects                                # 每个库的状态 + 里面有什么
 ```
+
+`--discover` 只认 Ghidra 真正能打开的形态：同一目录下同时有 `<name>.gpr` 与 `<name>.rep/`
+（GUI 建的、`analyzeHeadless` 建的、本工具建的都一样）。已经注册过的目录或名字会跳过，
+新项目自动分配一个既不在注册表里、也没人监听的端口；`--dry-run` 只列不改。**不会重新分析**——
+项目里已有的函数、注释、类型直接可用（实测：`analyzeHeadless` 建的库里 `info` 立刻报 855 个函数）。
 
 ```
 # 2 project(s), default = ghlab
@@ -256,7 +264,7 @@ ghlab projects                                # 每个库的状态 + 里面有�
       notepad.exe
 ```
 
-规则（都在 `src/ghlab/router.py`，18 个单测覆盖，全部不需要 socket）：
+规则（`src/ghlab/router.py` + `config.discover_projects`，24 个单测覆盖，全部不需要 socket）：
 
 1. `project=<名字>` 显式指定，优先级最高（参数不会转给 daemon）。
 2. 有 `binary`（或 `diff` 的 `a`/`b`）：问每个 daemon 有哪些程序，转发给**拥有它的那个**；

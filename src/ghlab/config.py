@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,66 @@ def default_project(cfg: dict[str, Any] | None = None) -> str:
     if wanted in known:
         return wanted
     return next(iter(known))
+
+
+def port_free(port: int, host: str = "127.0.0.1") -> bool:
+    """True when nothing is listening on the port (best effort, cheap)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex((host, port)) != 0
+
+
+def discover_projects(
+    roots: list[Path],
+    *,
+    known: dict[str, Target] | None = None,
+    base_port: int | None = None,
+    limit: int = 8,
+) -> list[Target]:
+    """Find Ghidra projects under `roots` that are not registered yet.
+
+    A project is a directory holding ``<name>.gpr`` (a 0-byte marker in Ghidra 11+)
+    next to ``<name>.rep`` -- that pair is what ``ProjectLocator`` looks for, so it is
+    also the only thing worth recognising. Names already registered (by directory or
+    by name) are skipped; each new project gets the next port that is both unused in
+    the registry and free on the box.
+    """
+    known = known if known is not None else projects()
+    taken_ports = {int(t.url.rsplit(":", 1)[-1].strip("/") or 0) for t in known.values()}
+    taken_ports.update(range(1024))
+    seen_dirs = {str(Path(t.project_dir).resolve()) for t in known.values() if t.project_dir}
+    port = base_port or (max(taken_ports) + 1 if taken_ports else DEFAULT_PORT)
+
+    found: list[Target] = []
+    for root in roots:
+        root = Path(root).expanduser()
+        if not root.is_dir():
+            continue
+        for marker in sorted(root.rglob("*.gpr")):
+            if len(found) >= limit:
+                return found
+            project_dir = marker.parent
+            name = marker.stem
+            if not (project_dir / f"{name}.rep").is_dir():
+                continue  # a stray .gpr, not a project Ghidra would open
+            if str(project_dir.resolve()) in seen_dirs or name in known:
+                continue
+            while port in taken_ports or not port_free(port):
+                port += 1
+                if port > 65535:
+                    return found
+            taken_ports.add(port)
+            seen_dirs.add(str(project_dir.resolve()))
+            found.append(
+                Target(
+                    name=name,
+                    url=f"http://{default_host()}:{port}",
+                    project_dir=str(project_dir),
+                    project_name=name,
+                )
+            )
+            port += 1
+    return found
 
 
 def register_project(

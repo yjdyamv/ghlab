@@ -20,6 +20,7 @@ from .client import Client, RemoteError
 from .config import (  # noqa: F401 - re-exported for callers and tests
     config_path,
     default_project,
+    discover_projects,
     focus_path,
     ghidra_dir,
     load_config,
@@ -1077,6 +1078,27 @@ def cmd_setup(args) -> int:
             if value:
                 cfg[key] = value
                 changed = True
+    if args.discover is not None:
+        roots = [Path(p).expanduser() for p in (args.discover or [Path.home() / "re"])]
+        known = projects(cfg)
+        found = discover_projects(roots, known=known, base_port=args.add_port)
+        if not found:
+            print(f"no unregistered Ghidra project under {', '.join(str(r) for r in roots)}")
+        for target in found:
+            print(f"found {target.name:<12} {target.project_dir}  -> {target.url}")
+            if not args.dry_run:
+                register_project(
+                    target.name,
+                    url=target.url,
+                    project_dir=target.project_dir,
+                    project_name=target.project_name,
+                )
+        if found and not args.dry_run:
+            cfg = load_config()
+            changed = True
+            print(
+                f"registered {len(found)} project(s); run `ghlab start --port <port>` per project"
+            )
     if args.add_project:
         port = args.cfg_port or (args.add_port or 0)
         if not port:
@@ -1437,6 +1459,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--add-port", type=int, help="port of the project being added")
     p.add_argument("--remove-project", metavar="NAME", help="forget a registered project")
     p.add_argument("--default-project", metavar="NAME", help="which project bare commands use")
+    p.add_argument(
+        "--discover",
+        nargs="*",
+        metavar="DIR",
+        help="find Ghidra projects (*.gpr + *.rep) under DIR (default: ~/re) and register them",
+    )
+    p.add_argument(
+        "--dry-run", action="store_true", help="with --discover: only list what was found"
+    )
     p.add_argument("--print-mcp", action="store_true", help="print MCP config snippets and exit")
     p.set_defaults(func=cmd_setup)
 
