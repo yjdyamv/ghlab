@@ -3,6 +3,7 @@
 import io
 import json
 import unittest
+from pathlib import Path
 
 from ghlab import mcp, protocol
 from ghlab.client import RemoteError
@@ -338,3 +339,8 @@ class ProgramResourceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_readme_counts_match_the_code(self):
+        """A README that says "15 tools" while the code has 22 is worse than no README."""
+        readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"{len(mcp.TOOLS)} 个工具", readme)
