@@ -2111,6 +2111,12 @@ def _diff_runs(
     return runs[:max_runs]
 
 
+def _int32(value: int) -> int:
+    """Low 32 bits of ``value`` read as a signed integer."""
+    low = value & 0xFFFFFFFF
+    return low - (1 << 32) if low >= (1 << 31) else low
+
+
 def _u64(value: Any) -> int:
     try:
         return int(value) & MASK64
@@ -2511,6 +2517,9 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
         )
 
     rax = _u64(emu.readRegister(program.getRegister("RAX"))) if _has_reg(program, "RAX") else 0
+    # A function returning -260 leaves 0xfffffefc in RAX; report both readings so a
+    # caller does not have to know whether the source prototype was signed.
+    rax_i32 = _int32(rax)
     return {
         "binary": a["binary"],
         "function": str(fn.getName()),
@@ -2522,7 +2531,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
         "insns": insns,
         "stubs": stubs,
         "skips": skips,
-        "ret": {"rax": rax, "rax_hex": hex(rax)},
+        "ret": {"rax": rax, "rax_hex": hex(rax), "rax_i32": rax_i32},
         "writes": {"tracked": tracked_bytes, "ranges": writes},
         "dump": dumps,
         "buffer": {"addr": hex(buf_addr), "size": buf_size} if buf_size else None,

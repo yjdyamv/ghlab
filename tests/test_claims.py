@@ -149,3 +149,22 @@ class DecryptTest(unittest.TestCase):
     def test_base64_candidate_is_decoded(self):
         found = session._decrypt_candidates(b"aGVsbG8sIHdvcmxk", ["base64"], 0.85)
         self.assertTrue(any(c["cipher"] == "base64" and "hello, world" in c["text"] for c in found))
+
+
+class Int32Test(unittest.TestCase):
+    """`emulate` reports both the raw RAX and its int32 reading."""
+
+    def test_negative_values_survive_the_wrap(self):
+        from ghlab.session import _int32
+
+        self.assertEqual(_int32(0xFFFFFEFC), -260)
+        self.assertEqual(_int32(0xFFFFFFFF), -1)
+        self.assertEqual(_int32(0x7FFFFFFF), 2147483647)
+        self.assertEqual(_int32(1000), 1000)
+
+    def test_high_bits_do_not_leak_into_the_reading(self):
+        from ghlab.session import _int32
+
+        # RAX often carries garbage in the upper half; only the low 32 bits matter.
+        self.assertEqual(_int32(0xDEADBEEF00000001), 1)
+        self.assertEqual(_int32(0x11111111FFFFFEFC), -260)
