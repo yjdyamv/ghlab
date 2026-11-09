@@ -5,3 +5,5 @@ build/
 dist/
 .ghlab.pid
 .venv/
+graphs/*.svg
+graphs/*.dot

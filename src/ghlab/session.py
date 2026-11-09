@@ -122,6 +122,39 @@ def _addr(entry: dict[str, Any], text: str):
     return addr
 
 
+def _symbols_named(program, name: str, limit: int = 8) -> list[Any]:
+    """Exact symbol lookup through the indexed tables (never a full scan).
+
+    `getAllSymbols(True)` walks every symbol in the program: on a 34 MB binary
+    with 300k+ symbols that costs ~7 s per call, which is why `xrefs` used to
+    look broken. `getGlobalSymbols`/`getSymbols` hit the name index instead.
+    """
+    text = str(name)
+    table = program.getSymbolTable()
+    out: list[Any] = []
+    for getter in ("getGlobalSymbols", "getSymbols"):
+        fn = getattr(table, getter, None)
+        if fn is None:
+            continue
+        try:
+            hits = fn(text)
+        except Exception:  # noqa: BLE001 - jpype raises for odd overloads
+            continue
+        for sym in hits or []:
+            out.append(sym)
+            if len(out) >= limit:
+                return out
+    if out:
+        return out
+    # Namespaced spellings (`USER32.DLL::GetWindowLongW`) are not in the index.
+    for sym in table.getAllSymbols(True):
+        if str(sym.getName()) == text or str(sym.getName(True)) == text:
+            out.append(sym)
+            if len(out) >= limit:
+                break
+    return out
+
+
 def _function(entry: dict[str, Any], target: str):
     program = entry["program"]
     fm = program.getFunctionManager()
@@ -129,14 +162,11 @@ def _function(entry: dict[str, Any], target: str):
     numeric = _hex_addr(text)
     if numeric is not None:
         addr = _addr(entry, text)
-        fn = fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
+        return fm.getFunctionAt(addr) or fm.getFunctionContaining(addr)
+    for sym in _symbols_named(program, text):
+        fn = fm.getFunctionAt(sym.getAddress())
         if fn is not None:
             return fn
-    for sym in program.getSymbolTable().getAllSymbols(True):
-        if str(sym.getName()) == text:
-            fn = fm.getFunctionAt(sym.getAddress())
-            if fn is not None:
-                return fn
     return None
 
 
@@ -717,9 +747,14 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
     targets = a.get("targets") or [a["target"]]
     out = []
     for t in targets:
-        fn = _function(e, t)
-        addr = fn.getEntryPoint() if fn else _addr(e, t)
+        # A hex target is already an address; asking for a *function* there used
+        # to fall back to a full symbol scan (seconds per call).
+        addr = _addr(e, t) if _hex_addr(t) is not None else None
+        if addr is None:
+            fn = _function(e, t)
+            addr = fn.getEntryPoint() if fn else _addr(e, t)
         refs = []
+        limit = int(a.get("limit", 400))
         for r in p.getReferenceManager().getReferencesTo(addr):
             holder = p.getFunctionManager().getFunctionContaining(r.getFromAddress())
             refs.append(
@@ -729,7 +764,9 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
                     "in_function": str(holder.getName()) if holder else None,
                 }
             )
-        out.append({"target": str(t), "addr": str(addr), "xrefs": refs[:400]})
+            if len(refs) >= limit:
+                break
+        out.append({"target": str(t), "addr": str(addr), "xrefs": refs})
     return {"results": out}
 
 
@@ -1777,16 +1814,18 @@ def _symbol_addr(program, name: str) -> int | None:
     text = str(name)
     if text.lower().startswith("0x"):
         return int(text, 16)
-    for sym in program.getSymbolTable().getAllSymbols(True):
-        if str(sym.getName()) == text:
-            return int(sym.getAddress().getOffset())
+    for sym in _symbols_named(program, text, limit=1):
+        return int(sym.getAddress().getOffset())
     return None
 
 
-def _suggest_symbols(program, name: str, limit: int = 6) -> list[str]:
+def _suggest_symbols(program, name: str, limit: int = 6, budget: int = 200_000) -> list[str]:
+    """Substring suggestions, but never an unbounded walk of a huge symbol table."""
     low = str(name).lower()
     hits: list[str] = []
-    for sym in program.getSymbolTable().getAllSymbols(True):
+    for seen, sym in enumerate(program.getSymbolTable().getAllSymbols(True)):
+        if seen >= budget:
+            break
         text = str(sym.getName())
         if low in text.lower():
             hits.append(text)
