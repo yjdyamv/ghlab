@@ -199,3 +199,50 @@ class McpSnippetTest(unittest.TestCase):
         self.assertIn("GHLAB_CONFIG", text)
         self.assertNotIn('"GHLAB_URL"', text, "a pinned URL would disable routing")
         self.assertIn("2 project(s)", text)
+
+
+class StopByPortTest(unittest.TestCase):
+    """`stop --port N` must target the daemon on that port, not the default one.
+
+    Regression: it read the default project's pidfile, so stopping a throwaway
+    daemon on a temp port signalled whatever was running on port 8766.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.one = root / "one"
+        self.two = root / "two"
+        for path, port in ((self.one, 9201), (self.two, 9202)):
+            path.mkdir()
+            (path / ".ghlab.pid").write_text(
+                json.dumps({"pid": 111, "port": port, "stamp": "x"}), encoding="utf-8"
+            )
+        cfg = {
+            "project_dir": str(self.one),
+            "project_name": "one",
+            "port": 9201,
+            "default": "one",
+            "projects": {
+                "one": {"url": "http://127.0.0.1:9201", "project_dir": str(self.one)},
+                "two": {"url": "http://127.0.0.1:9202", "project_dir": str(self.two)},
+            },
+        }
+        self.cfg_file = root / "config.json"
+        self.cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+        self.env = mock.patch.dict(os.environ, {"GHLAB_CONFIG": str(self.cfg_file)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_picks_the_pidfile_whose_port_matches(self):
+        self.assertEqual(cli._pidfile_by_port(9202), self.two / ".ghlab.pid")
+        self.assertEqual(cli._pidfile_by_port(9201), self.one / ".ghlab.pid")
+
+    def test_unknown_port_is_not_guessed(self):
+        self.assertIsNone(cli._pidfile_by_port(9999))
+
+    def test_stop_parser_does_not_inherit_a_project_dir(self):
+        parser = cli.build_parser()
+        args = parser.parse_args(["stop", "--port", "9202"])
+        self.assertIsNone(args.project_dir, "stop must resolve the project from the port")

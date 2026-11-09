@@ -487,7 +487,10 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
             if grep is not None:
                 hits = _grep_code(code, grep)
                 item["grep_hits"] = len(hits)
-                item["matched"] = hits[:20]
+                # `matched` already means "how many functions matched" elsewhere;
+                # a list of source lines under that name reads wrong (it cost me a
+                # broken smoke test to notice).
+                item["hits"] = hits[:20]
             if include_code:
                 if max_lines and len(all_lines) > max_lines:
                     item["code"] = "\n".join(all_lines[:max_lines]) + "\n/* ... truncated */"

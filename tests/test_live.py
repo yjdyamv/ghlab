@@ -27,7 +27,10 @@ def _alive():
 # Live tests hit a real daemon: one scan over a 34 MB DLL is half a minute, and
 # the whole file against wpscore.dll ran for minutes. So they are opt-in -- a
 # plain `unittest discover` has to stay a few seconds or nobody will run it.
-LIVE = bool(os.environ.get("GHLAB_LIVE")) and _alive()
+# Tier 2: these assert facts learned from a *specific* sample (notepad.exe:
+# its registry strings, its 521 functions).  Opt-in twice over, because a
+# machine that has not imported that sample must not see failures.
+LIVE = bool(os.environ.get("GHLAB_LIVE_RICH")) and _alive()
 reason = (
     f"set GHLAB_LIVE=1 with a daemon on {client.url} holding {BIN} (import it with `ghlab import`)"
 )
@@ -126,7 +129,7 @@ class LiveTest(unittest.TestCase):
         for item in r["results"]:
             self.assertGreater(item["grep_hits"], 0)
             self.assertNotIn("code", item, "grep mode must not ship whole source")
-            for hit in item["matched"]:
+            for hit in item["hits"]:
                 self.assertRegex(hit["text"], r"if \(")
 
     def test_decompile_callgraph_flags(self):

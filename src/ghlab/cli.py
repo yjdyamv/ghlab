@@ -110,7 +110,7 @@ def fmt_decompile(r: dict[str, Any]) -> str:
         )
         if item.get("grep_hits") is not None:
             out.append(f"   match: {item['grep_hits']} line(s)")
-            for hit in item.get("matched") or []:
+            for hit in item.get("hits") or []:
                 out.append(f"   L{hit['line']:<4} {hit['text']}")
         if item.get("code"):
             out.append(item["code"].rstrip())
@@ -592,7 +592,7 @@ def fmt_map(r: dict[str, Any]) -> str:
             out.append(f"{label}\n      error: {item['error']}")
             continue
         out.append(f"{label} {item['hits']} hit(s)")
-        for hit in item["matched"]:
+        for hit in item["hits"]:
             if "line" in hit:
                 out.append(f"      {hit['line']}: {str(hit.get('text', ''))[:110]}")
             else:
@@ -1326,8 +1326,43 @@ def _force_kill(pid: int) -> None:
             os.kill(pid, 9)
 
 
+def _pidfile_by_port(port: int) -> Path | None:
+    """The pidfile whose recorded port matches, or None.
+
+    `stop --port P` used to read the *default* project's pidfile, so stopping a
+    throwaway daemon on another port signalled whatever was running there.
+    """
+    seen: list[Path] = []
+    for target in projects(load_config()).values():
+        path = Path(target.project_dir).expanduser() / ".ghlab.pid"
+        if path in seen:
+            continue
+        seen.append(path)
+        if not path.exists():
+            continue
+        if int(_pidfile(path).get("port") or 0) == port:
+            return path
+    return None
+
+
 def cmd_stop(args) -> int:
-    pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
+    explicit = getattr(args, "project_dir", None)
+    pid_path = (
+        Path(explicit).expanduser() / ".ghlab.pid" if explicit else _pidfile_by_port(args.port)
+    )
+    if pid_path is None:
+        owner = _port_owner(args.host, args.port)
+        if not owner:
+            print(f"ghlab: nothing listening on {args.host}:{args.port}")
+            return 0
+        _force_kill(int(owner))
+        client = Client(f"http://{args.host}:{args.port}/")
+        for _ in range(40):
+            if not client.alive():
+                break
+            time.sleep(0.25)
+        print(f"ghlab: killed pid {owner} holding {args.host}:{args.port} (no pidfile)")
+        return 0 if not client.alive() else 1
     if not pid_path.exists():
         print("ghlab: no pidfile; nothing to stop")
         return 0
@@ -1452,7 +1487,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("stop", parents=[daemon], help="stop a detached daemon")
-    p.set_defaults(func=cmd_stop)
+    # No inherited default: `stop --port 8766` must not read another project's
+    # pidfile and kill that daemon instead (that bug killed a WPS daemon once).
+    p.set_defaults(func=cmd_stop, project_dir=None)
 
     p = sub.add_parser("status", parents=[common, daemon], help="daemon health")
     p.set_defaults(func=cmd_status)

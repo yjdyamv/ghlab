@@ -436,17 +436,26 @@ uv tool install ruff ty                  # 一次性
 ruff check . && ruff format --check .    # 或者直接 ruff format .
 ty check                                 # 类型检查
 
-python -m unittest discover -s tests -q  # 单元测试：254 个，约 7 秒，不需要 daemon
-GHLAB_LIVE=1 GHLAB_URL=http://127.0.0.1:8765/   GHLAB_TEST_BIN=notepad.exe   python -m unittest discover -s tests   # 加上端到端测试（要起 daemon，几十秒到几分钟）
+python -m unittest discover -s tests -q  # 272 个测试里跑 188 个，约 7 秒，不需要 daemon
+
+# 第一档：端到端冒烟，自带样例（40 KB 的 hostname.exe，临时项目，用完即删）
+GHLAB_LIVE=1 python -m unittest discover -s tests
+# 第二档：依赖某个特定样本（notepad.exe）的断言，需要它已导入
+GHLAB_LIVE_RICH=1 GHLAB_URL=http://127.0.0.1:8765/ python -m unittest discover -s tests
 ```
 
-**为什么分成两档**：端到端测试跑的是真反编译器。同一个文件对上 `wpscore.dll`（71304 个函数）
-要几分钟——每一次 `scan` 都是全库指令遍历，每一次失败的 `_function` 都要扫符号表。默认跑法
-必须是几秒钟，否则没人会在改一行代码后跑它。所以 `tests/test_live.py` 里的类全部挂在
-`GHLAB_LIVE` 下：不设这个环境变量时它们**整类跳过**（`skipped` 计数会显示），设了才真跑。
-实测默认档从 300 秒降到 7 秒，`GHLAB_LIVE=1` 档仍是同一批测试。
+**为什么分档，为什么不共用样本**：端到端测试跑的是真反编译器。第一档自己找机器上最小的系统二进制
+（Windows: `hostname.exe` → `whoami.exe` → `notepad.exe`；POSIX: `/bin/true` → `/bin/ls`，也可以用
+`GHLAB_TEST_BIN` 指定），在**临时项目 + 空闲端口**上导入一次，进程退出就停掉——不碰你的项目、
+不需要你装任何产品。用它跑完整套要 ~29 秒（其中导入占大头），测试本身 8 秒。
 
-配置在海 `pyproject.toml` 的 `[tool.ruff]` / `[tool.ty.*]`。两条规则值得说明：
+第二档里的断言是从 notepad.exe 上学来的具体事实（`RegSetValueExW` 的调用者、521 个函数），
+换个样本就不成立，所以它必须显式开启。默认跑法只跑单元测试：改一行代码后要能在几秒内跑完，
+否则没人会跑它。
+
+（此前不分档：一次 `discover` 300 秒，且在没有 WPS 的机器上会因为找不到样本而报错。）
+
+配置写在 `pyproject.toml` 的 `[tool.ruff]` / `[tool.ty.*]`。两条规则值得说明：
 
 - `select` 里带了 `BLE`（禁止裸 `except Exception`）：唯一豁免是 `session.py` 里那些**调用 jpype 反射**的地方，都写了 `# noqa: BLE001` 并注明原因（"a jpype call can raise anything"）。这类豁免是给人看的，不是给检查器看的。
 - `[tool.ty.rules] import-not-found = "ignore"`：`ghidra.*` / `jpype` 是 JVM 运行时才存在的模块，静态检查器没有可解析的包。关掉这条之后 ty 仍然抓到了真问题——比如 `_clean_name(callee)` 收到 `str | None`、`progress: io.TextIOBase` 接不住 `sys.stderr`、以及差集排序键的联合类型推断错误。
