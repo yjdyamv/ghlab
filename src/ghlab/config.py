@@ -13,6 +13,7 @@ install keeps working without a migration step.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
@@ -28,6 +29,23 @@ def config_path() -> Path:
     return Path(os.environ.get("GHLAB_CONFIG") or (Path.home() / ".ghlab" / "config.json"))
 
 
+def atomic_write_text(path: Path, text: str) -> None:
+    """Replace `path` atomically so a crash cannot leave a truncated file.
+
+    Everything ghlab writes back -- notes, the decompile cache, this setup file --
+    is read as if it were complete, and a half-written JSON file reads as "no
+    findings" rather than as an error. Write a sibling temp file and rename it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8", newline="\n")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+
+
 def load_config() -> dict[str, Any]:
     """Read the setup file; a missing or broken file is simply empty."""
     try:
@@ -39,9 +57,7 @@ def load_config() -> dict[str, Any]:
 
 def save_config(data: dict[str, Any]) -> Path:
     path = config_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(data, indent=2, ensure_ascii=False) + chr(10)
-    path.write_text(text, encoding="utf-8", newline=chr(10))
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + chr(10))
     return path
 
 
@@ -280,6 +296,5 @@ def read_focus() -> str:
 
 def write_focus(binary: str) -> Path:
     path = focus_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(binary.strip() + chr(10), encoding="utf-8", newline=chr(10))
+    atomic_write_text(path, binary.strip() + chr(10))
     return path

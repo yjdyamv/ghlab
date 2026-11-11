@@ -1745,7 +1745,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("bytes", parents=[common], help="raw memory")
     p.add_argument("binary")
     p.add_argument("addr")
-    p.add_argument("--size", type=int, default=64)
+    p.add_argument("--size", type=int, default=64, help="bytes to read (capped at 65536)")
     p.set_defaults(
         func=lambda a: _call(a, "bytes", {"binary": a.binary, "addr": a.addr, "size": a.size})
     )

@@ -189,10 +189,11 @@ ghlab similar notepad.exe FUN_140021ba8 --against other.exe
 ```
 
 任何命令加 `--json` 得到原始结构；`GHLAB_URL=http://host:port` 可指向远端 daemon。
-不带参数直接 `POST` 也行：
+不带参数直接 `POST` 也行（`Content-Type` 必须是 `application/json`，否则 415 —— `text/plain` 的跨站请求不触发 CORS 预检，放开它等于让任意网页驱动 `patch`）：
 
 ```bash
-curl -s localhost:8765/ -d '{"cmd":"decompile","binary":"notepad.exe","targets":["entry"],"include_callees":true}'
+curl -s localhost:8765/ -H 'Content-Type: application/json' \
+  -d '{"cmd":"decompile","binary":"notepad.exe","targets":["entry"],"include_callees":true}'
 curl -s localhost:8765/ | jq          # 自描述的命令表
 ```
 
@@ -342,7 +343,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `strings` | `binary` / `query, limit, offset, refs` | 字符串数据搜索；`--refs` 顺带给出引用它的函数（含大小），并在头部汇总“哪个函数用的字符串最多”（实测 0.28s / 4 条） |
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
-| `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii |
+| `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii。一次 `getBytes` 读完（不是逐字节），按“包含首地址的已初始化块”截断，上限 64 KiB；读短了或超上限返回 `size` 与 `truncated: true` |
 | `scan` | `binary, offset` / `range, func, limit, op, stack, imm, writes` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。实测 650 万条指令 38s |
 | `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
 | `rename` | `binary, target, new` | 重命名并保存 |
@@ -391,7 +392,7 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 ## 设计要点
 
 - **常驻 + 项目落盘**：`~/re/proj/ghlab` 是普通 Ghidra 项目，Ghidra GUI 也能打开看，两边结果一致。
-- **单线程 server**：Ghidra 的 transaction 不是线程安全的，串行执行换来"永不损坏项目"。
+- **串行 Ghidra 调用**：Ghidra 的 transaction 不是线程安全的，所有命令经一把 `LOCK` 串行；HTTP 层仍是多线程，所以长任务跑着的时候 `GET /`（busy、命令表）照常响应。
 - **服务端过滤**：`grep` 在 daemon 侧执行，只回传 `{line, text}`，几百个函数的扫描也只占几百 token。
 - **零依赖**：`protocol.py`/`client.py` 只用 stdlib，`session.py` 才懒加载 pyghidra → 单元测试和 CLI 都能在没有 Ghidra 的机器上跑。
 - **协议自描述**：`GET /` 返回全部命令及其参数，agent 可自举。

@@ -22,6 +22,11 @@ SLOW_MS = int(os.environ.get("GHLAB_SLOW_MS", "5000"))
 # a browser address bar, a link prefetch -- would otherwise start a job that
 # runs for minutes.
 GET_COMMANDS = ("ping", "binaries", "overview")
+# A daemon that can patch bytes must not answer cross-site "simple" requests: a
+# text/plain POST skips the CORS preflight, so any page the user visits could
+# otherwise drive `patch`/`rename`/`note`. application/json forces a preflight,
+# and every first-party client (Client, MCP) already sends exactly that.
+JSON_CONTENT_TYPE = "application/json"
 STARTED = time.time()
 
 
@@ -63,10 +68,23 @@ class Handler(BaseHTTPRequestHandler):
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
 
+    def _reject(self, code: int, note: str) -> None:
+        """Refuse without reading the body, then close so the body is not re-parsed."""
+        self._send(protocol.Err(note).to_bytes(), code)
+        self.close_connection = True
+        _log(f"cmd=? ms=0 status={code} {note}")
+
     def do_POST(self) -> None:
+        started = time.monotonic()
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != JSON_CONTENT_TYPE:
+            self._reject(415, f"Content-Type must be {JSON_CONTENT_TYPE}, got {ctype or 'none'}")
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._reject(411, "chunked bodies are not supported; send Content-Length")
+            return
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
-        started = time.monotonic()
         cmd = "?"
         params: dict[str, Any] = {}
         status = 200

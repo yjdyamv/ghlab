@@ -190,6 +190,7 @@ class Router:
         return self.default, params
 
     def _aggregate(self, cmd: str, params: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
         merged: list[dict[str, Any]] = []
         projects: list[dict[str, Any]] = []
         for name in self.targets:
@@ -207,7 +208,11 @@ class Router:
                 row = {"binary": item} if isinstance(item, str) else dict(item)
                 row["project"] = name
                 merged.append(row)
-        return {cmd: merged, "projects": projects, "elapsed_ms": 0}
+        return {
+            cmd: merged,
+            "projects": projects,
+            "elapsed_ms": int(1000 * (time.monotonic() - started)),
+        }
 
     def call(self, cmd: str, **params: Any) -> Any:
         if cmd == "projects":

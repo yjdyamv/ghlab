@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import tempfile
+import time
 import unittest
 from typing import Any
 from unittest import mock
@@ -165,6 +166,26 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(payload["binaries"][0]["project"], "ghlab")
         states = {row["project"]: row["alive"] for row in payload["projects"]}
         self.assertEqual(states, {"ghlab": True, "wps": False})
+
+    def test_aggregation_reports_how_long_it_took(self):
+        # `elapsed_ms` used to be a hardcoded 0, which made "why is `binaries` slow
+        # with five projects?" unanswerable from the tool's own output.
+        targets = {
+            "ghlab": target("ghlab", 8765, ["notepad.exe"]),
+            "wps": target("wps", 8766, ["wpscore.dll"]),
+        }
+
+        class SlowClient(FakeClient):
+            def call(self, cmd, **params):
+                time.sleep(0.02)
+                return super().call(cmd, **params)
+
+        clients: dict[str, router.ClientLike] = {
+            "ghlab": SlowClient(targets["ghlab"].url, ["notepad.exe"]),
+            "wps": SlowClient(targets["wps"].url, ["wpscore.dll"]),
+        }
+        payload = router.Router(targets=targets, default="ghlab", clients=clients).call("binaries")
+        self.assertGreaterEqual(payload["elapsed_ms"], 30)
 
     def test_autostart_starts_only_the_project_that_owns_the_binary(self):
         targets = {"wps": target("wps", 8766, ["wpscore.dll"])}

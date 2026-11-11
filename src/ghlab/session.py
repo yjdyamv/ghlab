@@ -15,12 +15,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import render
+from . import config, render
 
 MONITOR = None
 LOCK = threading.RLock()
-# What the dispatcher is running right now; the server is single-threaded, so this
-# is also the answer to "why is my request queued?".
+# What the dispatcher is running right now. Requests are threaded, but every
+# Ghidra call takes LOCK, so exactly one command runs at a time and this is also
+# the answer to "why is my request queued?". Set *inside* the lock: a command
+# still waiting for LOCK is queued, not running.
 _INFLIGHT: dict[str, Any] = {"cmd": None, "started": 0.0, "since": None}
 _proj = None
 _project_dir: Path | None = None
@@ -419,8 +421,12 @@ def _cache_read(key: str) -> str | None:
 
 
 def _cache_write(key: str, code: str) -> None:
+    # Empty output means the decompiler gave up mid-run; caching that would turn
+    # one failure into a permanent one.
+    if not code.strip():
+        return
     with contextlib.suppress(OSError):
-        (_cache_dir() / (key + ".c")).write_text(code, encoding="utf-8")
+        config.atomic_write_text(_cache_dir() / (key + ".c"), code)
 
 
 def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
@@ -1481,17 +1487,53 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
     return {"results": out}
 
 
+# A `bytes` answer is meant for an agent's context: 64 KiB is already ~200 KB of
+# hex, and the read itself must be one call, not one call per byte.
+MAX_BYTES = 65536
+
+
+def _byte_array(n: int):
+    """A Java byte[] of length n (jpype is imported lazily: only a real daemon has it)."""
+    from jpype import JArray, JByte
+
+    return JArray(JByte)(n)
+
+
+def _read_region(mem, addr, size: int) -> tuple[bytes, bool]:
+    """Read up to `size` bytes at `addr`, clamped to the containing initialized block.
+
+    `Memory.getBytes(Address, byte[])` is the sink form the JVM accepts; asking
+    `getByte(addr.add(i))` in a Python loop costs one crossing per byte and a
+    100 MB request turns into a hang instead of an error.
+    """
+    block = mem.getBlock(addr)
+    if block is None or not block.isInitialized():
+        raise ValueError(f"{addr} is not in initialized memory")
+    available = int(block.getEnd().subtract(addr)) + 1
+    want = min(size, available)
+    buf = _byte_array(want)
+    got = int(mem.getBytes(addr, buf))
+    data = bytes(buf[i] & 0xFF for i in range(got))
+    return data, want < size or got < want
+
+
 def cmd_bytes(a: dict[str, Any]) -> dict[str, Any]:
     e = _entry(a["binary"])
     p = e["program"]
     addr = _addr(e, a["addr"])
     size = int(a.get("size", 64))
-    mem = p.getMemory()
-    data = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(size))
+    if size <= 0:
+        raise ValueError("size must be positive")
+    capped = min(size, MAX_BYTES)
+    data, truncated = _read_region(p.getMemory(), addr, capped)
     return {
         "addr": str(addr),
         "hex": data.hex(),
         "ascii": "".join(chr(b) if 32 <= b < 127 else "." for b in data),
+        "size": len(data),
+        # Either the block ended or MAX_BYTES did: both mean "ask for less, or ask
+        # for the next chunk", and silently returning a short read hides that.
+        "truncated": truncated or capped < size,
     }
 
 
@@ -4102,7 +4144,7 @@ def _load_notes(binary: str) -> list[dict[str, Any]]:
 
 
 def _store_notes(binary: str, notes: list[dict[str, Any]]) -> None:
-    _notes_file(binary).write_text(json.dumps(notes, indent=2) + "\n", encoding="utf-8")
+    config.atomic_write_text(_notes_file(binary), json.dumps(notes, indent=2) + "\n")
 
 
 def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
@@ -4967,15 +5009,16 @@ def cmd_audit(a: dict[str, Any]) -> dict[str, Any]:
 
 
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
-    # `ping` is served to *ask* what is running, so it must never claim to be the
-    # thing that is running.
-    track = cmd != "ping"
-    if track:
-        _INFLIGHT["cmd"] = cmd
-        _INFLIGHT["started"] = time.monotonic()
-        _INFLIGHT["since"] = time.strftime("%H:%M:%S")
-    try:
-        with LOCK:
+    with LOCK:
+        # `ping` is served to *ask* what is running, so it must never claim to be
+        # the thing that is running. Everything else is marked only once it holds
+        # the lock: a request queued behind a slow decompile is not "running".
+        track = cmd != "ping"
+        if track:
+            _INFLIGHT["cmd"] = cmd
+            _INFLIGHT["started"] = time.monotonic()
+            _INFLIGHT["since"] = time.strftime("%H:%M:%S")
+        try:
             try:
                 result = HANDLERS[cmd](params)
             except Exception as ex:
@@ -4985,19 +5028,19 @@ def dispatch(cmd: str, params: dict[str, Any]) -> Any:
             if cmd in MUTATING:
                 _journal_append(cmd, params, result)
             return result
-    finally:
-        if track:
-            _INFLIGHT["cmd"] = None
-            _INFLIGHT["started"] = 0.0
-            _INFLIGHT["since"] = None
+        finally:
+            if track:
+                _INFLIGHT["cmd"] = None
+                _INFLIGHT["started"] = 0.0
+                _INFLIGHT["since"] = None
 
 
 def in_flight() -> dict[str, Any]:
     """What the daemon is doing right now (empty when idle).
 
-    The server is single-threaded, so an abandoned long call blocks every other
-    request. Reporting the running command is how you tell "slow" from "wedged"
-    without attaching a debugger.
+    Ghidra calls are serialized by LOCK, so an abandoned long call blocks every
+    other *command*; GET / keeps answering. Reporting the running command is how
+    you tell "slow" from "wedged" without attaching a debugger.
     """
     cmd = _INFLIGHT.get("cmd")
     if not cmd:

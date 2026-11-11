@@ -1,5 +1,6 @@
 """End-to-end over real HTTP, with a stub session so no Ghidra is needed."""
 
+import http.client
 import json
 import os
 import threading
@@ -221,6 +222,59 @@ class ServerTest(unittest.TestCase):
             self.assertIn("pid", info)
         finally:
             session._INFLIGHT.update({"cmd": None, "started": 0.0, "since": None})
+        self.assertEqual(session.in_flight(), {})
+
+    def test_a_text_plain_post_is_refused(self):
+        # `text/plain` is a CORS "simple" request: the browser sends it without a
+        # preflight, so without this check any page the user visits could drive
+        # `patch`/`rename`/`note` against the daemon.
+        before = len(self.stub.calls)
+        body = json.dumps({"cmd": "patch", "binary": "x.exe", "addr": "0x1000", "bytes": "90"})
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/",
+            data=body.encode(),
+            headers={"Content-Type": "text/plain;charset=UTF-8", "Origin": "https://evil.example"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(ctx.exception.code, 415)
+        self.assertEqual(len(self.stub.calls), before, "the rejected body must not run")
+
+    def test_a_chunked_body_is_refused_with_an_explanation(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(
+                "POST",
+                "/",
+                body=iter([b'{"cmd":"ping"}']),
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            payload = json.loads(resp.read())
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 411)
+        self.assertIn("Content-Length", payload["error"])
+
+    def test_a_queued_call_is_not_reported_as_running(self):
+        # Dispatch marks a command only once it holds the lock; a request parked
+        # behind a slow call used to overwrite (then wipe) the running status.
+        entered = threading.Event()
+        session.dispatch = type(self)._real_dispatch  # ty: ignore[invalid-assignment]
+        original = session.HANDLERS["binaries"]
+        session.HANDLERS["binaries"] = lambda _p: (entered.set(), {"binaries": []})[1]
+        session.LOCK.acquire()
+        worker = threading.Thread(target=lambda: session.dispatch("binaries", {}))
+        try:
+            worker.start()
+            self.assertFalse(entered.wait(0.3), "the call must still be waiting for the lock")
+            self.assertEqual(session.in_flight(), {}, "a queued call is not running")
+        finally:
+            session.LOCK.release()
+            worker.join(5)
+            session.HANDLERS["binaries"] = original
+            session.dispatch = self.stub.dispatch  # ty: ignore[invalid-assignment]
         self.assertEqual(session.in_flight(), {})
 
 
