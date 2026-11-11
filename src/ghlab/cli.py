@@ -120,6 +120,26 @@ def fmt_decompile(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_import(r: dict[str, Any]) -> str:
+    if r.get("load_specs") is not None:
+        rows = r["load_specs"]
+        out = [f"== {r['path']} : {len(rows)} load spec(s)"]
+        for row in rows:
+            out.append(f"   {row['loader']:<18} {row['language']:<28} {row['cspec']}")
+        if not rows:
+            out.append("   (no loader recognised this file)")
+        return chr(10).join(out)
+    if r.get("already_present"):
+        return f"{r['binary']} is already in the project (pass --overwrite to replace it)"
+    bits = [f"imported {r['binary']}"]
+    if r.get("language"):
+        bits.append(f"{r['language']}:{r['cspec']}")
+    if r.get("image_base"):
+        bits.append(f"base {r['image_base']}")
+    bits.append("analyzed" if r.get("analyzed") else "not analyzed (run `ghlab analyze`)")
+    return "  ".join(bits)
+
+
 def fmt_imports(r: dict[str, Any]) -> str:
     groups = ", ".join(f"{k} {v}" for k, v in r["groups"].items()) or "-"
     out = [
@@ -863,6 +883,7 @@ FORMATTERS = {
     "scan": fmt_scan,
     "offsets": fmt_offsets,
     "struct": fmt_struct,
+    "import": fmt_import,
     "imports": fmt_imports,
     "exports": fmt_exports,
     "names": fmt_names,
@@ -1646,10 +1667,41 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("binaries", parents=[common], help="list programs")
     p.set_defaults(func=lambda a: _call(a, "binaries"))
 
-    p = sub.add_parser("import", parents=[common], help="import + analyze a binary")
+    p = sub.add_parser(
+        "import", parents=[common], help="import + analyze a binary (base/language/no-analyze)"
+    )
     p.add_argument("path")
     p.add_argument("--no-analyze", action="store_true")
-    p.set_defaults(func=lambda a: _call(a, "import", {"path": a.path, "analyze": not a.no_analyze}))
+    p.add_argument("--base", default=None, help="load at this image base, e.g. 0x8000000")
+    p.add_argument(
+        "--language",
+        default=None,
+        help="force the language, e.g. x86:LE:32:default (see --show-loaders)",
+    )
+    p.add_argument("--cspec", default=None, help="compiler spec, e.g. gcc or windows")
+    p.add_argument("--name", default=None, help="store under this name instead of the file name")
+    p.add_argument("--overwrite", action="store_true", help="replace an existing program")
+    p.add_argument(
+        "--show-loaders",
+        action="store_true",
+        help="list the (loader, language, cspec) triples Ghidra offers for this file",
+    )
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "import",
+            {
+                "path": a.path,
+                "analyze": not a.no_analyze,
+                "base": a.base,
+                "language": a.language,
+                "cspec": a.cspec,
+                "name": a.name,
+                "overwrite": a.overwrite,
+                "show_loaders": a.show_loaders,
+            },
+        ),
+    )
 
     p = sub.add_parser("analyze", parents=[common], help="re-analyze everything or one address")
     p.add_argument("binary")

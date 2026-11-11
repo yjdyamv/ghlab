@@ -79,6 +79,8 @@ Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`，`export GHID
 ```bash
 ghlab import C:/Windows/System32/notepad.exe   # 导入 + 全量分析（约 75s，仅一次）
 ghlab import big.exe --no-analyze              # 只导入：字符串/导入立刻可查，分析稍后补
+ghlab import fw.bin --show-loaders             # 这个文件能被哪些 loader/语言组合导入
+ghlab import fw.bin --language x86:LE:32:default --base 0x8000000   # 固件：指语言 + 指基址
 ghlab analyze big.exe --addr 0x1400114c4       # 只分析这一段（2.3s），不是整个程序
 ghlab binaries
 ghlab info notepad.exe
@@ -337,7 +339,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 |---|---|---|
 | `ping` | – | 存活 + 项目信息 |
 | `binaries` | – | 项目内程序 |
-| `import` | `path` / `analyze` | 导入并分析 |
+| `import` | `path` / `analyze, base, language, cspec, name, overwrite, show_loaders` | 导入并分析。`--base 0x8000000` 换加载基址（在首次保存前重定位，分析后搬就等于让代码指向旧地址）；`--language x86:LE:32:default --cspec gcc` 强指定语言（固件/blob 靠它，`--show-loaders FILE` 先列出 Ghidra 认得的组合）；`--name` 换项目里的名字，`--overwrite` 替换已存在的同名程序 |
 | `analyze` | `binary` / `addr, full` | **增量分析**：`--addr` 只反汇编 + 建函数这一处（实测 2.3s，函数总数不变）；`--full` 重跑全量（notepad 实测 163s，比首次导入还慢——全量分析别当常用操作） |
 | `info` | `binary` | 语言、基址、MD5、函数数、段 |
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |

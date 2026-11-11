@@ -275,6 +275,81 @@ def cmd_binaries(_: dict[str, Any]) -> dict[str, Any]:
     return {"binaries": binary_names()}
 
 
+def _language_id(text: str) -> str:
+    """Validate the `processor:endian:size:variant` form Ghidra's LanguageID takes.
+
+    The point is to fail at the CLI with the shape you got wrong, instead of deep in
+    the importer with `No Language matched: x86_64`.
+    """
+    parts = str(text).split(":")
+    if len(parts) != 4 or not all(part.strip() for part in parts):
+        raise ValueError(
+            f"language {text!r} must look like x86:LE:64:default "
+            "(processor:endian:size:variant); `ghlab import --show-loaders FILE` lists them"
+        )
+    return ":".join(part.strip() for part in parts)
+
+
+def _load_spec_rows(path: Path) -> list[dict[str, Any]]:
+    """Every (loader, language, compiler spec) this JVM could import `path` with."""
+    from ghidra.app.util.bin import RandomAccessByteProvider
+    from ghidra.app.util.opinion import LoaderService
+    from java.io import File
+
+    provider = RandomAccessByteProvider(File(str(path)))
+    try:
+        rows = []
+        for spec in LoaderService().getSupportedLoadSpecs(provider):
+            pair = spec.getLanguageCompilerSpecPair()
+            rows.append(
+                {
+                    "loader": str(spec.getLoader().getName()),
+                    "language": str(pair.getLanguageID()),
+                    "cspec": str(pair.getCompilerSpecID()),
+                }
+            )
+        return sorted(rows, key=lambda r: (r["loader"], r["language"], r["cspec"]))
+    finally:
+        provider.close()
+
+
+def _auto_import(path: Path, name: str, language: str, cspec: str) -> Any:
+    """Import with an explicit language/compiler spec.
+
+    `AutoImporter` gained and lost a `ProgramConsumer` parameter across Ghidra
+    releases, so the overload is chosen from what this JVM actually exposes rather
+    than from memory -- and a miss prints the signatures it saw instead of a
+    `NoSuchMethodError` with no context.
+    """
+    import jpype  # the JVM only exists after boot()
+    from ghidra.program.util import LanguageCompilerSpecPair
+    from java.io import File
+
+    pair = LanguageCompilerSpecPair(language, cspec)
+    cls = jpype.JClass("ghidra.app.util.importer.AutoImporter").class_
+    head = [File(str(path)), project(), "/", name, pair]
+    seen: list[str] = []
+    errors: list[str] = []
+    for method in cls.getMethods():
+        if str(method.getName()) != "importByLookingForLcs":
+            continue
+        count = int(method.getParameterCount())
+        seen.append(f"{count} args")
+        args = [*head, None, MONITOR] if count == 7 else [*head, MONITOR]
+        try:
+            return method.invoke(None, args)
+        except Exception as ex:  # noqa: BLE001 - a wrong arity shows up here
+            errors.append(f"{count} args: {type(ex).__name__}: {ex}")
+    if not seen:
+        raise RuntimeError("this Ghidra has no AutoImporter.importByLookingForLcs")
+    raise RuntimeError("importByLookingForLcs failed -> " + " | ".join(errors))
+
+
+def _image_base(program: Any, text: str) -> Any:
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    return space.getAddress(int(str(text), 0))
+
+
 def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     from ghidra.app.script import GhidraScriptUtil
     from ghidra.program.flatapi import FlatProgramAPI
@@ -284,13 +359,31 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     path = Path(a["path"]).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"no such file: {path}")
-    name = path.name
+    if a.get("show_loaders"):
+        return {"path": str(path), "load_specs": _load_spec_rows(path)}
+    name = str(a.get("name") or path.name)
+    if a.get("language"):
+        language = _language_id(str(a["language"]))
+        cspec = str(a.get("cspec") or "default")
+    else:
+        language = cspec = ""
     proj = project()
-    if proj.getRootFolder().getFile(name):
+    existing = proj.getRootFolder().getFile(name)
+    if existing is not None and not a.get("overwrite"):
         return {"binary": name, "already_present": True}
-    program = proj.importProgram(File(str(path)))
+    if existing is not None:
+        existing.delete()
+    if language:
+        program = _auto_import(path, name, language, cspec)
+    else:
+        program = proj.importProgram(File(str(path)))
     if program is None:
         raise RuntimeError(f"Ghidra failed to import {path}")
+    if a.get("base") not in (None, ""):
+        # Rebasing has to happen before the first save: analysis fixes addresses,
+        # and a program moved after that keeps referring to the old ones.
+        with _edit(program, "ghlab import base"):
+            program.setImageBase(_image_base(program, str(a["base"])), True)
     proj.saveAs(program, "/", name, True)
     if a.get("analyze", True):
         api = FlatProgramAPI(program)
@@ -302,8 +395,17 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
         finally:
             GhidraScriptUtil.releaseBundleHostReference()
     proj.save(program)
+    out = {
+        "binary": name,
+        "imported": True,
+        "analyzed": bool(a.get("analyze", True)),
+        "image_base": str(program.getImageBase()),
+    }
+    if language:
+        out["language"] = language
+        out["cspec"] = cspec
     program.release(proj)
-    return {"binary": name, "imported": True, "analyzed": bool(a.get("analyze", True))}
+    return out
 
 
 def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
@@ -1424,9 +1526,9 @@ def _install_struct(program: Any, spec: dict[str, Any]) -> str:
 
 
 @contextlib.contextmanager
-def _edit(program: Any) -> Any:
+def _edit(program: Any, reason: str = "ghlab") -> Any:
     """One transaction, so a failure half-way cannot leave the program dirty."""
-    tx = program.startTransaction("ghlab struct")
+    tx = program.startTransaction(reason)
     try:
         yield program
     finally:

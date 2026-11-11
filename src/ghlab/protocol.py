@@ -48,7 +48,12 @@ class Spec:
 _SPECS = [
     Spec("ping", summary="liveness + project info"),
     Spec("binaries", summary="list programs in the project"),
-    Spec("import", ("path",), ("analyze",), "import + analyze a binary"),
+    Spec(
+        "import",
+        ("path",),
+        ("analyze", "base", "language", "cspec", "name", "overwrite", "show_loaders"),
+        "import + analyze a binary (optionally at an image base / with a chosen language)",
+    ),
     Spec("info", ("binary",), summary="metadata for one program"),
     Spec(
         "analyze",
