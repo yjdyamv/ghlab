@@ -136,6 +136,35 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_struct",
+        "description": (
+            "Infer a C struct from one function's [base + offset] accesses: width vote per "
+            "offset, gaps materialised so offsets stay true, `--create` installs the type. "
+            "Faster and more honest than guessing a layout from a decompiled listing."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {"type": "string", "description": "function name or 0x address"},
+                "base": {"type": "string", "description": "base variable (default: busiest param)"},
+                "offset": {"type": "string", "description": "only this field, e.g. 0x18"},
+                "name": {"type": "string", "description": "type name"},
+                "types": {
+                    "type": "string",
+                    "description": "override widths: 0x18=float,0x20=void *",
+                },
+                "pointer": {
+                    "type": "string",
+                    "description": "offsets that are pointers: 0x20,0x28",
+                },
+                "create": {"type": "boolean", "description": "install the type in the program"},
+                "limit": _LIMIT,
+            },
+            "required": ["binary", "target"],
+        },
+    },
+    {
         "name": "ghlab_scan",
         "description": (
             "Displacement search: which instructions read/write struct field +0xNN. Use it when "
@@ -592,6 +621,7 @@ _COMMANDS = {
     "ghlab_exports": "exports",
     "ghlab_scan": "scan",
     "ghlab_offsets": "offsets",
+    "ghlab_struct": "struct",
     "ghlab_decompile": "decompile",
     "ghlab_diff": "diff",
     "ghlab_slice": "slice",

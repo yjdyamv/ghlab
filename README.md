@@ -349,6 +349,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii。一次 `getBytes` 读完（不是逐字节），按“包含首地址的已初始化块”截断，上限 64 KiB；读短了或超上限返回 `size` 与 `truncated: true` |
 | `scan` | `binary, offset`（或 `hex`）/ `range, func, limit, op, stack, imm, writes, sequence, window` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。给 `--hex` 则改成**掩码字节搜索**（`48 8B ?? 05`），返回命中地址 + 所在段 + 所属函数。实测 650 万条指令 38s |
 | `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
+| `struct` | `binary, target` / `base, offset, name, types, pointer, create, limit` | **结构体推断**：把一个函数里同一 base 的字段访问按访问宽度投票成类型，缺口用 padding 补齐（偏移必须与代码一致），输出可直接编译的 C decl；`--types 0x18=float,0x20=void *` 人工纠正宽度，`--pointer 0x20` 标指针，`--create` 直接装进程序（之后 `set-type` 就能引用）；`offsets` 看归属，这个看布局 |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
 | `graph` | `binary, target` / `direction, depth, limit, format, out` | 调用树 BFS；`--format dot/mermaid/svg` 出图，`--out` 落盘（svg 是自绘的，无需 graphviz；dot 想再加工就交给 graphviz） |
@@ -377,7 +378,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 31 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 32 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 | `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 

@@ -1179,12 +1179,17 @@ def _param_accesses(hf: Any) -> list[dict[str, Any]]:
         if base is None:
             continue
         name = str(base.getHigh().getName()) if base.getHigh() is not None else "?"
+        if kinds == load:
+            width = op.getOutput()
+        else:
+            width = ins[2] if len(ins) >= 3 else None
         rows.append(
             {
                 "offset": f"{displacement:#x}" if displacement >= 0 else f"-{abs(displacement):#x}",
                 "base": name,
                 "kind": "param" if _is_param(base.getHigh()) else "local",
                 "op": "load" if kinds == load else "store",
+                "size": int(width.getSize()) if width is not None else 0,
             }
         )
     return rows
@@ -1276,6 +1281,205 @@ def cmd_offsets(a: dict[str, Any]) -> dict[str, Any]:
         "debug": debug or None,
         "elapsed_ms": int((time.monotonic() - began) * 1000),
     }
+
+
+_SIZED_TYPES = {1: "byte", 2: "ushort", 4: "int", 8: "longlong"}
+_GHIDRA_TYPES = {
+    "byte": "ByteDataType",
+    "ushort": "WordDataType",
+    "int": "IntegerDataType",
+    "uint": "DWordDataType",
+    "longlong": "LongLongDataType",
+    "ulonglong": "QWordDataType",
+    "float": "FloatDataType",
+    "double": "DoubleDataType",
+}
+
+
+def _align(value: int, alignment: int) -> int:
+    return (value + alignment - 1) // alignment * alignment
+
+
+def _parse_overrides(text: str | None) -> dict[int, str]:
+    """`0x18=float,0x20=void *` -> {0x18: 'float', 0x20: 'void *'}."""
+    out: dict[int, str] = {}
+    for item in str(text or "").split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise ValueError(f"bad override {item!r}; expected OFFSET=TYPE")
+        key, _, value = item.partition("=")
+        try:
+            out[int(key.strip(), 0)] = value.strip() or "int"
+        except ValueError:
+            raise ValueError(f"bad override {item!r}; expected OFFSET=TYPE") from None
+    return out
+
+
+def _infer_struct(
+    rows: list[dict[str, Any]],
+    name: str,
+    base: str,
+    overrides: dict[int, str] | None = None,
+) -> dict[str, Any]:
+    """Turn one base variable's field accesses into a C struct definition.
+
+    The vote is by access width, because width is the one thing p-code carries:
+    a field always loaded as 4 bytes is an `int` until a human says otherwise
+    (`overrides` wins). Gaps are materialised as padding so every offset in the
+    decl is the offset in the code -- a struct that silently pack-tightens would
+    describe a layout the program does not have.
+    """
+    overrides = overrides or {}
+    buckets: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        if row.get("base") != base:
+            continue
+        try:
+            offset = int(str(row["offset"]), 0)
+        except ValueError:
+            continue
+        if offset < 0:  # `[base - 0x8]` is a container_of trick, not a field
+            continue
+        bucket = buckets.setdefault(
+            offset, {"offset": offset, "widths": Counter(), "loads": 0, "stores": 0}
+        )
+        width = int(row.get("size") or 0) or 4
+        bucket["widths"][width] += 1
+        bucket["loads" if row.get("op") == "load" else "stores"] += 1
+    if not buckets:
+        return {
+            "name": name,
+            "base": base,
+            "size": 0,
+            "fields": [],
+            "decl": f"// no field access on {base!r} in this function",
+            "confidence": "none",
+        }
+    fields: list[dict[str, Any]] = []
+    for offset in sorted(buckets):
+        bucket = buckets[offset]
+        width = bucket["widths"].most_common(1)[0][0]
+        kind = overrides.get(offset, _SIZED_TYPES.get(width, f"byte[{width}]"))
+        fields.append(
+            {
+                "offset": offset,
+                "name": f"field_{offset:#x}",
+                "size": width,
+                "type": kind,
+                "loads": bucket["loads"],
+                "stores": bucket["stores"],
+                "widths": dict(sorted(bucket["widths"].items())),
+            }
+        )
+    total = _align(max(f["offset"] + f["size"] for f in fields), 8)
+    lines = [f"struct {name} {{"]
+    cursor = 0
+    for field in fields:
+        if field["offset"] > cursor:
+            lines.append(f"    byte gap_{cursor:#x}[{field['offset'] - cursor:#x}];")
+        suffix = f"  // {field['loads']} load(s), {field['stores']} store(s)"
+        lines.append(f"    {field['type']:<12} {field['name']};{suffix}")
+        cursor = field["offset"] + field["size"]
+    if total > cursor:
+        lines.append(f"    byte gap_{cursor:#x}[{total - cursor:#x}];")
+    lines.append("};")
+    return {
+        "name": name,
+        "base": base,
+        "size": total,
+        "fields": fields,
+        "decl": "\n".join(lines),
+        "confidence": "measured" if len(fields) > 1 else "single-field",
+    }
+
+
+def _install_struct(program: Any, spec: dict[str, Any]) -> str:
+    """Put the inferred type into the program so `set-type` can name it.
+
+    Only the type is installed, never applied to a parameter: rewriting a
+    signature behind the user's back would need `ApplyFunctionSignatureCmd` and a
+    prototype nobody asked for. `ghlab set-type FUNC "int f(Foo *p)"` does that
+    in one visible step.
+    """
+    import ghidra.program.model.data as dtypes  # the JVM only exists after boot()
+    from ghidra.program.model.data import DataTypeConflictHandler
+
+    manager = program.getDataTypeManager()
+    struct = dtypes.StructureDataType(spec["name"], spec["size"], manager)
+    for field in spec["fields"]:
+        wanted = str(field["type"])
+        if wanted.replace(" ", "").endswith("*"):
+            data_type = dtypes.PointerDataType()
+        elif wanted in _GHIDRA_TYPES:
+            data_type = getattr(dtypes, _GHIDRA_TYPES[wanted])()
+        else:
+            raise ValueError(
+                f"cannot create field {field['name']} of type {wanted!r}; "
+                f"known: {', '.join(sorted(_GHIDRA_TYPES))}, or NAME * for a pointer"
+            )
+        struct.add(field["offset"], data_type, field["name"], f"{field['loads']} load(s)")
+    manager.addDataType(struct, DataTypeConflictHandler.REPLACE_HANDLER)
+    return str(struct.getPathName())
+
+
+@contextlib.contextmanager
+def _edit(program: Any) -> Any:
+    """One transaction, so a failure half-way cannot leave the program dirty."""
+    tx = program.startTransaction("ghlab struct")
+    try:
+        yield program
+    finally:
+        program.endTransaction(tx, True)
+
+
+def cmd_struct(a: dict[str, Any]) -> dict[str, Any]:
+    """What struct is behind `[param+0x18]`?  Infer it from the field accesses."""
+    began = time.monotonic()
+    binary = a["binary"]
+    e = _entry(binary)
+    p = e["program"]
+    target = str(a["target"])
+    fn = _function(e, target)
+    if fn is None:
+        raise KeyError(f"function {target!r} not found{_function_suggestions(p, target)}")
+    res = e["decomp"].decompileFunction(fn, int(a.get("timeout", 60)), MONITOR)
+    if not res.decompileCompleted():
+        raise ValueError(f"decompiler said: {res.getErrorMessage()}")
+    rows = _param_accesses(res.getHighFunction())
+    # A parameter is what a struct pointer usually is; only fall back to locals
+    # when this function keeps its object on the stack.
+    params = [row for row in rows if row["kind"] == "param"]
+    rows = params or rows
+    bases: Counter = Counter(row["base"] for row in rows)
+    if not bases:
+        raise ValueError(f"{fn.getName()} touches no memory through a variable")
+    base = a.get("base") or bases.most_common(1)[0][0]
+    if base not in bases:
+        raise ValueError(f"{base!r} is not a base variable here; saw {', '.join(sorted(bases))}")
+    overrides = _parse_overrides(a.get("types"))
+    for offset in str(a.get("pointer") or "").replace(",", " ").split():
+        overrides[int(offset, 0)] = "void *"
+    want = a.get("offset")
+    if want not in (None, ""):
+        only = int(str(want), 0)
+        rows = [row for row in rows if row["base"] == base and int(row["offset"], 0) == only]
+    name = a.get("name") or f"{fn.getName()}_{re.sub(r'W', '', base)}_t".replace("__", "_")
+    spec = _infer_struct(rows, name, base, overrides)
+    out: dict[str, Any] = {
+        "binary": binary,
+        "function": fn.getName(),
+        "prototype": str(fn.getPrototypeString(False, False)),
+        "bases": dict(bases.most_common()),
+        "accesses": len(rows),
+        **spec,
+        "elapsed_ms": int(1000 * (time.monotonic() - began)),
+    }
+    if spec["fields"] and a.get("create") in (True, "yes", "true", "1"):
+        with _edit(p):
+            out["created"] = _install_struct(p, spec)
+            out["saved_via"] = _save(p, "ghlab struct", e)
+    return out
 
 
 def _parse_hex_pattern(text: str) -> tuple[bytes, bytes]:
@@ -5193,6 +5397,13 @@ MUTATING = (
 )
 
 
+def _mutates(cmd: str, args: dict[str, Any]) -> bool:
+    """`struct` is a question ... unless `create=yes` installs the type."""
+    if cmd == "struct":
+        return args.get("create") in (True, "yes", "true", "1")
+    return cmd in MUTATING
+
+
 def readonly() -> bool:
     """Was this daemon asked to refuse every change?  (GHLAB_READONLY=1)
 
@@ -5428,17 +5639,17 @@ def dispatch(cmd: str, params: dict[str, Any]) -> Any:
             _INFLIGHT["started"] = time.monotonic()
             _INFLIGHT["since"] = time.strftime("%H:%M:%S")
         try:
-            if cmd in MUTATING and readonly():
+            if _mutates(cmd, params) and readonly():
                 raise PermissionError(
                     f"daemon is read-only (GHLAB_READONLY=1); {cmd!r} changes the project"
                 )
             try:
                 result = HANDLERS[cmd](params)
             except Exception as ex:
-                if cmd in MUTATING:
+                if _mutates(cmd, params):
                     _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
                 raise
-            if cmd in MUTATING:
+            if _mutates(cmd, params):
                 _journal_append(cmd, params, result)
             return result
         finally:
@@ -5579,6 +5790,7 @@ HANDLERS = {
     "names": cmd_names,
     "scan": cmd_scan,
     "offsets": cmd_offsets,
+    "struct": cmd_struct,
     "imports": cmd_imports,
     "exports": cmd_exports,
     "xrefs": cmd_xrefs,

@@ -149,7 +149,8 @@ class ServerTest(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 self._get("/overview")  # the stub raises KeyError for it
             self.assertEqual(ctx.exception.code, 500)
-            lines = self._wait_for_line(lines, 1)
+            lines = self._wait_for(lines, "cmd=overview")
+        self.assertTrue(lines, "no log line for the failing GET")
         self.assertIn("status=500", lines[0])
 
     def test_down_daemon_gives_actionable_message(self):
@@ -159,12 +160,20 @@ class ServerTest(unittest.TestCase):
             dead.call("ping")
         self.assertIn("ghlab start", str(ctx.exception))
 
-    def _wait_for_line(self, lines: list[str], count: int, timeout: float = 2.0) -> list[str]:
-        """The handler logs after it answers, so a fast client can beat the log."""
+    def _wait_for(self, lines: list[str], needle: str, timeout: float = 2.0) -> list[str]:
+        """Wait for the line *this* test wrote.
+
+        The handler logs on its own thread after answering, so a line from the
+        previous test can land inside this test's window -- indexing `lines` would
+        then assert against somebody else's request. Only the content identifies
+        a line, so only the content is trusted.
+        """
         deadline = time.monotonic() + timeout
-        while len(lines) < count and time.monotonic() < deadline:
+        while True:
+            hits = [line for line in lines if needle in line]
+            if hits or time.monotonic() > deadline:
+                return hits
             time.sleep(0.01)
-        return lines
 
     def test_every_request_is_logged(self):
         lines: list[str] = []
@@ -172,13 +181,15 @@ class ServerTest(unittest.TestCase):
             self.client.call("ping")
             with self.assertRaises(RemoteError):
                 self.client.call("info", binary="stub.exe")
-            lines = self._wait_for_line(lines, 2)
-        self.assertEqual(len(lines), 2)
-        self.assertIn("cmd=ping", lines[0])
-        self.assertIn("status=200", lines[0])
-        self.assertIn("cmd=info", lines[1])
-        self.assertIn("status=500", lines[1])
-        self.assertIn("KeyError", lines[1])
+            # `lines` is the collector the mock appends to; keep the filtered views
+            # in their own names or the second wait would watch a filtered copy.
+            ping = self._wait_for(lines, "cmd=ping")
+            info = self._wait_for(lines, "cmd=info")
+        self.assertTrue(ping, "ping was not logged")
+        self.assertIn("status=200", ping[0])
+        self.assertTrue(info, "the failing call was not logged")
+        self.assertIn("status=500", info[0])
+        self.assertIn("KeyError", info[0])
 
     def test_slow_requests_are_marked(self):
         lines: list[str] = []

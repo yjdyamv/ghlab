@@ -209,6 +209,26 @@ def _fmt_hex_scan(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_struct(r: dict[str, Any]) -> str:
+    head = (
+        f"== {r['binary']} {r['function']} ({r.get('elapsed_ms')}ms)"
+        f"  base {r.get('base')}  {r.get('accesses')} access(es)"
+    )
+    out = [head]
+    if r.get("bases"):
+        ranked = ", ".join(f"{n} x{c}" for n, c in r["bases"].items())
+        out.append(f"   bases: {ranked}")
+    out.extend(str(r.get("decl") or "").split(chr(10)))
+    if r.get("created"):
+        out.append(f"   installed as {r['created']} (saved via {r.get('saved_via')})")
+        out.append(
+            f'   apply it with: ghlab set-type {r["binary"]} {r["function"]} "int f(struct {r["name"]} *p)"'
+        )
+    elif r.get("fields"):
+        out.append("   pass --create to install this type in the program")
+    return chr(10).join(out)
+
+
 def fmt_scan(r: dict[str, Any]) -> str:
     if "matches" in r:
         return _fmt_hex_scan(r)
@@ -842,6 +862,7 @@ FORMATTERS = {
     "strings": fmt_strings,
     "scan": fmt_scan,
     "offsets": fmt_offsets,
+    "struct": fmt_struct,
     "imports": fmt_imports,
     "exports": fmt_exports,
     "names": fmt_names,
@@ -1764,6 +1785,38 @@ def build_parser() -> argparse.ArgumentParser:
             a,
             "offsets",
             {"binary": a.binary, "target": a.target, "offset": a.offset, "limit": a.limit},
+        ),
+    )
+
+    p = sub.add_parser(
+        "struct",
+        parents=[common],
+        help="infer a C struct from one function's [base+offset] accesses",
+    )
+    p.add_argument("binary")
+    p.add_argument("target", help="function name or address")
+    p.add_argument("--base", default=None, help="base variable (default: the busiest parameter)")
+    p.add_argument("--offset", default=None, help="only this field, e.g. 0x18")
+    p.add_argument("--name", default=None, help="type name (default: <fn>_<base>_t)")
+    p.add_argument("--types", default=None, help="override widths, e.g. 0x18=float,0x20=void *")
+    p.add_argument("--pointer", default=None, help="offsets that are pointers, e.g. 0x20,0x28")
+    p.add_argument("--create", action="store_true", help="install the type in the program")
+    p.add_argument("-n", "--limit", type=int, default=200)
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "struct",
+            {
+                "binary": a.binary,
+                "target": a.target,
+                "base": a.base,
+                "offset": a.offset,
+                "name": a.name,
+                "types": a.types,
+                "pointer": a.pointer,
+                "create": a.create,
+                "limit": a.limit,
+            },
         ),
     )
 

@@ -56,6 +56,24 @@ class ValidateTest(unittest.TestCase):
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "offsets", "binary": "a.exe"})
 
+    def test_struct_takes_the_inference_knobs(self):
+        self.assertIn("struct", protocol.COMMAND_NAMES)
+        spec, params = protocol.validate(
+            {
+                "cmd": "struct",
+                "binary": "a.exe",
+                "target": "FUN_1",
+                "types": "0x18=float",
+                "pointer": "0x20",
+                "create": True,
+            }
+        )
+        self.assertEqual(spec.name, "struct")
+        self.assertEqual(params["types"], "0x18=float")
+        self.assertTrue(params["create"])
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate({"cmd": "struct", "binary": "a.exe"})
+
     def test_scan_accepts_the_imm_and_writes_filters(self):
         spec, params = protocol.validate(
             {"cmd": "scan", "binary": "a.exe", "offset": "0x44", "imm": "0..5", "writes": True}

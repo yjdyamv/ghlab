@@ -112,6 +112,12 @@ _SPECS = [
         "which parameter or local each struct offset belongs to (offsets alone are not facts)",
     ),
     Spec(
+        "struct",
+        ("binary", "target"),
+        ("base", "offset", "name", "types", "pointer", "create", "limit"),
+        "infer a C struct from one function's field accesses (create=yes installs the type)",
+    ),
+    Spec(
         "scan",
         ("binary",),
         (
