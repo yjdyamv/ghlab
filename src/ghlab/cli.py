@@ -1512,10 +1512,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wait", type=int, default=120)
     p.set_defaults(func=cmd_start)
 
-    p = sub.add_parser("stop", parents=[daemon], help="stop a detached daemon")
-    # No inherited default: `stop --port 8766` must not read another project's
-    # pidfile and kill that daemon instead (that bug killed a WPS daemon once).
-    p.set_defaults(func=cmd_stop, project_dir=None)
+    # `stop` declares its own copies of these three options instead of taking the
+    # `daemon` parent: parents=[] shares the *action objects*, so a
+    # set_defaults(project_dir=None) here rewrote the default for serve, start,
+    # status and doctor as well (it did, and `ghlab start` then passed None on the
+    # child's command line). No inherited default matters here: `stop --port 8766`
+    # must not read another project's pidfile and kill that daemon instead (that
+    # bug killed a WPS daemon once).
+    p = sub.add_parser("stop", help="stop a detached daemon")
+    p.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
+    p.add_argument("--port", type=int, default=int(cfg.get("port") or DEFAULT_PORT))
+    p.add_argument("--project-dir", help="stop this project's daemon (default: by --port)")
+    p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("status", parents=[common, daemon], help="daemon health")
     p.set_defaults(func=cmd_status)

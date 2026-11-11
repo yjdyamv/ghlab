@@ -255,3 +255,11 @@ class StopByPortTest(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["stop", "--port", "9202"])
         self.assertIsNone(args.project_dir, "stop must resolve the project from the port")
+
+    def test_every_daemon_command_gets_a_real_project_dir(self):
+        # parents=[] shares action objects, so a stop-only default leaked into the
+        # others: doctor crashed on Path(None) and `start` passed None to the child.
+        parser = cli.build_parser()
+        for cmd in ("serve", "start", "status", "doctor"):
+            with self.subTest(cmd=cmd):
+                self.assertIsInstance(parser.parse_args([cmd]).project_dir, str)

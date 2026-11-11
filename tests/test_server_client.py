@@ -3,6 +3,7 @@
 import http.client
 import json
 import os
+import socket
 import threading
 import time
 import unittest
@@ -91,6 +92,36 @@ class ServerTest(unittest.TestCase):
     def _get(self, path: str) -> dict:
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as r:
             return json.loads(r.read())
+
+    def _raw(self, payload: bytes) -> tuple[int, bytes]:
+        """Send bytes a well-behaved client would never send, and read the answer."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            sock.sendall(payload)
+            return self._read_response(sock)
+        finally:
+            sock.close()
+
+    @staticmethod
+    def _read_response(sock) -> tuple[int, bytes]:
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        status = int(head.split(b" ")[1])
+        length = 0
+        for line in head.split(b"\r\n")[1:]:
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1])
+        while len(rest) < length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            rest += chunk
+        return status, rest[:length]
 
     def test_get_runs_a_command_that_takes_no_arguments(self):
         # `curl host/binaries` is the first thing a new client tries; the help page
@@ -256,6 +287,44 @@ class ServerTest(unittest.TestCase):
             conn.close()
         self.assertEqual(resp.status, 411)
         self.assertIn("Content-Length", payload["error"])
+
+    def test_head_answers_with_the_help_page_headers_and_no_body(self):
+        # `curl -I` / link checkers use HEAD; 501 from the base class made a healthy
+        # daemon look dead to every one of them.
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("HEAD", "/")
+            resp = conn.getresponse()
+            body = resp.read()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn("application/json", resp.getheader("Content-Type"))
+        self.assertGreater(int(resp.getheader("Content-Length")), 100)
+        self.assertEqual(body, b"")
+
+    def test_an_oversized_body_is_refused_before_it_is_read(self):
+        # Nothing downstream needs a 1 GB command; reading it would park a thread.
+        from ghlab import server as server_mod
+
+        with mock.patch.object(server_mod, "MAX_BODY", 16):
+            status, body = self._raw(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 999999\r\n\r\n"
+            )
+        self.assertEqual(status, 413)
+        self.assertIn(b"limit is 16", body)
+
+    def test_a_stalled_body_is_dropped_after_the_read_timeout(self):
+        # The response timeout is 900 s because big answers take a while to write;
+        # a client that never sends its body must not inherit that patience.
+        with mock.patch.dict(os.environ, {"GHLAB_READ_TIMEOUT": "0.2"}):
+            status, body = self._raw(
+                b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 10\r\n\r\n"
+            )
+        self.assertEqual(status, 408)
+        self.assertIn(b"timed out", body)
 
     def test_a_queued_call_is_not_reported_as_running(self):
         # Dispatch marks a command only once it holds the lock; a request parked

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from collections import Counter
@@ -87,6 +88,7 @@ def binary_names() -> list[str]:
 def _entry(binary: str) -> dict[str, Any]:
     """Open (and cache) one program; `binary` may be a unique substring."""
     if binary in _programs:
+        _programs[binary]["used"] = time.monotonic()
         return _programs[binary]
     names = binary_names()
     if binary not in names:
@@ -94,17 +96,53 @@ def _entry(binary: str) -> dict[str, Any]:
         if len(cand) != 1:
             raise KeyError(f"binary {binary!r} not found; project has {names}")
         binary = cand[0]
+        # the substring spelling may still hit an already-open program
+        if binary in _programs:
+            _programs[binary]["used"] = time.monotonic()
+            return _programs[binary]
     from ghidra.app.decompiler import DecompInterface
     from ghidra.program.flatapi import FlatProgramAPI
 
-    program = project().openProgram("/", binary, False)
+    proj = project()
+    program = proj.openProgram("/", binary, False)
     decomp = DecompInterface()
     decomp.toggleCCode(True)
     decomp.toggleSyntaxTree(True)
     decomp.openProgram(program)
-    entry = {"binary": binary, "program": program, "decomp": decomp, "api": FlatProgramAPI(program)}
+    entry = {
+        "binary": binary,
+        "proj": proj,
+        "program": program,
+        "decomp": decomp,
+        "api": FlatProgramAPI(program),
+        "used": time.monotonic(),
+    }
     _programs[binary] = entry
+    _evict_lru(keep=binary)
     return entry
+
+
+def _evict_lru(keep: str) -> None:
+    """Close the least recently used programs; an open program costs heap for life.
+
+    Every open program keeps its lists, symbol index and decompiler alive for as
+    long as the daemon runs, so a session that touched twenty binaries ends up
+    holding all twenty. `GHLAB_MAX_OPEN_PROGRAMS` (default 4) caps that; the one
+    being asked for is never evicted.
+    """
+    cap = max(1, int(os.environ.get("GHLAB_MAX_OPEN_PROGRAMS", "4")))
+    while len(_programs) > cap:
+        candidates = [name for name in _programs if name != keep]
+        if not candidates:
+            return
+        victim = min(candidates, key=lambda name: _programs[name].get("used", 0.0))
+        entry = _programs.pop(victim)
+        with contextlib.suppress(Exception):  # jpype: already closed, or never opened
+            entry["decomp"].dispose()
+        with contextlib.suppress(Exception):
+            entry["program"].release(entry["proj"])
+        for key in [k for k in _FP_CACHE if k[0] == victim]:
+            _FP_CACHE.pop(key, None)
 
 
 def _hex_addr(text: Any) -> int | None:
@@ -176,12 +214,16 @@ def _function(entry: dict[str, Any], target: str):
     return None
 
 
-def _save(program, message: str) -> str:
+def _save(program, message: str, entry: dict[str, Any] | None = None) -> str:
     """Persist the program.
 
     Ghidra 12.2 leaves a transaction open from `GhidraProject.openProgram`, so
     `program.save(...)` fails with "Unable to lock due to active transaction".
     Saving through the project works (it manages the domain file itself).
+
+    Pass `entry` when the change alters what the decompiler prints: the disk cache
+    is keyed by md5/prototype/comments only, so patched bytes would otherwise keep
+    answering from stale source until someone remembered `--refresh`.
     """
     attempts = (
         ("project.save(program)", lambda: project().save(program)),
@@ -192,6 +234,8 @@ def _save(program, message: str) -> str:
     for label, fn in attempts:
         try:
             fn()
+            if entry is not None:
+                _cache_purge(entry)
             return label
         except Exception as ex:  # noqa: BLE001
             errors.append(f"{label}: {type(ex).__name__}: {ex}")
@@ -280,7 +324,7 @@ def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
             e["api"].analyzeAll(p)
         finally:
             GhidraScriptUtil.releaseBundleHostReference()
-        saved = _save(p, "ghlab analyze (full)")
+        saved = _save(p, "ghlab analyze (full)", e)
         return {
             "binary": a["binary"],
             "mode": "full",
@@ -313,7 +357,7 @@ def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
             )
     finally:
         p.endTransaction(tx, True)
-    saved = _save(p, "ghlab analyze")
+    saved = _save(p, "ghlab analyze", e)
     return {
         "binary": a["binary"],
         "mode": "targeted",
@@ -410,8 +454,17 @@ def _decomp_cache_key(e, fn) -> str:
     return h.hexdigest()
 
 
-def _cache_read(key: str) -> str | None:
-    path = _cache_dir() / (key + ".c")
+def _cache_bucket(md5: Any) -> Path:
+    """One directory per program, so a write can drop exactly one program's cache.
+
+    Keys already carry the md5; the flat layout worked until a mutation had to
+    invalidate it -- deleting by bucket is one rmtree, deleting by prefix is a
+    glob over every program in the project.
+    """
+    return _cache_dir() / str(md5)
+
+
+def _cache_read(path: Path) -> str | None:
     if not path.exists():
         return None
     try:
@@ -420,13 +473,23 @@ def _cache_read(key: str) -> str | None:
         return None
 
 
-def _cache_write(key: str, code: str) -> None:
+def _cache_write(path: Path, code: str) -> None:
     # Empty output means the decompiler gave up mid-run; caching that would turn
     # one failure into a permanent one.
     if not code.strip():
         return
     with contextlib.suppress(OSError):
-        config.atomic_write_text(_cache_dir() / (key + ".c"), code)
+        config.atomic_write_text(path, code)
+
+
+def _cache_purge(e: dict[str, Any]) -> int:
+    """Drop every decompile cached for this program: a write changed what it emits."""
+    bucket = _cache_bucket(e["program"].getExecutableMD5())
+    if not bucket.is_dir():
+        return 0
+    removed = len(list(bucket.glob("*.c")))
+    shutil.rmtree(bucket, ignore_errors=True)
+    return removed
 
 
 def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
@@ -473,7 +536,8 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                 results.append(item)
                 continue
             key = None if a.get("refresh") else _decomp_cache_key(e, fn)
-            code = _cache_read(key) if key else None
+            cache_path = _cache_bucket(program.getExecutableMD5()) / (key + ".c") if key else None
+            code = _cache_read(cache_path) if cache_path else None
             cached = code is not None
             if code is None:
                 res = e["decomp"].decompileFunction(fn, timeout, MONITOR)
@@ -481,8 +545,8 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                     results.append({"target": str(t), "error": str(res.getErrorMessage())})
                     continue
                 code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
-                if key:
-                    _cache_write(key, code)
+                if cache_path:
+                    _cache_write(cache_path, code)
             all_lines = code.splitlines()
             item = brief(fn)
             item["cached"] = cached
@@ -3650,7 +3714,7 @@ def cmd_patch(a: dict[str, Any]) -> dict[str, Any]:
     finally:
         p.endTransaction(tx, True)
     after = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(len(data)))
-    saved = _save(p, "ghlab patch")
+    saved = _save(p, "ghlab patch", e)
     return {
         "addr": str(addr),
         "before": before.hex(),
@@ -3736,7 +3800,7 @@ def cmd_set_type(a: dict[str, Any]) -> dict[str, Any]:
         out = apply_one(e, a["target"], decl)
     finally:
         p.endTransaction(tx, True)
-    out["saved_via"] = _save(p, "ghlab set-type")
+    out["saved_via"] = _save(p, "ghlab set-type", e)
     return out
 
 
@@ -3827,7 +3891,7 @@ def cmd_types(a: dict[str, Any]) -> dict[str, Any]:
                 )
     finally:
         p.endTransaction(tx, True)
-    saved = _save(p, "ghlab types")
+    saved = _save(p, "ghlab types", e)
     return {
         "binary": str(a["binary"]),
         "applied": applied,
@@ -3876,7 +3940,7 @@ def cmd_pdb(a: dict[str, Any]) -> dict[str, Any]:
         "log": str(log)[:2000],
     }
     if ok:
-        out["saved_via"] = _save(p, "ghlab pdb")
+        out["saved_via"] = _save(p, "ghlab pdb", e)
     return out
 
 
@@ -4708,8 +4772,12 @@ def _map_rows(e, functions: list[Any], op: str, grep: re.Pattern[str] | None, hi
         item["hits"] = 0
         if op == "decompile":
             code = None
+            cache_path = None
             with contextlib.suppress(Exception):  # cache key touches jpype
-                code = _cache_read(_decomp_cache_key(e, fn))
+                cache_path = _cache_bucket(program.getExecutableMD5()) / (
+                    _decomp_cache_key(e, fn) + ".c"
+                )
+                code = _cache_read(cache_path)
             if code is None:
                 res = e["decomp"].decompileFunction(fn, 60, MONITOR)
                 if not res.decompileCompleted():
@@ -4717,8 +4785,9 @@ def _map_rows(e, functions: list[Any], op: str, grep: re.Pattern[str] | None, hi
                     rows.append(item)
                     continue
                 code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
-                with contextlib.suppress(OSError):
-                    _cache_write(_decomp_cache_key(e, fn), code)
+                if cache_path is not None:
+                    with contextlib.suppress(OSError):
+                        _cache_write(cache_path, code)
             if grep is not None:
                 found = _grep_code(code, grep)
                 item["hits"] = len(found)

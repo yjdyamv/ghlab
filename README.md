@@ -197,6 +197,8 @@ curl -s localhost:8765/ -H 'Content-Type: application/json' \
 curl -s localhost:8765/ | jq          # 自描述的命令表
 ```
 
+请求体必须带 `Content-Length`（chunked 回 411），上限 8 MiB、30s 内发完（超时 408）；`HEAD /` 与 `GET /` 同头无体，`curl -I` 能直接看到 daemon 是否活着。
+
 ## 可重放脚本（`ghlab run`）
 
 分析一个样本往往要十几条命令。把顺序写成脚本，下次换个样本只改一个变量：
@@ -339,7 +341,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `analyze` | `binary` / `addr, full` | **增量分析**：`--addr` 只反汇编 + 建函数这一处（实测 2.3s，函数总数不变）；`--full` 重跑全量（notepad 实测 163s，比首次导入还慢——全量分析别当常用操作） |
 | `info` | `binary` | 语言、基址、MD5、函数数、段 |
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |
-| `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache`，热查询 2.5s → 0.19s，`--refresh` 强制重算 |
+| `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache/<md5>/`，热查询 2.5s → 0.19s；`patch`/`set-type`/`types`/`pdb`/`analyze` 保存后自动清空该程序的缓存，`--refresh` 仍可手动强制重算 |
 | `strings` | `binary` / `query, limit, offset, refs` | 字符串数据搜索；`--refs` 顺带给出引用它的函数（含大小），并在头部汇总“哪个函数用的字符串最多”（实测 0.28s / 4 条） |
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
@@ -398,7 +400,8 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 - **协议自描述**：`GET /` 返回全部命令及其参数，agent 可自举。
 - **模拟执行是"够用主义"**：`EmulatorHelper` 在独立内存里跑，写入不落回 program；外部导入用 Python 应答（CRT 真的有语义，其余返回 0），`lock` 等未实现的 p-code op 直接跳过并在输出里点名。所以它适合解密循环、配置解析、返回值推演，不适合依赖真实 API 语义的逻辑。
 - **diff 不假设地址对齐**：指纹是"这个函数引用了哪些字符串/调用了哪些导入/用了哪些常量/多大/多少块"，匹配时先找签名唯一的，再退同地址（同基址补丁）、同名（有符号）、最后相似度贪心（阈值 `--min-score`）。所以既能比同源补丁，也能比隔了几个版本的构建。
-- **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`；打完补丁要 `--refresh`。
+- **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`。补丁改了字节而键不变，所以缓存按 `<md5>/` 分目录，写操作保存成功后整目录删掉——不用记着 `--refresh`。
+- **打开的 program 有上限**：每个打开的 program 都会把符号表、反编译器和地址索引留在堆里，摸过十个二进制就占十份。`GHLAB_MAX_OPEN_PROGRAMS`（默认 4）按最近使用淘汰，被淘汰的 program 会被 `release`（下次用到重新打开，项目本身没变）。
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
 - **图要不依赖外部工具也能看**：SVG 自己按 BFS 层次排（列=深度，行=同层节点），不装 graphviz 也能直接丢浏览器/报告；DOT/Mermaid 是给“还要再加工”的场景留的接口

@@ -27,6 +27,14 @@ GET_COMMANDS = ("ping", "binaries", "overview")
 # otherwise drive `patch`/`rename`/`note`. application/json forces a preflight,
 # and every first-party client (Client, MCP) already sends exactly that.
 JSON_CONTENT_TYPE = "application/json"
+# A request body is a command and its arguments; 8 MiB is orders of magnitude more
+# than the largest real one (bulk `types` maps) and small enough that an uploaded
+# body cannot be used to park a thread.
+MAX_BODY = 8 * 1024 * 1024
+# How long a client may take to send that body. Separate from
+# GHLAB_SOCKET_TIMEOUT, which must stay long: decompiling a big binary writes tens
+# of megabytes back to a slow client and a short write timeout would cut it off.
+READ_TIMEOUT = 30.0
 STARTED = time.time()
 
 
@@ -49,6 +57,26 @@ def _describe(params: dict[str, Any]) -> str:
     return " ".join(bits)
 
 
+def _info_body() -> bytes:
+    """The self-describing help page: GET / returns it, HEAD / advertises its size."""
+    return json.dumps(
+        {
+            "ok": True,
+            "service": "ghlab",
+            "pid": os.getpid(),
+            "uptime_s": round(time.time() - STARTED, 1),
+            "busy": session.in_flight(),
+            "usage": 'POST / with {"cmd": "<name>", ...}, or GET /<name> for the '
+            "commands that take no arguments (ping, binaries, overview, ...)",
+            "cmds": {
+                name: {"required": s.required, "optional": s.optional, "summary": s.summary}
+                for name, s in protocol.SPECS.items()
+            },
+        },
+        ensure_ascii=False,
+    ).encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "ghlab/0.1"
@@ -60,19 +88,47 @@ class Handler(BaseHTTPRequestHandler):
         with contextlib.suppress(OSError):
             self.connection.settimeout(float(os.environ.get("GHLAB_SOCKET_TIMEOUT", "900")))
 
-    def _send(self, body: bytes, code: int = 200) -> None:
+    def _send(self, body: bytes, code: int = 200, head_only: bool = False) -> None:
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if head_only:
+            return
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.wfile.write(body)
+
+    def _read_body(self, n: int) -> bytes:
+        """Read exactly n bytes of request body, under a deadline of its own."""
+        read_timeout = float(os.environ.get("GHLAB_READ_TIMEOUT", str(READ_TIMEOUT)))
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(read_timeout)
+        try:
+            return self.rfile.read(n) if n else b"{}"
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(float(os.environ.get("GHLAB_SOCKET_TIMEOUT", "900")))
 
     def _reject(self, code: int, note: str) -> None:
         """Refuse without reading the body, then close so the body is not re-parsed."""
         self._send(protocol.Err(note).to_bytes(), code)
         self.close_connection = True
+        # Log before draining: a delayed line would land in the next test's capture.
         _log(f"cmd=? ms=0 status={code} {note}")
+        self._drain()
+
+    def _drain(self, budget: float = 0.2) -> None:
+        """Swallow what the client is still sending, so the close is not an RST.
+
+        Closing a socket with unread bytes in the receive buffer makes Windows
+        answer with RST; the client then loses the 415/411 it was about to read
+        and reports a reset instead (seen with chunked bodies from http.client).
+        """
+        deadline = time.monotonic() + budget
+        with contextlib.suppress(OSError):
+            self.connection.settimeout(0.05)
+            while time.monotonic() < deadline and self.connection.recv(65536):
+                pass
 
     def do_POST(self) -> None:
         started = time.monotonic()
@@ -83,8 +139,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Transfer-Encoding"):
             self._reject(411, "chunked bodies are not supported; send Content-Length")
             return
-        n = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(n) if n else b"{}"
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._reject(400, "Content-Length is not a number")
+            return
+        if n > MAX_BODY:
+            self._reject(413, f"body is {n} bytes; the limit is {MAX_BODY}")
+            return
+        try:
+            raw = self._read_body(n)
+        except TimeoutError:
+            self._reject(408, "timed out reading the request body")
+            return
         cmd = "?"
         params: dict[str, Any] = {}
         status = 200
@@ -136,23 +203,13 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as ex:  # noqa: BLE001
                 body = json.dumps({"ok": False, "error": f"{type(ex).__name__}: {ex}"}).encode()
         else:
-            body = json.dumps(
-                {
-                    "ok": True,
-                    "service": "ghlab",
-                    "pid": os.getpid(),
-                    "uptime_s": round(time.time() - STARTED, 1),
-                    "busy": session.in_flight(),
-                    "usage": 'POST / with {"cmd": "<name>", ...}, or GET /<name> for the '
-                    "commands that take no arguments (ping, binaries, overview, ...)",
-                    "cmds": {
-                        name: {"required": s.required, "optional": s.optional, "summary": s.summary}
-                        for name, s in protocol.SPECS.items()
-                    },
-                },
-                ensure_ascii=False,
-            ).encode()
+            body = _info_body()
         self._send(body)
+
+    def do_HEAD(self) -> None:
+        # `curl -I` and link checkers probe with HEAD; the inherited 501 made a
+        # healthy daemon look broken. Same headers as GET /, no body.
+        self._send(_info_body(), head_only=True)
 
     def log_message(self, format: str, *args: Any) -> None:
         if os.environ.get("GHLAB_VERBOSE"):

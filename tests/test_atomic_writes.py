@@ -45,8 +45,8 @@ class AtomicWriteTest(unittest.TestCase):
         self.assertEqual(list(self.dir.glob("*.tmp")), [])
 
     def test_an_empty_cache_entry_is_not_written(self):
-        with mock.patch.object(session, "_cache_dir", lambda: self.dir):
-            session._cache_write("deadbeef", "")
+        path = self.dir / "md5" / "deadbeef.c"
+        session._cache_write(path, "")
         self.assertEqual(list(self.dir.iterdir()), [])
 
     def test_save_config_round_trips(self):
