@@ -66,6 +66,7 @@ def _info_body() -> bytes:
             "pid": os.getpid(),
             "uptime_s": round(time.time() - STARTED, 1),
             "busy": session.in_flight(),
+            "readonly": session.readonly(),
             "usage": 'POST / with {"cmd": "<name>", ...}, or GET /<name> for the '
             "commands that take no arguments (ping, binaries, overview, ...)",
             "cmds": {

@@ -133,6 +133,24 @@ def fmt_imports(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_exports(r: dict[str, Any]) -> str:
+    rows = r.get("exports") or []
+    out = [
+        f"# {r['total']} export(s), {r['demangled']} demangled  ({r['elapsed_ms']}ms)"
+        + ("  [truncated]" if r.get("truncated") else "")
+    ]
+    if not rows:
+        out.append("  (this binary exports nothing)")
+        return chr(10).join(out)
+    for row in rows:
+        readable = row.get("demangled")
+        name = row["name"]
+        out.append(f"  {row['addr']:<12} {readable or name}")
+        if readable:
+            out.append(f"  {'':<12} {name}")
+    return chr(10).join(out)
+
+
 def fmt_names(r: dict[str, Any]) -> str:
     state = "cached" if r.get("cached") else "built"
     out = [
@@ -174,7 +192,26 @@ def fmt_offsets(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def _fmt_hex_scan(r: dict[str, Any]) -> str:
+    matches = r.get("matches") or []
+    out = [
+        f"== {r['binary']} : {r['hex']}  {len(matches)} match(es) in "
+        f"{r['blocks_scanned']} block(s) ({r['elapsed_ms']}ms)"
+    ]
+    if not matches:
+        out.append("   (pattern not found)")
+        return chr(10).join(out)
+    for m in matches:
+        fn = m.get("function") or "-"
+        out.append(f"   {m['addr']}  {m['block'] or '-':<14} {fn:<24} {m['bytes']}")
+    if r.get("truncated"):
+        out.append("   [truncated; raise -n]")
+    return chr(10).join(out)
+
+
 def fmt_scan(r: dict[str, Any]) -> str:
+    if "matches" in r:
+        return _fmt_hex_scan(r)
     out = [
         f"== {r['binary']} : {r['scanned']} instruction(s) scanned for {r['pattern']} "
         f"({r['elapsed_ms']}ms)"
@@ -483,11 +520,27 @@ def fmt_digest(r: dict[str, Any]) -> str:
 
 
 def fmt_patch(r: dict[str, Any]) -> str:
-    return (
-        f"patched {r['size']} byte(s) at {r['addr']}\n"
-        f"  {r['before']} -> {r['after']}\n"
-        f"  saved via {r['saved_via']}"
-    )
+    lines = [
+        f"patched {r['size']} byte(s) at {r['addr']}",
+        f"  {r['before']} -> {r['after']}",
+        f"  saved via {r['saved_via']}",
+    ]
+    if r.get("reversible"):
+        lines.append(
+            f"  original kept; `ghlab revert {r.get('binary') or 'BIN'} {r['addr']}` undoes it"
+        )
+    else:
+        lines.append("  [too large to keep the original bytes; this one cannot be reverted]")
+    return chr(10).join(lines)
+
+
+def fmt_revert(r: dict[str, Any]) -> str:
+    rows = r.get("reverted") or []
+    out = [f"# {len(rows)} patch(es) unwound in {r['binary']}"]
+    for row in rows:
+        out.append(f"  {row['addr']}  {row['was']} -> {row['restored']}")
+    out.append(f"  {r.get('remaining', 0)} recorded patch(es) left")
+    return chr(10).join(out)
 
 
 def fmt_set_type(r: dict[str, Any]) -> str:
@@ -790,6 +843,7 @@ FORMATTERS = {
     "scan": fmt_scan,
     "offsets": fmt_offsets,
     "imports": fmt_imports,
+    "exports": fmt_exports,
     "names": fmt_names,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
@@ -800,6 +854,7 @@ FORMATTERS = {
     "emulate": fmt_emulate,
     "decrypt": fmt_decrypt,
     "patch": fmt_patch,
+    "revert": fmt_revert,
     "set_type": fmt_set_type,
     "bookmark": fmt_bookmark,
     "note": fmt_note,
@@ -1655,6 +1710,24 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    p = sub.add_parser("exports", parents=[common], help="exported entries, demangled")
+    p.add_argument("binary")
+    p.add_argument("-m", "--match", help="regex on the mangled or demangled name")
+    p.add_argument("-q", "--query", help="alias for --match")
+    p.add_argument("-n", "--limit", type=int, default=0, help="max rows (0 = all)")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "exports",
+            {
+                "binary": a.binary,
+                "match": a.match,
+                "query": a.query,
+                "limit": a.limit,
+            },
+        )
+    )
+
     p = sub.add_parser("names", parents=[common], help="method names from assertion strings")
     p.add_argument("binary")
     p.add_argument("-q", "--query", help="regex on the recovered name")
@@ -1695,10 +1768,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser(
-        "scan", parents=[common], help="instructions that touch a struct field offset"
+        "scan", parents=[common], help="field-offset displacement search, or a byte pattern"
     )
     p.add_argument("binary")
-    p.add_argument("offset", help="displacement, e.g. 0x54")
+    p.add_argument("offset", nargs="?", default=None, help="displacement, e.g. 0x54")
+    p.add_argument(
+        "--hex",
+        default=None,
+        help="byte pattern with ?? wildcards instead of an offset, e.g. '48 8B ?? 05'",
+    )
     p.add_argument("--range", default=None, help="0xSTART-0xEND to limit the sweep")
     p.add_argument("--func", dest="in_func", default=None, help="limit to one function")
     p.add_argument("-n", "--limit", type=int, default=60)
@@ -1732,6 +1810,7 @@ def build_parser() -> argparse.ArgumentParser:
             {
                 "binary": a.binary,
                 "offset": a.offset,
+                "hex": a.hex,
                 "range": a.range,
                 "func": a.in_func,
                 "limit": a.limit,
@@ -1998,6 +2077,28 @@ def build_parser() -> argparse.ArgumentParser:
                 "bytes": a.bytes,
                 "nop": a.nop,
                 "expect": a.expect,
+            },
+        )
+    )
+
+    p = sub.add_parser("revert", parents=[common], help="put back the bytes a patch overwrote")
+    p.add_argument("binary")
+    p.add_argument("addr", nargs="?", help="address to unwind (default: with --all, everything)")
+    p.add_argument("--all", action="store_true", help="unwind every recorded patch, newest first")
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="restore even if the bytes changed since the patch",
+    )
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "revert",
+            {
+                "binary": a.binary,
+                "addr": a.addr,
+                "all": a.all,
+                "force": a.force,
             },
         )
     )

@@ -345,8 +345,9 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `strings` | `binary` / `query, limit, offset, refs` | 字符串数据搜索；`--refs` 顺带给出引用它的函数（含大小），并在头部汇总“哪个函数用的字符串最多”（实测 0.28s / 4 条） |
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
+| `exports` | `binary` / `match, query, limit` | **导出面**：这个二进制对外开放的入口（PE 导出表 / ELF `.dynsym`），每个都附还原后的 C++ 名字（`_Z`/`?` 开头的走 Ghidra 自带 demangler）。`imports` 问"我调用了谁"，这个问"别人能调用我什么"——拿到 DLL/SO 先看它，能直接看出 SDK 边界与插件入口 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii。一次 `getBytes` 读完（不是逐字节），按“包含首地址的已初始化块”截断，上限 64 KiB；读短了或超上限返回 `size` 与 `truncated: true` |
-| `scan` | `binary, offset` / `range, func, limit, op, stack, imm, writes` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。实测 650 万条指令 38s |
+| `scan` | `binary, offset`（或 `hex`）/ `range, func, limit, op, stack, imm, writes, sequence, window` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。给 `--hex` 则改成**掩码字节搜索**（`48 8B ?? 05`），返回命中地址 + 所在段 + 所属函数。实测 650 万条指令 38s |
 | `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
@@ -360,7 +361,8 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `decrypt` | – / `binary, addr, len, hex, ciphers, min_printable, limit` | **破小块密文**：单字节 xor/add/sub、rol/ror、utf-16le、base64 全试一遍，只留"像字符串"的候选（要求至少一段 4 字母连写），按可打印度 + 字母数字占比 + 配置关键词打分排序。`--hex` 直接给密文，或给 `binary`+`--addr/--len` 从内存读 |
 | `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed, stub` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置），`--stub FN[ARGn=V]=RET` 可跳过某个调用并直接给返回值（按第 1–4 个整数参数匹配），用于"函数读配置再计算"的场景 |
 | `diff` | `a, b` / `match, limit, min_score, detail, semantic` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`）；`--semantic` 换成整库视角：新增/移除的**导入（带 inject/exec/network… 风险分组）、字符串、常量**，`counts` 永远是真实总数（列表按 `-n` 截断并标 `truncated`） |
-| `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
+| `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 || `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
+| `revert` | `binary` / `addr, all, force` | **撤销补丁**：`patch` 会把被覆盖的原字节记到 `<项目>/.ghlab/patches/`，`revert BIN 0x401000` 还原那一处，`--all` 按从新到旧把整个补丁栈退回去（同一地址打了两次就退两次）。若当前字节已不是当初写入的（说明后来又被改过），默认拒绝并报出两边内容，`--force` 才强行覆盖——默认拒绝是刻意的：那已经是另一处编辑，不是 undo |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
 | `note` | `binary, text` / `at, addr, tag, assert, delete` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
@@ -375,7 +377,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 23 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 31 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 | `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 
@@ -402,6 +404,14 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 - **diff 不假设地址对齐**：指纹是"这个函数引用了哪些字符串/调用了哪些导入/用了哪些常量/多大/多少块"，匹配时先找签名唯一的，再退同地址（同基址补丁）、同名（有符号）、最后相似度贪心（阈值 `--min-score`）。所以既能比同源补丁，也能比隔了几个版本的构建。
 - **缓存键里不放指令字节**：第一次反编译会重写 code unit，反编译前算的哈希和之后算的永远不等，所以键用 `md5+地址+函数签名+注释`。补丁改了字节而键不变，所以缓存按 `<md5>/` 分目录，写操作保存成功后整目录删掉——不用记着 `--refresh`。
 - **打开的 program 有上限**：每个打开的 program 都会把符号表、反编译器和地址索引留在堆里，摸过十个二进制就占十份。`GHLAB_MAX_OPEN_PROGRAMS`（默认 4）按最近使用淘汰，被淘汰的 program 会被 `release`（下次用到重新打开，项目本身没变）。
+- **能看不能改**：`GHLAB_READONLY=1` 起的 daemon 会拒绝所有写命令
+  （`patch`/`set_type`/`types`/`pdb`/`rename`/`comment`/`note`/`bookmark`/`import`/`analyze`），
+  返回 `PermissionError` 且 handler 根本不执行；`audit`/`verify` 照常跑，只是不写回 notes 文件。
+  `ping` 与 `GET /` 会带上 `readonly: true`，客户端能自己判断。
+
+  ```bash
+  GHLAB_READONLY=1 ghlab serve --port 8765   # 交给模型/同事的脚本时用
+  ```
 - **相似度必须防 stub 噪声**：几百个 29 字节 thunk 的空指纹两两相似度都是 1.00，所以"没有任何共享字符串/导入/常量"的候选一律压到 0.3 以下。
 - **写操作全部落盘、全部可校验**：`patch` 要求 `--expect` 长度与写入一致（防手滑写错位置），改完重新反汇编；`set_type` 以声明里的名字为准；`note` 同时写 Ghidra 书签和磁盘 JSON——书签给 GUI 用户看，JSON 给 agent 和 `report` 用，两边不互相依赖（Ghidra 崩了结论还在）。
 - **图要不依赖外部工具也能看**：SVG 自己按 BFS 层次排（列=深度，行=同层节点），不装 graphviz 也能直接丢浏览器/报告；DOT/Mermaid 是给“还要再加工”的场景留的接口
@@ -419,6 +429,8 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 同一偏移在多套结构体里重复出现时，用逗号一次问几个字段：`ghlab scan BIN 0x168,0x170,0x178 --writes` 只保留**同时**碰到这三处的函数——单偏移在 30 MB 的二进制里必然被噪声淹没。
 
 要认“结构体拷贝”这种形状，用 `--sequence`：`ghlab scan BIN 0x8,0x10,0x18 --sequence --window 24` 要求三个偏移按顺序落在一个 24 条指令的窗口里，命中直接打印整段。全库一遍约 50 秒（6.5M 条指令），先 `--range`/`--func` 缩小范围。
+
+找一串字节（特征码、字符串常量、立即数表）时把偏移换成 `--hex`：`ghlab scan BIN --hex '48 8B ?? 05'`。`??` 是按字节的通配符（半字节通配会直接报错拒绝），搜索走 `Memory.findBytes(addr, mask)`，每命中一次一次 JVM 调用；输出是命中地址、所在段、所属函数和实际字节（`??` 位置会填成真实值）。用 `-n` 限制条数，命中上限即标 `truncated`。
 
 ## 开发
 

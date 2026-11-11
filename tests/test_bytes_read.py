@@ -1,10 +1,11 @@
 """`bytes` reads a region in one call, clamps to the block, and caps the answer.
 
 No Ghidra here: `_read_region` is driven through a fake memory object and the one
-jpype touchpoint (`_byte_array`) is swapped for a bytearray.
+jpype touchpoint (`_zero_bytes`) is swapped for a bytearray.
 """
 
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from ghlab import session
@@ -61,7 +62,7 @@ class FakeProgram:
 
 class ReadRegionTest(unittest.TestCase):
     def setUp(self):
-        patcher = mock.patch.object(session, "_byte_array", bytearray)
+        patcher = mock.patch.object(session, "_zero_bytes", bytearray)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -98,7 +99,7 @@ class BytesCommandTest(unittest.TestCase):
     def run_cmd(self, mem: FakeMemory, size: int) -> dict:
         program = FakeProgram(mem)
         with (
-            mock.patch.object(session, "_byte_array", bytearray),
+            mock.patch.object(session, "_zero_bytes", bytearray),
             mock.patch.object(session, "_entry", lambda _name: {"program": program}),
             mock.patch.object(session, "_addr", lambda _entry, _text: FakeAddr(0x1000)),
         ):
@@ -121,6 +122,14 @@ class BytesCommandTest(unittest.TestCase):
     def test_zero_size_is_rejected(self):
         with self.assertRaises(ValueError):
             self.run_cmd(FakeMemory(0x1000, b"\x90"), 0)
+
+    def test_the_sink_allocator_does_not_shadow_the_bytes_helper(self):
+        # Two module-level `_byte_array` definitions: the later one wins, so a sink
+        # allocator with the same name turned every real `bytes` call into a
+        # TypeError (len() of an int) that the mocked tests above could not see.
+        src = Path(session.__file__).read_text(encoding="utf-8")
+        self.assertEqual(src.count("def _byte_array("), 1)
+        self.assertEqual(src.count("def _zero_bytes("), 1)
 
 
 if __name__ == "__main__":

@@ -263,6 +263,8 @@ def ping(_: dict[str, Any]) -> dict[str, Any]:
         "binaries": len(binary_names()),
         "loaded": sorted(_programs),
     }
+    if readonly():
+        out["readonly"] = True
     busy = in_flight()
     if busy:
         out["busy"] = busy
@@ -678,6 +680,86 @@ def cmd_imports(a: dict[str, Any]) -> dict[str, Any]:
 _STACK_REF = re.compile(r"\[(?:RSP|RBP|ESP|EBP)[\s,+\-]")
 # The last operand of an instruction, when it is an immediate: `MOV [RAX+0x8],0x4`.
 _LAST_IMM = re.compile(r",\s*(-?(?:0x)?[0-9a-f]+)\s*$", re.I)
+
+
+def _demangle(program, name: str) -> str | None:
+    """Readable form of a mangled C++ name, or None when it is not mangled.
+
+    Ghidra already ships both demanglers (Itanium and MSVC), so this adds no
+    dependency; the entry point moved between versions, so every signature is
+    tried and a miss stays quiet rather than failing the whole listing.
+    """
+    if not name or not name.startswith(("_Z", "?")):
+        return None
+    try:
+        from ghidra.app.util.demangler import DemanglerUtil
+    except Exception:  # noqa: BLE001 - unit tests have no Ghidra on the path
+        return None
+    attempts = (
+        lambda: DemanglerUtil.demangle(program, name),
+        lambda: DemanglerUtil.demangle(name),
+    )
+    for attempt in attempts:
+        try:
+            obj = attempt()
+        except Exception:  # noqa: BLE001
+            continue
+        if obj is None:
+            continue
+        for getter in ("getSignature", "getNamespaceString"):
+            read = getattr(obj, getter, None)
+            if read is None:
+                continue
+            try:
+                text = str(read())
+            except Exception:  # noqa: BLE001
+                continue
+            if text and text != "null":
+                return text
+    return None
+
+
+def cmd_exports(a: dict[str, Any]) -> dict[str, Any]:
+    """Entries a binary makes callable from outside (PE exports, ELF .dynsym).
+
+    `imports` answers "what does this call"; this is the mirror question, plus the
+    demangled name, which is the first thing a reader wants from a C++ DLL.
+    """
+    started = time.time()
+    binary = a["binary"]
+    p = _entry(binary)["program"]
+    pattern = a.get("match") or a.get("query")
+    rx = re.compile(str(pattern), re.I) if pattern else None
+    limit = int(a.get("limit", 0))
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sym in p.getSymbolTable().getAllSymbols(True):
+        try:
+            if not sym.isExternalEntryPoint():
+                continue
+            name = str(sym.getName())
+        except Exception:  # noqa: BLE001 - jpype call, can raise anything
+            continue
+        if not name or name in seen:
+            continue
+        demangled = _demangle(p, name)
+        readable = demangled or name
+        if rx is not None and rx.search(f"{name} {readable}") is None:
+            continue
+        seen.add(name)
+        rows.append({"name": name, "demangled": demangled, "addr": str(sym.getAddress())})
+    rows.sort(key=lambda r: (r["demangled"] or r["name"]).lower())
+    total = len(rows)
+    if limit:
+        rows = rows[:limit]
+    return {
+        "binary": binary,
+        "total": total,
+        "demangled": sum(1 for r in rows if r["demangled"]),
+        "truncated": bool(limit) and total > len(rows),
+        "exports": rows,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
 
 
 def _split_operands(text: str) -> list[str]:
@@ -1196,24 +1278,33 @@ def cmd_offsets(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
-    """Find the instructions that read or write a given struct field offset.
+def _parse_hex_pattern(text: str) -> tuple[bytes, bytes]:
+    """'48 8B ?? 05' -> (values, masks); `??` becomes a zero mask byte."""
+    compact = re.sub(r"[\s,]+", "", str(text))
+    if not compact:
+        raise ValueError("hex pattern is empty")
+    if len(compact) % 2:
+        raise ValueError(f"{text!r} has an odd number of hex digits")
+    values, masks = bytearray(), bytearray()
+    for i in range(0, len(compact), 2):
+        pair = compact[i : i + 2]
+        if pair == "??":
+            values.append(0)
+            masks.append(0)
+        elif re.fullmatch(r"[0-9A-Fa-f]{2}", pair):
+            values.append(int(pair, 16))
+            masks.append(0xFF)
+        elif "?" in pair:
+            raise ValueError(f"only whole-byte wildcards (??) are supported, saw {pair!r}")
+        else:
+            raise ValueError(f"{pair!r} is not a hex byte")
+    if not any(masks):
+        raise ValueError("hex pattern has no fixed byte; `bytes` reads a region instead")
+    return bytes(values), bytes(masks)
 
-    This is the question you always ask when a struct's layout is known but its
-    consumers are not: who touches `+0x54`? A displacement search over the code
-    section answers it without any type information.
-    """
-    binary = a["binary"]
-    p = _entry(binary)["program"]
-    offsets = [int(part, 0) for part in str(a["offset"]).split(",") if part.strip()]
-    if not offsets:
-        raise ValueError("offset must be >= 0")
-    if any(value < 0 for value in offsets):
-        raise ValueError("offset must be >= 0")
-    offset = offsets[0]
-    limit = int(a.get("limit", 60))
-    op = re.compile(str(a["op"]), re.I) if a.get("op") else None
-    pattern = re.compile(rf"[+-]\s*{offset:#x}\]", re.I)
+
+def _scan_bounds(p, a: dict[str, Any]):
+    """[start, end] from `range` or `func`; (None, None) means the whole program."""
     start = end = None
     rng = a.get("range")
     if rng:
@@ -1225,15 +1316,100 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
         space = p.getAddressFactory().getDefaultAddressSpace()
         start, end = space.getAddress(lo), space.getAddress(hi)
     if a.get("func"):
-        fn = _function(_entry(binary), str(a["func"]))
+        fn = _function(_entry(str(a["binary"])), str(a["func"]))
         if fn is None:
             # A miss used to surface as "'NoneType' object has no attribute
             # 'getBody'", which reads like a bug in scan rather than in the name.
-            wanted = str(a["func"])
-            hint = _function_suggestions(p, wanted, limit=3)
-            raise KeyError(f"no function at or containing {wanted!r}" + hint)
+            hint = _function_suggestions(p, str(a["func"]), limit=3)
+            raise KeyError(f"no function at or containing {a['func']!r}" + hint)
         start, end = fn.getBody().getMinAddress(), fn.getBody().getMaxAddress()
+    return start, end
+
+
+def _byte_hit(mem, p, addr, values: bytes, masks: bytes) -> dict[str, Any]:
+    data, _ = _read_region(mem, addr, len(values))
+    block = mem.getBlock(addr)
+    fn = p.getFunctionManager().getFunctionContaining(addr)
+    return {
+        "addr": str(addr),
+        "block": str(block.getName()) if block is not None else None,
+        "function": str(fn.getName()) if fn is not None else None,
+        "bytes": data.hex(),
+        "pattern": "".join(f"{v:02x}" if m else "??" for v, m in zip(values, masks, strict=True)),
+    }
+
+
+def _scan_bytes(binary, p, spec: str, start, end, limit: int, began: float) -> dict[str, Any]:
+    """Where does this byte pattern occur?  One masked search per hit, not per byte."""
+    values, masks = _parse_hex_pattern(spec)
+    mem = p.getMemory()
+    needles, mask = _byte_array(values), _byte_array(masks)
+    matches: list[dict[str, Any]] = []
+    blocks_scanned = 0
+    for block in mem.getBlocks():
+        if not block.isInitialized():
+            continue
+        lo, hi = block.getStart(), block.getEnd()
+        if start is not None and hi.compareTo(start) < 0:
+            continue
+        if end is not None and lo.compareTo(end) > 0:
+            continue
+        cursor = lo if start is None or lo.compareTo(start) >= 0 else start
+        stop = hi if end is None or hi.compareTo(end) <= 0 else end
+        if cursor.compareTo(stop) > 0:
+            continue
+        blocks_scanned += 1
+        while True:
+            found = mem.findBytes(cursor, needles, mask, True, MONITOR)
+            if found is None or found.compareTo(stop) > 0:
+                break
+            matches.append(_byte_hit(mem, p, found, values, masks))
+            if len(matches) >= limit:
+                return {
+                    "binary": str(binary),
+                    "hex": str(spec),
+                    "blocks_scanned": blocks_scanned,
+                    "matches": matches,
+                    "truncated": True,
+                    "elapsed_ms": int((time.monotonic() - began) * 1000),
+                }
+            cursor = found.add(1)
+    return {
+        "binary": str(binary),
+        "hex": str(spec),
+        "blocks_scanned": blocks_scanned,
+        "matches": matches,
+        "truncated": False,
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
+
+
+def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
+    """Find what touches a struct field, or where a byte pattern occurs.
+
+    Two questions share one sweep: "who reads/writes +0x54" needs no type
+    information (a displacement search over the code), and "where does this
+    signature occur" is a masked byte search (`hex` with `??` wildcards).
+    """
+    binary = a["binary"]
+    p = _entry(binary)["program"]
+    limit = int(a.get("limit", 60))
+    if limit <= 0:
+        raise ValueError("limit must be positive")
+    start, end = _scan_bounds(p, a)
     began = time.monotonic()
+    if a.get("hex") not in (None, ""):
+        return _scan_bytes(binary, p, str(a["hex"]), start, end, limit, began)
+    if a.get("offset") in (None, ""):
+        raise ValueError("scan needs offset=<n> (field displacement) or hex=<pattern>")
+    offsets = [int(part, 0) for part in str(a["offset"]).split(",") if part.strip()]
+    if not offsets:
+        raise ValueError("offset must be >= 0")
+    if any(value < 0 for value in offsets):
+        raise ValueError("offset must be >= 0")
+    offset = offsets[0]
+    op = re.compile(str(a["op"]), re.I) if a.get("op") else None
+    pattern = re.compile(rf"[+-]\s*{offset:#x}\]", re.I)
     imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None
     writes = bool(a.get("writes"))
     if len(offsets) < 2:
@@ -1556,8 +1732,12 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
 MAX_BYTES = 65536
 
 
-def _byte_array(n: int):
-    """A Java byte[] of length n (jpype is imported lazily: only a real daemon has it)."""
+def _zero_bytes(n: int):
+    """A zeroed Java byte[] of length n, for a JVM call that fills it in place.
+
+    Not named `_byte_array`: that name already means "Python bytes -> Java byte[]"
+    (see the patch path), and a second definition silently shadowed it.
+    """
     from jpype import JArray, JByte
 
     return JArray(JByte)(n)
@@ -1575,7 +1755,7 @@ def _read_region(mem, addr, size: int) -> tuple[bytes, bool]:
         raise ValueError(f"{addr} is not in initialized memory")
     available = int(block.getEnd().subtract(addr)) + 1
     want = min(size, available)
-    buf = _byte_array(want)
+    buf = _zero_bytes(want)
     got = int(mem.getBytes(addr, buf))
     data = bytes(buf[i] & 0xFF for i in range(got))
     return data, want < size or got < want
@@ -3713,15 +3893,157 @@ def cmd_patch(a: dict[str, Any]) -> dict[str, Any]:
         DisassembleCommand(addr, None, True).applyTo(p)
     finally:
         p.endTransaction(tx, True)
+    _write_bytes(p, addr, data)
     after = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(len(data)))
+    backup = _record_patch(str(a["binary"]), addr, before, after)
     saved = _save(p, "ghlab patch", e)
     return {
+        "binary": str(a["binary"]),
         "addr": str(addr),
         "before": before.hex(),
         "after": after.hex(),
         "size": len(data),
         "saved_via": saved,
+        "backup": backup["file"],
+        "reversible": backup["reversible"],
     }
+
+
+def cmd_revert(a: dict[str, Any]) -> dict[str, Any]:
+    """Put back the bytes an earlier `patch` overwrote.
+
+    The patches are a stack per project: `addr` unwinds that address only, `all`
+    unwinds everything, newest first. Refuses when the bytes have moved on since
+    the patch (that is a different edit, not an undo) unless `force` is set.
+    """
+    e = _entry(a["binary"])
+    p = e["program"]
+    want_addr = str(a["addr"]) if a.get("addr") else None
+    every = bool(a.get("all"))
+    if not want_addr and not every:
+        raise ValueError("revert needs addr=<address> or all=yes")
+    records = _patch_records(str(a["binary"]))
+    if want_addr:
+        wanted = str(_addr(e, want_addr))
+        records = [r for r in records if str(r.get("addr")) == wanted]
+    if not records:
+        raise ValueError("no recorded patch" + (f" at {want_addr}" if want_addr else ""))
+    todo = records[::-1] if every else records[-1:]
+    mem = p.getMemory()
+    done = []
+    for rec in todo:
+        if not rec.get("reversible"):
+            raise ValueError(
+                f"the patch at {rec['addr']} was {rec.get('size')} byte(s); it was recorded "
+                "without its original bytes and cannot be reverted"
+            )
+        addr = _addr(e, str(rec["addr"]))
+        before = bytes.fromhex(str(rec["before"]))
+        current = bytes(mem.getByte(addr.add(i)) & 0xFF for i in range(len(before)))
+        if current != bytes.fromhex(str(rec.get("after", ""))) and not a.get("force"):
+            raise ValueError(
+                f"{rec['addr']} changed since the patch: now {current.hex()}, "
+                f"patched {rec.get('after')}; pass force=yes to overwrite anyway"
+            )
+        _write_bytes(p, addr, before, label="ghlab-revert")
+        saved = _save(p, "ghlab revert", e)
+        with contextlib.suppress(OSError):
+            Path(str(rec["file"])).unlink()
+        done.append(
+            {
+                "addr": str(rec["addr"]),
+                "restored": before.hex(),
+                "was": current.hex(),
+                "saved_via": saved,
+            }
+        )
+    return {
+        "binary": a["binary"],
+        "reverted": done,
+        "remaining": len(_patch_records(str(a["binary"]))),
+    }
+
+
+def _patch_dir() -> Path:
+    """Where the bytes a `patch` overwrote are kept so they can be put back."""
+    base = _project_dir or (Path.home() / "re" / "proj")
+    d = Path(base) / ".ghlab" / "patches"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# A patch is a handful of instructions; anything near this size is a bulk rewrite
+# whose "before" would be a second copy of the binary inside the project directory.
+MAX_RECORDED_PATCH = 4096
+
+
+def _patch_records(binary: str | None = None) -> list[dict[str, Any]]:
+    """Recorded patches, oldest first (the order a revert should unwind).
+
+    Two binaries in one project share address strings like "0x401000", so a
+    revert must never look at another binary's records.
+    """
+    out: list[dict[str, Any]] = []
+    for path in sorted(_patch_dir().glob("*.json")):
+        try:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if binary is not None and str(rec.get("binary")) != str(binary):
+            continue
+        rec["file"] = str(path)
+        out.append(rec)
+    out.sort(key=lambda r: (r.get("at", ""), r.get("seq", 0)))
+    return out
+
+
+def _record_patch(binary: str, addr, before: bytes, after: bytes) -> dict[str, Any]:
+    """Save what a patch destroyed; a revert is only possible because of this."""
+    seq = max((int(rec.get("seq", 0)) for rec in _patch_records()), default=0) + 1
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    rec = {
+        "binary": binary,
+        "addr": str(addr),
+        "size": len(before),
+        "before": before.hex(),
+        "after": after.hex(),
+        "at": stamp,
+        "seq": seq,
+        "reversible": len(before) <= MAX_RECORDED_PATCH,
+    }
+    if not rec["reversible"]:
+        rec.pop("before")
+    path = _patch_dir() / f"{seq:04d}-{str(addr).replace('0x', '')}-{stamp}.json"
+    config.atomic_write_text(path, json.dumps(rec, ensure_ascii=False) + chr(10))
+    rec["file"] = str(path)
+    return rec
+
+
+def _write_bytes(program, addr, data: bytes, label: str = "ghlab-patch") -> None:
+    """Replace bytes and re-disassemble (Ghidra demands clearing code units first)."""
+    mem = program.getMemory()
+    tx = program.startTransaction(label)
+    block = mem.getBlock(addr)
+    writable = _block_writable(block) if block is not None else True
+    try:
+        if block is not None and not writable:
+            block.setWrite(True)
+        program.getListing().clearCodeUnits(addr, addr.add(len(data) - 1), False)
+        mem.setBytes(addr, _byte_array(data))
+    finally:
+        if block is not None and not writable:
+            with contextlib.suppress(Exception):  # the block was read-only already
+                block.setWrite(False)
+        program.endTransaction(tx, True)
+    from ghidra.app.cmd.disassemble import DisassembleCommand
+
+    tx = program.startTransaction(f"{label}-disasm")
+    try:
+        DisassembleCommand(addr, None, True).applyTo(program)
+    finally:
+        program.endTransaction(tx, True)
 
 
 def _prototype(fn) -> str:
@@ -4208,6 +4530,10 @@ def _load_notes(binary: str) -> list[dict[str, Any]]:
 
 
 def _store_notes(binary: str, notes: list[dict[str, Any]]) -> None:
+    if readonly():
+        # audit/verify stay usable, they just do not remember: read-only means the
+        # project files on disk are not this daemon's to write.
+        return
     config.atomic_write_text(_notes_file(binary), json.dumps(notes, indent=2) + "\n")
 
 
@@ -4858,12 +5184,23 @@ MUTATING = (
     "rename",
     "comment",
     "patch",
+    "revert",
     "set_type",
     "bookmark",
     "note",
     "types",
     "pdb",
 )
+
+
+def readonly() -> bool:
+    """Was this daemon asked to refuse every change?  (GHLAB_READONLY=1)
+
+    A daemon handed to someone else (a model, a colleague's script) should be able
+    to answer questions without being able to edit the project.  Checked per call,
+    not cached, so a test can flip it.
+    """
+    return os.environ.get("GHLAB_READONLY", "").strip().lower() not in ("", "0", "no", "false")
 
 
 def _journal_file() -> Path:
@@ -4880,6 +5217,9 @@ def _journal_summary(cmd: str, params: dict[str, Any], result: Any) -> str:
         return f"{params.get('target')} -> {r.get('new') or params.get('new')}"
     if cmd == "patch":
         return f"{params.get('addr')} {r.get('before')} -> {r.get('after')}"
+    if cmd == "revert":
+        addrs = ", ".join(str(row.get("addr")) for row in r.get("reverted") or [])
+        return f"restored {addrs}"
     if cmd == "set_type":
         return f"{params.get('target')} {r.get('decl') or params.get('decl')}"
     if cmd == "types":
@@ -5088,6 +5428,10 @@ def dispatch(cmd: str, params: dict[str, Any]) -> Any:
             _INFLIGHT["started"] = time.monotonic()
             _INFLIGHT["since"] = time.strftime("%H:%M:%S")
         try:
+            if cmd in MUTATING and readonly():
+                raise PermissionError(
+                    f"daemon is read-only (GHLAB_READONLY=1); {cmd!r} changes the project"
+                )
             try:
                 result = HANDLERS[cmd](params)
             except Exception as ex:
@@ -5236,6 +5580,7 @@ HANDLERS = {
     "scan": cmd_scan,
     "offsets": cmd_offsets,
     "imports": cmd_imports,
+    "exports": cmd_exports,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,
     "rename": cmd_rename,
@@ -5248,6 +5593,7 @@ HANDLERS = {
     "diff": cmd_diff,
     "emulate": cmd_emulate,
     "patch": cmd_patch,
+    "revert": cmd_revert,
     "set_type": cmd_set_type,
     "bookmark": cmd_bookmark,
     "note": cmd_note,

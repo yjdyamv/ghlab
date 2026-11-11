@@ -57,7 +57,9 @@ class ProtocolTest(unittest.TestCase):
 
     def test_tools_are_few_and_well_formed(self):
         tools = mcp.TOOLS
-        self.assertLessEqual(len(tools), 24, "MCP facade should stay small")
+        # The point of the cap is "the facade stays a short list", not a fixed number:
+        # raise it only when a daemon command that answers a question is missing here.
+        self.assertLessEqual(len(tools), 33, "MCP facade should stay small")
         names = [t["name"] for t in tools]
         self.assertEqual(len(names), len(set(names)))
         for tool in tools:

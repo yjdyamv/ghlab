@@ -98,6 +98,26 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_exports",
+        "description": (
+            "What this binary offers to callers (PE exports, ELF .dynsym), each with its "
+            "demangled C++ name. The mirror of ghlab_imports: use it on a DLL/SO to see its API "
+            "surface, or on a plugin to find the entry point the host calls."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "match": {
+                    "type": "string",
+                    "description": "regex on the mangled or demangled name",
+                },
+                "limit": _LIMIT,
+            },
+            "required": ["binary"],
+        },
+    },
+    {
         "name": "ghlab_offsets",
         "description": (
             "Attribute every [base + constant] access in a function to the parameter or local "
@@ -126,7 +146,14 @@ TOOLS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "binary": _BIN,
-                "offset": {"type": "string", "description": "field offset, e.g. '0x54'"},
+                "offset": {
+                    "type": "string",
+                    "description": "field offset, e.g. '0x54' (omit when using `hex`)",
+                },
+                "hex": {
+                    "type": "string",
+                    "description": "byte pattern with ?? wildcards, e.g. '48 8B ?? 05' (alternative to `offset`)",
+                },
                 "range": {"type": "string", "description": "0xSTART-0xEND to limit the sweep"},
                 "func": {"type": "string", "description": "only scan one function's body"},
                 "op": {"type": "string", "description": "regex on the mnemonic, e.g. '^MOVSS$'"},
@@ -141,7 +168,7 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "limit": _LIMIT,
             },
-            "required": ["binary", "offset"],
+            "required": ["binary"],
         },
     },
     {
@@ -428,6 +455,132 @@ TOOLS: list[dict[str, Any]] = [
         "description": "One line per program in the project: facts, notes, failing claims, last change.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "ghlab_strings",
+        "description": (
+            "String data in one binary, filtered by a regex; `refs` answers the follow-up question "
+            "(which functions use it) in the same call. Start here when what you have is a literal "
+            "(a URL, a registry key, a format string) rather than an imported API."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "query": {"type": "string", "description": "regex over the string value"},
+                "refs": {"type": "boolean", "description": "add the functions that use each hit"},
+                "limit": _LIMIT,
+                "offset": {"type": "integer", "description": "skip this many hits"},
+                "refresh": {"type": "boolean", "description": "rebuild the string index"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_xrefs",
+        "description": (
+            "Who references this address, function or symbol: call sites and data reads. The "
+            "reverse edge of ghlab_graph — use it when you already know the target and want its "
+            "callers, instead of walking the call tree down from a guess."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {"type": "string", "description": "address, function name or symbol"},
+                "targets": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "several targets in one call",
+                },
+                "limit": _LIMIT,
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_functions",
+        "description": (
+            "The function roster: address, size and prototype, filtered by a regex on the name. "
+            "Cheaper than ghlab_digest when you only need to know what exists before picking targets."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "match": {"type": "string", "description": "regex over function names"},
+                "limit": _LIMIT,
+                "offset": {"type": "integer", "description": "skip this many functions"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_info",
+        "description": (
+            "Program metadata: format, language, compiler, image base, entry points, section and "
+            "hash facts. Ask this before interpreting an address — a DLL and a raw dump need "
+            "different reading."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"binary": _BIN},
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_journal",
+        "description": (
+            "What was already changed in this project and when (import/analyze/rename/comment/"
+            "patch/set_type/types/pdb/note), newest last. Check it before concluding that the "
+            "code you are reading is the vendor's."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "op": {"type": "string", "description": "only this command's entries"},
+                "since": {"type": "string", "description": "only entries at/after this time"},
+                "limit": _LIMIT,
+            },
+        },
+    },
+    {
+        "name": "ghlab_graph",
+        "description": (
+            "Call tree from one function, with depth and direction, optionally rendered as "
+            "dot/mermaid/svg (`out` writes the file and returns its path). Use it to find the "
+            "few hubs worth reading instead of decompiling everything."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {"type": "string", "description": "function name or address"},
+                "direction": {"type": "string", "enum": ["down", "up", "both"]},
+                "depth": {"type": "integer", "description": "levels to walk, default 3"},
+                "format": {"type": "string", "enum": ["dot", "mermaid", "svg", "json"]},
+                "out": {"type": "string", "description": "write the rendered graph here"},
+                "limit": _LIMIT,
+            },
+            "required": ["binary", "target"],
+        },
+    },
+    {
+        "name": "ghlab_bytes",
+        "description": (
+            "Raw memory as hex+ascii (capped at 64 KiB, `truncated` when the block ends first). "
+            "Use it to confirm one constant or struct field without paying for a full decompile."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "addr": {"type": "string", "description": "start address"},
+                "size": {"type": "integer", "description": "bytes to read (capped at 65536)"},
+            },
+            "required": ["binary", "addr"],
+        },
+    },
 ]
 
 # tool name -> daemon command
@@ -436,6 +589,7 @@ _COMMANDS = {
     "ghlab_find": "find",
     "ghlab_names": "names",
     "ghlab_imports": "imports",
+    "ghlab_exports": "exports",
     "ghlab_scan": "scan",
     "ghlab_offsets": "offsets",
     "ghlab_decompile": "decompile",
@@ -455,6 +609,13 @@ _COMMANDS = {
     "ghlab_notes": "notes",
     "ghlab_audit": "audit",
     "ghlab_overview": "overview",
+    "ghlab_strings": "strings",
+    "ghlab_xrefs": "xrefs",
+    "ghlab_functions": "functions",
+    "ghlab_info": "info",
+    "ghlab_journal": "journal",
+    "ghlab_graph": "graph",
+    "ghlab_bytes": "bytes",
 }
 
 _LIST_KEYS = {

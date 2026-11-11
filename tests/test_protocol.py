@@ -37,12 +37,14 @@ class ValidateTest(unittest.TestCase):
         self.assertIn("decompile", overview)
         self.assertIn("binary", overview["decompile"]["required"])
 
-    def test_scan_needs_an_offset_and_rejects_junk(self):
+    def test_scan_takes_an_offset_or_a_hex_pattern(self):
         spec, params = protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54"})
         self.assertEqual(spec.name, "scan")
         self.assertEqual(params, {"binary": "a.exe", "offset": "0x54"})
-        with self.assertRaises(protocol.ProtocolError):
-            protocol.validate({"cmd": "scan", "binary": "a.exe"})
+        # `hex` is the other question scan answers. Which of the two was asked is
+        # the handler's business, so the schema no longer requires `offset`.
+        spec, params = protocol.validate({"cmd": "scan", "binary": "a.exe", "hex": "48 8B ?? 05"})
+        self.assertEqual(params, {"binary": "a.exe", "hex": "48 8B ?? 05"})
         with self.assertRaises(protocol.ProtocolError):
             protocol.validate({"cmd": "scan", "binary": "a.exe", "offset": "0x54", "nope": 1})
 

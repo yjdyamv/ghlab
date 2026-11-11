@@ -88,6 +88,12 @@ _SPECS = [
         "imports with caller counts and risk group",
     ),
     Spec(
+        "exports",
+        ("binary",),
+        ("match", "query", "limit"),
+        "exported entries (PE exports / ELF .dynsym) with demangled names",
+    ),
+    Spec(
         "strings",
         ("binary",),
         ("query", "limit", "offset", "refs", "refresh"),
@@ -107,9 +113,21 @@ _SPECS = [
     ),
     Spec(
         "scan",
-        ("binary", "offset"),
-        ("range", "func", "limit", "op", "stack", "imm", "writes", "sequence", "window"),
-        "instructions that touch a struct field offset (displacement search; `sequence` asks for an ordered window)",
+        ("binary",),
+        (
+            "offset",
+            "hex",
+            "range",
+            "func",
+            "limit",
+            "op",
+            "stack",
+            "imm",
+            "writes",
+            "sequence",
+            "window",
+        ),
+        "instructions that touch a struct field offset (displacement search), or a masked byte search (`hex` with `??`)",
     ),
     Spec("xrefs", ("binary",), ("target", "targets", "limit"), "references to address/function"),
     Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),
@@ -161,7 +179,14 @@ _SPECS = [
         "patch",
         ("binary", "addr"),
         ("bytes", "nop", "expect"),
-        "overwrite bytes at an address (hex or --nop), optionally verifying the old bytes",
+        "overwrite bytes at an address (hex or --nop), optionally verifying the old bytes; "
+        "the original bytes are kept",
+    ),
+    Spec(
+        "revert",
+        ("binary",),
+        ("addr", "all", "force"),
+        "put back the bytes a `patch` overwrote (one address, or `all` newest-first)",
     ),
     Spec(
         "set_type",
