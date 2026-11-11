@@ -114,26 +114,53 @@ class Router:
         self._cache[name] = (self._clock(), names)
         return names
 
+    def _hits(self, binary: str) -> list[tuple[str, str]]:
+        """(project, real name) pairs naming this binary; exact names beat substrings.
+
+        The daemons accept a unique substring, so the router has to resolve one the
+        same way or a call that the owner would happily serve dies in routing.
+        """
+        exact: list[tuple[str, str]] = []
+        loose: list[tuple[str, str]] = []
+        needle = binary.lower()
+        for name in self.targets:
+            for known in self.binaries(name):
+                if known == binary:
+                    exact.append((name, known))
+                elif needle in known.lower():
+                    loose.append((name, known))
+        return exact or loose
+
     def owners(self, binary: str) -> list[str]:
-        return [name for name in self.targets if binary in self.binaries(name)]
+        seen: list[str] = []
+        for name, _ in self._hits(binary):
+            if name not in seen:
+                seen.append(name)
+        return seen
 
     def _owner_for(self, binary: str) -> str:
         if binary == "-":
             binary = config.read_focus()
             if not binary:
                 raise RouteError("no focus binary; run `ghlab use <binary>` or name one explicitly")
+        hits = self._hits(binary)
         owners = self.owners(binary)
-        if len(owners) == 1:
-            return owners[0]
-        if not owners:
+        if not hits:
             seen = "; ".join(
                 f"{name}: {', '.join(self.binaries(name, refresh=True)[:6]) or '(down)'}"
                 for name in self.targets
             )
             raise RouteError(f"binary {binary!r} is in no configured project ({seen})")
+        if len(hits) == 1:
+            return hits[0][0]
+        if len(owners) > 1:
+            raise RouteError(
+                f"binary {binary!r} is in several projects ({', '.join(owners)}); "
+                f"add project=<one of them>"
+            )
+        names = ", ".join(known for _, known in hits)
         raise RouteError(
-            f"binary {binary!r} is in several projects ({', '.join(owners)}); "
-            f"add project=<one of them>"
+            f"binary {binary!r} matches several programs in {owners[0]} ({names}); name one exactly"
         )
 
     # ---- routing -----------------------------------------------------------

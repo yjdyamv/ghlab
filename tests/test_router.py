@@ -102,6 +102,22 @@ class RouterTest(unittest.TestCase):
             r.call("decompile", binary="same.exe")
         self.assertIn("project=", str(cm.exception))
 
+    def test_unique_substring_reaches_the_owner_like_the_daemon_would(self):
+        r, clients = self.make()
+        r.call("decompile", binary="notepad")
+        self.assertEqual(clients["ghlab"].calls[-1][1]["binary"], "notepad")
+
+    def test_substring_that_hits_two_programs_asks_for_the_exact_name(self):
+        targets = {"a": target("a", 8001, ["libmwservices.dll", "libmwservices_api.dll"])}
+        clients: dict[str, router.ClientLike] = {
+            "a": FakeClient(targets["a"].url, ["libmwservices.dll", "libmwservices_api.dll"])
+        }
+        r = router.Router(targets=targets, default="a", clients=clients)
+        with self.assertRaises(router.RouteError) as cm:
+            r.call("decompile", binary="libmw")
+        self.assertIn("libmwservices.dll", str(cm.exception))
+        r.call("decompile", binary="libmwservices.dll")
+
     def test_focus_binary_is_resolved_through_the_router(self):
         targets = {"wps": target("wps", 8766, ["wpscore.dll"])}
         clients: dict[str, router.ClientLike] = {

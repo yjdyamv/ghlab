@@ -16,6 +16,12 @@ from . import protocol, session
 
 # Requests slower than this get a SLOW marker in the log (milliseconds).
 SLOW_MS = int(os.environ.get("GHLAB_SLOW_MS", "5000"))
+# GET serves only these: the commands that answer a question asked by naming
+# nothing. Argument-free project-wide scans (audit re-checks every claim,
+# campaign clusters every program) stay POST-only, because a single stray GET --
+# a browser address bar, a link prefetch -- would otherwise start a job that
+# runs for minutes.
+GET_COMMANDS = ("ping", "binaries", "overview")
 STARTED = time.time()
 
 
@@ -85,7 +91,28 @@ class Handler(BaseHTTPRequestHandler):
             _log(f"cmd={cmd} ms={ms}{marker} status={status} {_describe(params)} {note}".rstrip())
 
     def do_GET(self) -> None:
-        if self.path.rstrip("/") in ("/health", "/ping"):
+        # A GET is a convenience for the parameterless query commands, so that
+        # `curl http://127.0.0.1:8765/binaries` lists the programs instead of
+        # returning the help page (the help page surprised every new client).
+        bare = self.path.split("?", 1)[0].rstrip("/")
+        name = bare.rsplit("/", 1)[-1]
+        spec = protocol.SPECS.get(name)
+        # `not spec.required` still matters: GET never invents arguments, so a name
+        # that needs one must fall through to the help page rather than fail.
+        if spec is not None and name in GET_COMMANDS and not spec.required:
+            started = time.monotonic()
+            status = 200
+            try:
+                result = session.dispatch(spec.name, {})
+                self._send(protocol.Ok(result, int(1000 * (time.monotonic() - started))).to_bytes())
+            except Exception as ex:  # noqa: BLE001
+                status = 500
+                self._send(protocol.Err(f"{type(ex).__name__}: {ex}").to_bytes(), 500)
+            finally:
+                ms = int(1000 * (time.monotonic() - started))
+                _log(f"cmd={spec.name} ms={ms} status={status} (GET)")
+            return
+        if bare in ("/health", "/ping"):
             try:
                 body = json.dumps({"ok": True, "result": session.ping({})}).encode()
             except Exception as ex:  # noqa: BLE001
@@ -98,7 +125,8 @@ class Handler(BaseHTTPRequestHandler):
                     "pid": os.getpid(),
                     "uptime_s": round(time.time() - STARTED, 1),
                     "busy": session.in_flight(),
-                    "usage": 'POST / with {"cmd": "<name>", ...}',
+                    "usage": 'POST / with {"cmd": "<name>", ...}, or GET /<name> for the '
+                    "commands that take no arguments (ping, binaries, overview, ...)",
                     "cmds": {
                         name: {"required": s.required, "optional": s.optional, "summary": s.summary}
                         for name, s in protocol.SPECS.items()

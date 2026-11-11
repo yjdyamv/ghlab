@@ -1,9 +1,12 @@
 """End-to-end over real HTTP, with a stub session so no Ghidra is needed."""
 
+import json
 import os
 import threading
 import time
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 
 from ghlab import session
@@ -36,6 +39,8 @@ class StubSession:
         self.calls.append((cmd, params))
         if cmd == "ping":
             return {"service": "stub", "binaries": ["stub.exe"]}
+        if cmd == "binaries":
+            return {"binaries": ["stub.exe"]}
         if cmd == "decompile":
             return {"binary": params["binary"], "results": []}
         raise KeyError(f"stub has no {cmd}")
@@ -81,6 +86,39 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(info["ok"])
         self.assertIn("decompile", info["cmds"])
         self.assertEqual(info["cmds"]["decompile"]["required"], ["binary"])
+
+    def _get(self, path: str) -> dict:
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}", timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_get_runs_a_command_that_takes_no_arguments(self):
+        # `curl host/binaries` is the first thing a new client tries; the help page
+        # that came back instead was the surprise this branch exists to remove.
+        payload = self._get("/binaries")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["result"]["binaries"], ["stub.exe"])
+
+    def test_get_of_a_command_that_needs_arguments_is_still_the_help_page(self):
+        # Guessing empty params for `decompile` would answer a question nobody asked.
+        payload = self._get("/decompile")
+        self.assertIn("decompile", payload["cmds"])
+        self.assertNotIn("result", payload)
+
+    def test_a_heavy_parameterless_command_stays_post_only(self):
+        # `campaign` takes no arguments either, but it clusters every program: a GET
+        # that silently started minutes of work is exactly what the allowlist stops.
+        payload = self._get("/campaign")
+        self.assertIn("cmds", payload)
+        self.assertNotIn("result", payload)
+
+    def test_a_failing_get_is_logged_as_a_failure(self):
+        lines: list[str] = []
+        with mock.patch("ghlab.server._log", lines.append):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                self._get("/overview")  # the stub raises KeyError for it
+            self.assertEqual(ctx.exception.code, 500)
+            lines = self._wait_for_line(lines, 1)
+        self.assertIn("status=500", lines[0])
 
     def test_down_daemon_gives_actionable_message(self):
         dead = Client("http://127.0.0.1:9/", timeout=1)
