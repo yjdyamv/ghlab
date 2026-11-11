@@ -249,6 +249,28 @@ def fmt_struct(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_fid(r: dict[str, Any]) -> str:
+    if "libraries" in r and "analyzer" not in r:
+        lines = [f"== FunctionID databases: {r['count']}"]
+        lines.extend(f"   {path}" for path in r["libraries"])
+        if not r["count"]:
+            lines.append(
+                "   none yet -- drop a .fidb into the folder above, then `ghlab fid <binary>`"
+            )
+        return chr(10).join(lines)
+    out = [
+        f"== {r['binary']}  {r['renamed']} of {r['scanned']} function(s) named"
+        f"  ({len(r.get('libraries') or [])} database(s), {r.get('analyzer')}, {r.get('elapsed_ms')}ms)"
+    ]
+    for row in r.get("functions") or []:
+        out.append(f"   {row['addr']}  {row['now']}   (was {row['was']})")
+    if r.get("truncated"):
+        out.append("   [truncated; raise -n]")
+    if r.get("saved_via"):
+        out.append(f"   saved via {r['saved_via']}")
+    return chr(10).join(out)
+
+
 def fmt_scan(r: dict[str, Any]) -> str:
     if "matches" in r:
         return _fmt_hex_scan(r)
@@ -883,6 +905,7 @@ FORMATTERS = {
     "scan": fmt_scan,
     "offsets": fmt_offsets,
     "struct": fmt_struct,
+    "fid": fmt_fid,
     "import": fmt_import,
     "imports": fmt_imports,
     "exports": fmt_exports,
@@ -1838,6 +1861,18 @@ def build_parser() -> argparse.ArgumentParser:
             "offsets",
             {"binary": a.binary, "target": a.target, "offset": a.offset, "limit": a.limit},
         ),
+    )
+
+    p = sub.add_parser(
+        "fid",
+        parents=[common],
+        help="name library functions with FunctionID (.fidb) databases",
+    )
+    p.add_argument("binary", nargs="?", default=None)
+    p.add_argument("--list", action="store_true", help="show the .fidb libraries Ghidra would use")
+    p.add_argument("-n", "--limit", type=int, default=200, help="renames to print")
+    p.set_defaults(
+        func=lambda a: _call(a, "fid", {"binary": a.binary, "list": a.list, "limit": a.limit}),
     )
 
     p = sub.add_parser(

@@ -280,7 +280,7 @@ ghlab projects                                # 每个库的状态 + 里面有�
    `overview` **跨库聚合**，每行带 `project` 字段——"我手头有什么"本来就该一次问完。
 6. 目标库的 daemon 没起且开了 `GHLAB_AUTOSTART=1`：先把它启动（服务名会说清是哪个库），再重试一次；启动失败只试一次，不循环。
 
-MCP 侧多了一个 `ghlab_projects` 工具（22 个），agent 可以先看"哪个库有这个文件"再动手。
+MCP 侧多了一个 `ghlab_projects` 工具（33 个），agent 可以先看"哪个库有这个文件"再动手。
 
 ## 接 MCP（给别的 agent 用）
 
@@ -288,7 +288,7 @@ MCP 侧多了一个 `ghlab_projects` 工具（22 个），agent 可以先看"哪
 ghlab mcp          # stdio MCP server，转调本机 daemon
 ```
 
-只暴露 22 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+只暴露 33 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
 
 | 工具 | 干什么 |
 |---|---|
@@ -304,6 +304,7 @@ ghlab mcp          # stdio MCP server，转调本机 daemon
 | `ghlab_notes` / `ghlab_audit` / `ghlab_overview` | 读回历史结论 / 全项目复算断言 / 项目总览 |
 | `ghlab_decrypt` | 破小块密文（xor/add/rot/utf16/base64） |
 | `ghlab_map` / `ghlab_types` / `ghlab_pdb` | 批量扫函数 / 批量写类型 / 吃 PDB 符号 |
+| `ghlab_struct` / `ghlab_fid` | 从 offset 反推结构体 / 用 FunctionID 库给函数命名 |
 | `ghlab_projects` | 有哪些库、哪些 daemon 在线、每个库装了什么（多项目路由的入口） |
 
 还有资源：`ghlab://programs`（名字 + md5 + 架构 + 函数数）、`ghlab://program/<name>/digest`、`ghlab://program/<name>/notes`。
@@ -371,6 +372,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `note` | `binary, text` / `at, addr, tag, assert, delete` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
 | `map` | `binary` / `from, op, grep, limit, hits` | **批量原语**：`--from` 选函数集（`all`/`name:`/`import:`/`calls:`/`string:`/`const:`/`addr:`），`--op` 取 `decompile`/`strings`/`imports`/`calls`/`consts`，`-g` 只留命中行。4 个函数反编译+过滤 ≈2.6s，回 15 行而不是 4 份源码 |
 | `pdb` | `binary, file` / `untrusted` | **吃调试符号**：`PdbUniversalAnalyzer.doAnalysis` 套壳；PDB 与二进制不匹配时不写入（`functions_before == functions_after`），日志一并返回 |
+| `fid` | – / `binary, list, limit` | **认库函数**：用用户装的 `.fidb` 给函数改名（`list=yes` 只列数据库）。改名结果靠前后函数名快照 diff 报告，不依赖 FunctionID 的内部结果类；没有安装任何库时直接报错而不是回"0 命中" |
 | `types` | `binary, from` / `dry_run` | **批量写类型**：签名表（`.json` 分组或 `target = decl` 文本）一次应用，一个事务一次 `save`；`--dry-run` 只列计划；单条失败进 `failed` 不中断 |
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
 | `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
@@ -380,7 +382,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 32 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 33 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 | `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 

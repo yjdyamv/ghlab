@@ -242,6 +242,12 @@ _SPECS = [
         "apply a matching PDB (symbols and types) via Ghidra's PdbUniversalAnalyzer",
     ),
     Spec(
+        "fid",
+        (),
+        ("binary", "list", "limit"),
+        "name library functions with FunctionID (.fidb); list=yes shows the databases",
+    ),
+    Spec(
         "notes",
         ("binary",),
         ("tag", "at", "query", "limit"),

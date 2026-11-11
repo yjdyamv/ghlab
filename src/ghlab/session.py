@@ -4572,6 +4572,121 @@ def cmd_pdb(a: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+MAX_FID_FUNCTIONS = 20000
+
+
+def _name_snapshot(program: Any, limit: int = MAX_FID_FUNCTIONS) -> tuple[dict[str, str], bool]:
+    """{entry address: function name}, plus "did we stop before the end".
+
+    `fid` reports what identification changed by diffing names in the program, not by
+    reading FunctionID's result objects: those live in an internal package whose shape
+    is not a promise, while names are the thing the user actually asked for.
+    """
+    out: dict[str, str] = {}
+    funcs = program.getFunctionManager().getFunctions(True)
+    while funcs.hasNext():
+        fn = funcs.next()
+        out[str(fn.getEntryPoint())] = str(fn.getName())
+        if len(out) >= limit:
+            return out, bool(funcs.hasNext())
+    return out, False
+
+
+def _renamed(before: dict[str, str], after: dict[str, str]) -> list[dict[str, str]]:
+    """Functions whose name differs between the two snapshots, both spellings kept."""
+    return [
+        {"addr": addr, "was": was, "now": after[addr]}
+        for addr, was in before.items()
+        if addr in after and after[addr] != was
+    ]
+
+
+def _fid_libraries() -> list[str]:
+    """The .fidb files Ghidra would search, from the user settings directory."""
+    import jpype
+
+    root = Path(str(jpype.JClass("ghidra.framework.Application").getUserSettingsDirectory()))
+    if not root.is_dir():
+        return []
+    return sorted(str(p) for p in root.rglob("*.fidb"))
+
+
+def _run_fid_analyzer(program: Any) -> str:
+    """Run this Ghidra's FunctionID analyzer over `program`; return its class name.
+
+    Discovered through ClassSearcher instead of imported by path: FunctionID is an
+    optional module and its package has moved between releases, so a hard-coded class
+    name is a guess about one build.  If the module is absent the error says how many
+    analyzers were searched, which is the difference between "not installed" and
+    "name changed again".
+    """
+    import jpype
+    from ghidra.program.model.address import AddressSet
+    from ghidra.util.classfinder import ClassSearcher
+
+    base = jpype.JClass("ghidra.app.services.Analyzer").class_
+    found = []
+    seen = 0
+    for cls in ClassSearcher.getClasses(base) or []:
+        seen += 1
+        if "fid" in str(cls.getSimpleName()).lower():
+            found.append(cls)
+    if not found:
+        raise RuntimeError(
+            f"this Ghidra has no FunctionID analyzer (searched {seen} analyzers); "
+            "install the FunctionID module and at least one .fidb library"
+        )
+    cls = found[0]
+    analyzer = cls.getDeclaredConstructor().newInstance()
+    # Options are optional: a missing FunctionID option package must not stop matching.
+    with contextlib.suppress(Exception):
+        analyzer.registerOptions(program.getOptions("FunctionID"))
+    with _edit(program, "ghlab fid"):
+        analyzer.added(program, AddressSet(), MONITOR)
+    return str(cls.getSimpleName())
+
+
+def cmd_fid(a: dict[str, Any]) -> dict[str, Any]:
+    """Name library functions using the user's FunctionID databases (.fidb).
+
+    Identification is a mutation: a match renames the function to the library's name,
+    which is what a reader wants and why this cannot run under GHLAB_READONLY.  A
+    binary with no installed library is refused rather than reported as "0 matches",
+    because those two situations call for different actions.
+    """
+    if not a.get("list") and not a.get("binary"):
+        raise ValueError("fid needs binary=<name>, or list=yes to see the databases")
+    libs = _fid_libraries()
+    if a.get("list"):
+        return {"libraries": libs, "count": len(libs)}
+    e = _entry(str(a["binary"]))
+    p = e["program"]
+    if not libs:
+        raise ValueError(
+            "no .fidb libraries are installed; put one in Ghidra's FunctionID folder "
+            "(`ghlab fid --list` shows the directory Ghidra searches)"
+        )
+    cap = int(a.get("limit") or 200)
+    started = time.monotonic()
+    before, truncated = _name_snapshot(p)
+    analyzer = _run_fid_analyzer(p)
+    after, _ = _name_snapshot(p)
+    changed = _renamed(before, after)
+    out = {
+        "binary": str(p.getName()),
+        "analyzer": analyzer,
+        "libraries": libs,
+        "scanned": len(before),
+        "renamed": len(changed),
+        "functions": changed[:cap],
+        "truncated": truncated or len(changed) > cap,
+        "elapsed_ms": int(1000 * (time.monotonic() - started)),
+    }
+    if changed:
+        out["saved_via"] = _save(p, "ghlab fid", e)
+    return out
+
+
 BOOKMARK_TYPES = ("Note", "Info", "Warning", "Error", "Analysis")
 
 
@@ -5496,6 +5611,7 @@ MUTATING = (
     "note",
     "types",
     "pdb",
+    "fid",
 )
 
 
@@ -5539,6 +5655,8 @@ def _journal_summary(cmd: str, params: dict[str, Any], result: Any) -> str:
         return f"{r.get('applied')} applied / {r.get('failed')} failed from {params.get('from')}"
     if cmd == "pdb":
         return f"{params.get('file')} applied={r.get('applied')}"
+    if cmd == "fid":
+        return f"{r.get('renamed')} renamed via {r.get('analyzer')}"
     if cmd == "note":
         return f"[{params.get('tag') or '-'}] {str(params.get('text'))[:100]}"
     if cmd == "bookmark":
@@ -5916,6 +6034,7 @@ HANDLERS = {
     "map": cmd_map,
     "types": cmd_types,
     "pdb": cmd_pdb,
+    "fid": cmd_fid,
     "report": cmd_report,
     "cross_xref": cmd_cross_xref,
     "slice": cmd_slice,

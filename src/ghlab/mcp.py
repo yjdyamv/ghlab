@@ -434,6 +434,23 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_fid",
+        "description": (
+            "Identify library functions with the user's FunctionID databases (.fidb): matched "
+            "functions are renamed to their library name. Changes the project, so it is refused "
+            "under GHLAB_READONLY. `list: true` shows which databases are installed."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "list": {"type": "boolean", "description": "list the .fidb libraries instead"},
+                "limit": {"type": "integer", "description": "renames to return (default 200)"},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "ghlab_projects",
         "description": (
             "List the configured Ghidra projects, which daemons are up, and the binaries each "
@@ -633,6 +650,7 @@ _COMMANDS = {
     "ghlab_map": "map",
     "ghlab_types": "types",
     "ghlab_pdb": "pdb",
+    "ghlab_fid": "fid",
     "ghlab_projects": "projects",
     "ghlab_decrypt": "decrypt",
     "ghlab_report": "report",
