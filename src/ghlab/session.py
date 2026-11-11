@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import difflib
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -25,6 +26,14 @@ LOCK = threading.RLock()
 # the answer to "why is my request queued?". Set *inside* the lock: a command
 # still waiting for LOCK is queued, not running.
 _INFLIGHT: dict[str, Any] = {"cmd": None, "started": 0.0, "since": None}
+# Commands that must answer *while* something else runs: the status question, the
+# queue, and the interruption.  Everything else serializes on LOCK.
+_UNLOCKED: tuple[str, ...] = ("ping", "job", "cancel")
+# Background jobs: a long scan queued from an agent that then has to wait for it
+# anyway is a timeout waiting to happen, and no way to watch or stop it.
+JOBS: dict[str, dict[str, Any]] = {}
+MAX_JOBS_KEPT = 50
+_JOB_SEQ = itertools.count(1)
 _proj = None
 _project_dir: Path | None = None
 _project_name = "ghlab"
@@ -5848,35 +5857,227 @@ def cmd_audit(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _job_args(text: Any) -> dict[str, Any]:
+    """`k=v;k2=v2` -> params.
+
+    `;` separates pairs because the values themselves are full of commas
+    (`targets=a,b`, `types=0x18=float,0x20=void *`), and a separator that also
+    occurs inside values is a parser bug waiting to be reported.
+    """
+    out: dict[str, Any] = {}
+    for pair in str(text or "").split(";"):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(f"bad args item {pair!r}; expected key=value, pairs split on ';'")
+        key, _, value = pair.partition("=")
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _job_view(job: dict[str, Any], with_result: bool = False) -> dict[str, Any]:
+    """The line a client gets: identity, state, cost -- and the output on request."""
+    started = float(job["started_at"] or 0.0)
+    ended = float(job["ended_at"] or 0.0)
+    elapsed = (ended or time.monotonic()) - started if started else 0.0
+    out: dict[str, Any] = {
+        "job": job["id"],
+        "cmd": job["cmd"],
+        "state": job["state"],
+        "requested": job["requested"],
+        "elapsed_ms": int(1000 * elapsed) if started else 0,
+    }
+    if job["error"]:
+        out["error"] = job["error"]
+    if with_result and job["state"] == "done":
+        out["result"] = job["result"]
+    return out
+
+
+def _monitor_cancelled() -> bool:
+    if MONITOR is None:
+        return False
+    with contextlib.suppress(Exception):
+        return bool(MONITOR.isCancelled())
+    return False
+
+
+def _monitor_reset() -> None:
+    """Clear the shared cancel flag before and after a job.
+
+    One monitor serves the whole daemon, so a stale flag would make the *next*
+    command abort immediately; a job must leave it as it found it.
+    """
+    if MONITOR is None:
+        return
+    with contextlib.suppress(Exception):
+        MONITOR.setCanceled(False)
+
+
+def _job_trim() -> None:
+    """Forget the oldest finished jobs once there are more than MAX_JOBS_KEPT."""
+    while len(JOBS) > MAX_JOBS_KEPT:
+        finished = [j for j in JOBS.values() if j["state"] in ("done", "failed", "cancelled")]
+        if not finished:
+            return
+        JOBS.pop(min(finished, key=lambda j: float(j["ended_at"] or 0.0))["id"], None)
+
+
+def _job_thread(job_id: str) -> None:
+    """Worker: goes through `dispatch`, so locking, journal and in_flight all apply.
+
+    A job started this way is a queued command, not a second Ghidra thread: it waits
+    for LOCK like any request.  Its `dispatch` marks it as in flight, so `GET /` and
+    `ping` report the job -- not the `job` call that started it.
+    """
+    job = JOBS[job_id]
+    # Take the lock *before* declaring the job running: a job cancelled while it was
+    # queued must never run, and the only moment where that is decidable is after we
+    # hold the lock the job was waiting for.  LOCK is an RLock, so `dispatch` taking
+    # it again below is free.
+    with LOCK:
+        if job["cancelled"]:
+            job["state"] = "cancelled"
+            job["ended_at"] = time.monotonic()
+            return
+        job["state"] = "running"
+        job["started_at"] = time.monotonic()
+        _monitor_reset()
+        try:
+            job["result"] = dispatch(job["cmd"], job["params"])
+            job["state"] = "cancelled" if job["cancelled"] or _monitor_cancelled() else "done"
+        except BaseException as ex:  # noqa: BLE001 - a worker thread must not die silently
+            job["state"] = "cancelled" if job["cancelled"] or _monitor_cancelled() else "failed"
+            if job["state"] == "failed":
+                job["error"] = f"{type(ex).__name__}: {ex}"
+        finally:
+            job["ended_at"] = time.monotonic()
+            _monitor_reset()
+            _job_trim()
+
+
+def cmd_job(a: dict[str, Any]) -> dict[str, Any]:
+    """Run a command in the background; `list=yes` shows the queue, `id=` one result.
+
+    The parameters are validated here, before the thread starts: a typo must come back
+    as a protocol error to the caller, not as a failed job nobody is watching.
+    """
+    from . import protocol
+
+    if a.get("list") or a.get("id"):
+        wanted = a.get("id")
+        if wanted:
+            job = JOBS.get(str(wanted))
+            if job is None:
+                raise KeyError(f"no job {wanted!r}; `job list=yes` shows the kept ones")
+            return {"jobs": [_job_view(job, with_result=True)]}
+        jobs = sorted(JOBS.values(), key=lambda j: float(j["started_at"] or 0.0))
+        return {
+            "jobs": [_job_view(j) for j in jobs],
+            "running": sum(1 for j in jobs if j["state"] in ("queued", "running")),
+        }
+    run = str(a.get("run") or "")
+    if not run:
+        raise ValueError(
+            "job needs run=<command>; e.g. job run=decompile binary=fw.bin args=targets=main"
+        )
+    params = _job_args(a.get("args"))
+    if a.get("binary"):
+        params["binary"] = str(a["binary"])
+    _, params = protocol.validate({"cmd": run, **params})
+    job = {
+        "id": f"j{next(_JOB_SEQ)}",
+        "cmd": run,
+        "params": params,
+        "state": "queued",
+        "requested": time.strftime("%H:%M:%S"),
+        "started_at": 0.0,
+        "ended_at": 0.0,
+        "result": None,
+        "error": None,
+        "cancelled": False,
+    }
+    JOBS[job["id"]] = job
+    worker = threading.Thread(target=_job_thread, args=(job["id"],), name=job["id"], daemon=True)
+    worker.start()
+    if a.get("wait"):
+        worker.join()
+        return _job_view(JOBS[job["id"]], with_result=True)
+    return _job_view(job)
+
+
+def cmd_cancel(a: dict[str, Any]) -> dict[str, Any]:
+    """Ask a running or queued job to stop.
+
+    Ghidra checks its monitor between steps, so this stops *between* steps: a single
+    long decompile finishes first.  Saying that in the reply is cheaper than letting a
+    caller conclude the flag did nothing.
+    """
+    if a.get("all"):
+        targets = [j for j in JOBS.values() if j["state"] in ("queued", "running")]
+    else:
+        jid = a.get("id")
+        if not jid:
+            raise ValueError("cancel needs id=<job> or all=yes")
+        job = JOBS.get(str(jid))
+        if job is None:
+            raise KeyError(f"no job {jid!r}; `job list=yes` shows the kept ones")
+        targets = [job]
+    for job in targets:
+        job["cancelled"] = True
+        if job["state"] == "queued":
+            job["state"] = "cancelled"
+            job["ended_at"] = time.monotonic()
+    if targets:
+        with contextlib.suppress(Exception):
+            if MONITOR is not None:
+                MONITOR.setCanceled(True)
+    return {
+        "cancel_requested": [j["id"] for j in targets],
+        "note": "Ghidra checks between steps; a long single step finishes first",
+    }
+
+
 def dispatch(cmd: str, params: dict[str, Any]) -> Any:
+    """Run one command.  Everything that touches Ghidra takes LOCK first.
+
+    `ping`, `job` and `cancel` do not: they exist to *ask about* or *interrupt* a
+    running command, so queueing them behind it would answer the wrong question.
+    """
+    if cmd in _UNLOCKED:
+        return _run(cmd, params, track=False)
     with LOCK:
         # `ping` is served to *ask* what is running, so it must never claim to be
         # the thing that is running. Everything else is marked only once it holds
         # the lock: a request queued behind a slow decompile is not "running".
-        track = cmd != "ping"
-        if track:
-            _INFLIGHT["cmd"] = cmd
-            _INFLIGHT["started"] = time.monotonic()
-            _INFLIGHT["since"] = time.strftime("%H:%M:%S")
+        return _run(cmd, params, track=cmd != "ping")
+
+
+def _run(cmd: str, params: dict[str, Any], track: bool) -> Any:
+    if track:
+        _INFLIGHT["cmd"] = cmd
+        _INFLIGHT["started"] = time.monotonic()
+        _INFLIGHT["since"] = time.strftime("%H:%M:%S")
+    try:
+        if _mutates(cmd, params) and readonly():
+            raise PermissionError(
+                f"daemon is read-only (GHLAB_READONLY=1); {cmd!r} changes the project"
+            )
         try:
-            if _mutates(cmd, params) and readonly():
-                raise PermissionError(
-                    f"daemon is read-only (GHLAB_READONLY=1); {cmd!r} changes the project"
-                )
-            try:
-                result = HANDLERS[cmd](params)
-            except Exception as ex:
-                if _mutates(cmd, params):
-                    _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
-                raise
+            result = HANDLERS[cmd](params)
+        except Exception as ex:
             if _mutates(cmd, params):
-                _journal_append(cmd, params, result)
-            return result
-        finally:
-            if track:
-                _INFLIGHT["cmd"] = None
-                _INFLIGHT["started"] = 0.0
-                _INFLIGHT["since"] = None
+                _journal_append(cmd, params, None, f"{type(ex).__name__}: {ex}")
+            raise
+        if _mutates(cmd, params):
+            _journal_append(cmd, params, result)
+        return result
+    finally:
+        if track:
+            _INFLIGHT["cmd"] = None
+            _INFLIGHT["started"] = 0.0
+            _INFLIGHT["since"] = None
 
 
 def in_flight() -> dict[str, Any]:
@@ -6044,4 +6245,6 @@ HANDLERS = {
     "journal": cmd_journal,
     "overview": cmd_overview,
     "audit": cmd_audit,
+    "job": cmd_job,
+    "cancel": cmd_cancel,
 }

@@ -807,6 +807,40 @@ def fmt_similar(r: dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def fmt_job(r: dict[str, Any]) -> str:
+    jobs = r.get("jobs") or []
+    if not jobs:
+        return "(no jobs; `ghlab job <cmd> <binary>` starts one)"
+    head = f"== {len(jobs)} job(s)"
+    if "running" in r:
+        head += f", {r['running']} active"
+    out = [head]
+    for job in jobs:
+        out.append(
+            f"   {job['job']:<5} {job['state']:<10} {job['elapsed_ms'] / 1000:7.1f}s  {job['cmd']}"
+        )
+        if job.get("error"):
+            out.append(f"         error: {job['error']}")
+        if "result" in job:
+            fmt = FORMATTERS.get(job["cmd"])
+            body: Any = job["result"]
+            if fmt is not None and isinstance(body, dict):
+                out.extend("   " + line for line in fmt(body).splitlines())
+            else:
+                out.extend(
+                    "   " + line
+                    for line in json.dumps(body, ensure_ascii=False, indent=2).splitlines()
+                )
+    if any(j["state"] in ("queued", "running") for j in jobs):
+        out.append("   (cancel with `ghlab cancel <job>`)")
+    return chr(10).join(out)
+
+
+def fmt_cancel(r: dict[str, Any]) -> str:
+    ids = ", ".join(r.get("cancel_requested") or []) or "nothing to stop"
+    return f"cancel requested: {ids}" + chr(10) + f"   {r.get('note') or ''}".rstrip()
+
+
 def fmt_overview(r: dict[str, Any]) -> str:
     if not r["binaries"]:
         return "(project is empty; import something first)"
@@ -936,6 +970,8 @@ FORMATTERS = {
     "family": fmt_family,
     "journal": fmt_journal,
     "overview": fmt_overview,
+    "job": fmt_job,
+    "cancel": fmt_cancel,
     "audit": fmt_audit,
 }
 
@@ -2365,6 +2401,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("overview", parents=[common], help="one line per program in the project")
     p.set_defaults(func=lambda a: _call(a, "overview", {}))
+
+    p = sub.add_parser(
+        "job",
+        parents=[common],
+        help="run a long command in the background and return at once",
+    )
+    p.add_argument("run", nargs="?", help="command to run, e.g. decompile or scan")
+    p.add_argument("binary", nargs="?", help="program name")
+    p.add_argument("-a", "--args", default="", help="extra params as key=value; pairs split on ';'")
+    p.add_argument("--list", action="store_true", help="list the jobs this daemon kept")
+    p.add_argument("--id", default=None, help="show one job's result")
+    p.add_argument(
+        "--wait", action="store_true", help="block until it finishes (same as running it)"
+    )
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "job",
+            {
+                "run": a.run,
+                "binary": a.binary,
+                "args": a.args,
+                "list": a.list,
+                "id": a.id,
+                "wait": a.wait,
+            },
+        ),
+    )
+
+    p = sub.add_parser("cancel", parents=[common], help="stop a running or queued job")
+    p.add_argument("id", nargs="?", help="job id (see `ghlab job --list`)")
+    p.add_argument("--all", action="store_true", help="stop everything queued or running")
+    p.set_defaults(func=lambda a: _call(a, "cancel", {"id": a.id, "all": a.all}))
 
     p = sub.add_parser("audit", parents=[common], help="re-check every stored claim")
     p.add_argument("binary", nargs="?", help="limit the audit to one program")

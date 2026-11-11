@@ -280,7 +280,7 @@ ghlab projects                                # 每个库的状态 + 里面有�
    `overview` **跨库聚合**，每行带 `project` 字段——"我手头有什么"本来就该一次问完。
 6. 目标库的 daemon 没起且开了 `GHLAB_AUTOSTART=1`：先把它启动（服务名会说清是哪个库），再重试一次；启动失败只试一次，不循环。
 
-MCP 侧多了一个 `ghlab_projects` 工具（33 个），agent 可以先看"哪个库有这个文件"再动手。
+MCP 侧多了一个 `ghlab_projects` 工具（35 个），agent 可以先看"哪个库有这个文件"再动手。
 
 ## 接 MCP（给别的 agent 用）
 
@@ -288,7 +288,7 @@ MCP 侧多了一个 `ghlab_projects` 工具（33 个），agent 可以先看"哪
 ghlab mcp          # stdio MCP server，转调本机 daemon
 ```
 
-只暴露 33 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
+只暴露 35 个"问问题"的工具，而不是把 200 个 Ghidra 动作一一映射：
 
 | 工具 | 干什么 |
 |---|---|
@@ -359,6 +359,8 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `overview` | – | **项目总览**：每个程序的函数数/字符串数/导入数/结论数/失败断言数 + 最后一次改动（走索引，实测 3 个程序 2.7s） |
 | `journal` | – / `binary, op, since, limit` | **变更日志**（`.ghlab/journal.jsonl`）：所有写操作自动记录（import/analyze/rename/comment/patch/set_type/types/pdb/note/bookmark），失败也记 |
 | `audit` | – / `binary` | **全项目复算**：把所有结论里的断言重算一遍，列出 FAIL/UNKNOWN |
+| `job` | `run` / `binary, args, list, id, wait` | **后台跑长任务**：`job run=scan binary=fw.bin args="op=decompile;grep=memcpy"` 立刻返回 job 号，`--list` 看队列、`--id j3` 取结果；`--wait` 退回同步语义。参数在这里就校验，写错是协议错误而不是一个没人看的失败任务 |
+| `cancel` | – / `id, all` | **停任务**：翻共享 monitor 的标志位，Ghidra 只在步骤之间检查，所以单个长 decompile 会把当前步跑完（回复里直说）。取消是唯一的例外：它不排队等 LOCK，否则要停的任务自己也停不掉 |
 | `digest` | `binary` / `top, strings` | **一次性 triage**：入口链、按风险分组的导入、API 组合、字符串分类、调用图枢纽、函数大小分布（实测 notepad ≈450 token / 2.7s） |
 | `index` | `binary` / `refresh` | **持久索引**：一次全扫把每个函数的 strings/imports/callees/常量/大小写进 `<project>/.ghlab/index/<binary>.json`；`find`/`diff`/`similar`/`campaign` 都改读索引，`(md5, modification number)` 变了就自动重建 |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
@@ -382,7 +384,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
 
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
-| `mcp` | – | 以 stdio MCP server 形式暴露 33 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
+| `mcp` | – | 以 stdio MCP server 形式暴露 35 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
 | `family` | – / `binary, min_score, limit` | **家族报告**：对 `campaign` 分出的某一族，逐样本给出函数数/字符串数/导入数/调用枢纽/已有结论数与标签，外加全族共有导入与共有字符串（长串优先，单行截断） |
 
@@ -413,6 +415,7 @@ ghlab scan sample.exe 0x44 --writes --imm 4
   （`patch`/`set_type`/`types`/`pdb`/`rename`/`comment`/`note`/`bookmark`/`import`/`analyze`），
   返回 `PermissionError` 且 handler 根本不执行；`audit`/`verify` 照常跑，只是不写回 notes 文件。
   `ping` 与 `GET /` 会带上 `readonly: true`，客户端能自己判断。
+- **长任务要能被看见、被停掉**：全量 `analyze`、大程序 `scan` 都是分钟级，客户端等到超时再重试等于把同一个任务跑两遍。`job run=...` 立刻返回 job 号，任务本身还是走 `dispatch`（照旧排队拿 LOCK、照旧记 journal、照旧在 `in_flight` 里露脸），所以没有"第二套执行路径"；`cancel` 是唯一不排队的命令——要停的东西排在队里，停它的请求不能也排在后面。取消是协作式的：Ghidra 在步骤之间查 monitor，单个长 decompile 会把那一步跑完。
 
   ```bash
   GHLAB_READONLY=1 ghlab serve --port 8765   # 交给模型/同事的脚本时用

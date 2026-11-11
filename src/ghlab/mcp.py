@@ -451,6 +451,46 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_job",
+        "description": (
+            "Run a command in the background and return at once, for work that takes minutes "
+            "(full decompiles, scans, analysis): `run` names the command, `args` carries its "
+            "parameters as key=value pairs split on ';'. Then poll with `list: true` or "
+            '`id: "j3"`; stop it with ghlab_cancel. Errors in the parameters come back '
+            "immediately, not as a failed job."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "run": {"type": "string", "description": "command to run, e.g. decompile"},
+                "binary": _BIN,
+                "args": {
+                    "type": "string",
+                    "description": "its params as key=value pairs split on ';', e.g. targets=main;grep=memcpy",
+                },
+                "list": {"type": "boolean", "description": "list the jobs instead of starting one"},
+                "id": {"type": "string", "description": "return this job's result"},
+                "wait": {"type": "boolean", "description": "block until it finishes"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "ghlab_cancel",
+        "description": (
+            "Ask a running or queued job to stop. Ghidra checks its monitor between steps, so "
+            "this stops between steps: one long decompile finishes first."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "job id, e.g. j3"},
+                "all": {"type": "boolean", "description": "stop everything queued or running"},
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "ghlab_projects",
         "description": (
             "List the configured Ghidra projects, which daemons are up, and the binaries each "
@@ -651,6 +691,8 @@ _COMMANDS = {
     "ghlab_types": "types",
     "ghlab_pdb": "pdb",
     "ghlab_fid": "fid",
+    "ghlab_job": "job",
+    "ghlab_cancel": "cancel",
     "ghlab_projects": "projects",
     "ghlab_decrypt": "decrypt",
     "ghlab_report": "report",

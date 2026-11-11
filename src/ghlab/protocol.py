@@ -261,6 +261,18 @@ _SPECS = [
     ),
     Spec("overview", summary="one line per program: size, facts, notes, last change"),
     Spec(
+        "job",
+        (),
+        ("run", "binary", "args", "list", "id", "wait"),
+        "run a command in the background; list=yes reports the queue, id=<job> one result",
+    ),
+    Spec(
+        "cancel",
+        (),
+        ("id", "all"),
+        "ask the running/queued job to stop (Ghidra checks its monitor between steps)",
+    ),
+    Spec(
         "audit",
         (),
         ("binary",),
