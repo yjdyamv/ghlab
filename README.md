@@ -498,7 +498,7 @@ GHLAB_LIVE_RICH=1 GHLAB_URL=http://127.0.0.1:8765/ python -m unittest discover -
 2. `proj.importProgram(str)` 在 jpype 下重载歧义 → 必须 `proj.importProgram(File(path))`。
 3. `FunctionManager.getFunction(String)` 不存在（只有 `getFunction(long)`）→ 按符号表找。
 4. `Data.hasStringValue()` 在 jpype 下抛异常 → 改为按数据类型名（string/unicode/char）判定，并返回 `defined_data_scanned` 便于诊断。
-5. `GhidraProject.openProgram` 会遗留一个未关闭的 transaction，此后 `program.save()` 必报 `Unable to lock due to active transaction`；`project.save(program)` 才能落盘（`_save()` 里做了回退链）。
+5. `GhidraProject.openProgram` 会开一个名叫 `Batch Processing` 的 transaction 并把它记在私有 `openPrograms` 里，`GhidraProject.save` 负责"结束它 → 落盘 → 再开一个"。它只在落盘成功后才把新 id 记回去，**所以一次落盘失败就会让它永远指向一个已结束的 transaction**，此后该 program 的每次保存都 `Attempted to end Transaction more than once` + `Unable to lock due to active transaction`，直到 daemon 重启。更糟的是 `getCurrentTransactionInfo()` 会返回一个已经结束的 id，照着它 `endTransaction` 只会得到 `Transaction not found`。ghlab 因此**不用 `openProgram` 也不留那份记账**：打开走 `project.getProjectData().getFile("/"+name).getDomainObject(consumer, true, false, MONITOR)`（打开后当前 transaction 是 `none`），关闭走 `domainObject.release(consumer)`，保存只走 `program.getDomainFile().save(MONITOR)`；落盘失败重试一次，仍失败就把该 program 踢出缓存并 `release`，下次请求重开一个干净的。`project.save()` 只在 `import` 里用一次——那时 program 正是 `GhidraProject` 打开的，随后立刻 `close(program)` 收尾。
 6. Ghidra 12.2 的 `CommentType` 只有 `EOL/PRE/POST/PLATE/REPEATABLE`，没有 `DECOMPILER`（11.x 有）→ `decompiler` 映射为 `PRE`。
 7. JVM 冷启动 30–45s 不可避免：`ghlab start` 会轮询 health 直到就绪；进程内查询才是快的。
 8. 环境代理 127.0.0.1:7897 失效会拖垮 pip/uv：`env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY`。

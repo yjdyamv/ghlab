@@ -110,20 +110,32 @@ class SmokeTest(unittest.TestCase):
         self.assertTrue(all(i["risk"] == "file" for i in grouped["imports"]))
 
     def test_offsets_attributes_a_field_to_its_parameter(self):
-        """The whole point: +0x40 on param_2 is not the same fact as +0x40 on a local."""
-        args = sorted(
-            (row for row in self.c.call("functions", binary=BIN, limit=200)["functions"]),
-            key=lambda row: row["size"],
-            reverse=True,
+        """The whole point: +0x40 on param_2 is not the same fact as +0x40 on a local.
+
+        The biggest function is not necessarily one that touches a field -- on a 40 KB
+        sample several are only calls and stack arrays -- so walk down until a function
+        actually has a `[base + constant]` access, and fail if none of them does (that
+        is what a broken attribution looks like).
+        """
+        rows = self.c.call("functions", binary=BIN, limit=200)["functions"]
+        self.assertTrue(rows)
+        saw_param, checked = False, 0
+        for row in sorted(rows, key=lambda r: r["size"], reverse=True):
+            r = self.c.call("offsets", binary=BIN, target=row["name"], limit=40)
+            self.assertEqual(r["function"], row["name"])
+            self.assertIsNone(r["error"])
+            checked += 1
+            for access in r["accesses"]:
+                self.assertIn(access["kind"], ("param", "local"))
+                self.assertTrue(access["offset"].startswith(("0x", "-0x")))
+                saw_param = saw_param or access["kind"] == "param"
+            if saw_param:
+                break
+        self.assertTrue(
+            saw_param,
+            f"no [param+disp] access in any of {checked} function(s) of {BIN}: "
+            "either the sample is too simple or `offsets` stopped attributing",
         )
-        target = args[0]["name"]
-        r = self.c.call("offsets", binary=BIN, target=target, limit=40)
-        self.assertEqual(r["function"], target)
-        self.assertIsNone(r["error"])
-        self.assertTrue(r["accesses"])
-        for row in r["accesses"]:
-            self.assertIn(row["kind"], ("param", "local"))
-            self.assertTrue(row["offset"].startswith(("0x", "-0x")))
 
     def test_scan_accepts_several_offsets_at_once(self):
         """Several offsets at once keeps only functions that touch all of them."""

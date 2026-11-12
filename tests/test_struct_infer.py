@@ -217,7 +217,7 @@ class StructCreateOrderTest(unittest.TestCase):
         def fake_save(_program, _message, entry=None):
             events.append("save")
             self.assertIn("end", events, "save ran inside the transaction")
-            return "project.save(program)"
+            return "domain.save(monitor)"
 
         with (
             mock.patch.object(session, "_entry", return_value=entry),
@@ -244,7 +244,7 @@ class StructCreateOrderTest(unittest.TestCase):
             )
         self.assertEqual(events, ["begin", "install", "end", "save"])
         self.assertEqual(out["created"], "/Foo_t")
-        self.assertEqual(out["saved_via"], "project.save(program)")
+        self.assertEqual(out["saved_via"], "domain.save(monitor)")
 
 
 if __name__ == "__main__":

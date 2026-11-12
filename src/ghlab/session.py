@@ -117,8 +117,24 @@ def _entry(binary: str) -> dict[str, Any]:
     from ghidra.app.decompiler import DecompInterface
     from ghidra.program.flatapi import FlatProgramAPI
 
+    # Opened through the domain file, *not* through `GhidraProject.openProgram`:
+    # that one starts a transaction named "Batch Processing" and remembers its id
+    # in a private map.  Keeping a program open for minutes (instead of one
+    # import/save cycle) makes that bookkeeping drift from the real transaction
+    # stack, and one failed save leaves it permanently stale -- every later save
+    # then dies with "Attempted to end Transaction more than once".  Going through
+    # `getDomainObject` means we own every transaction we open, and a save is just
+    # a save.
     proj = project()
-    program = proj.openProgram("/", binary, False)
+    domain_file = proj.getProjectData().getFile("/" + binary)
+    if domain_file is None:
+        raise KeyError(f"program {binary!r} is not in the project any more")
+    from java.lang import Object as JavaObject
+
+    # The consumer is only an identity token for Ghidra's open-object bookkeeping;
+    # it must be the same object when the program is released again.
+    consumer = JavaObject()
+    program = domain_file.getDomainObject(consumer, True, False, MONITOR)
     decomp = DecompInterface()
     decomp.toggleCCode(True)
     decomp.toggleSyntaxTree(True)
@@ -126,6 +142,8 @@ def _entry(binary: str) -> dict[str, Any]:
     entry = {
         "binary": binary,
         "proj": proj,
+        "file": domain_file,
+        "consumer": consumer,
         "program": program,
         "decomp": decomp,
         "api": FlatProgramAPI(program, MONITOR),
@@ -154,7 +172,9 @@ def _evict_lru(keep: str) -> None:
         with contextlib.suppress(Exception):  # jpype: already closed, or never opened
             entry["decomp"].dispose()
         with contextlib.suppress(Exception):
-            entry["program"].release(entry["proj"])
+            # release through the consumer it was opened with, so Ghidra closes the
+            # domain object instead of thinking it still has a user
+            entry["program"].release(entry.get("consumer") or entry["proj"])
         for key in [k for k in _FP_CACHE if k[0] == victim]:
             _FP_CACHE.pop(key, None)
 
@@ -228,32 +248,129 @@ def _function(entry: dict[str, Any], target: str):
     return None
 
 
-def _save(program, message: str, entry: dict[str, Any] | None = None) -> str:
-    """Persist the program.
+def _end_open_transactions(program: Any, limit: int = 4) -> int:
+    """End whatever transaction Ghidra left open on this program.
 
-    Ghidra 12.2 leaves a transaction open from `GhidraProject.openProgram`, so
-    `program.save(...)` fails with "Unable to lock due to active transaction".
-    Saving through the project works (it manages the domain file itself).
+    `GhidraProject.openProgram` starts one, names it "Batch Processing", and
+    expects `GhidraProject.save`/`GhidraProject.close` to end it.  We keep programs
+    open for minutes instead of one import/save cycle, so that bookkeeping and the
+    real transaction stack drift apart: after one failed save, Ghidra hits
+    "Attempted to end Transaction more than once" (its stale id is no longer on
+    top) and then refuses every following save with "Unable to lock due to active
+    transaction" -- one bad program, wedged for the life of the daemon.
+
+    Ending the leftover here, before each save, keeps the two in step.  A handle
+    that has already been ended throws; `getCurrentTransactionInfo` happily
+    returns those, so the throw is the signal to stop.
+    """
+    ended = 0
+    for _ in range(limit):
+        try:
+            tx = program.getCurrentTransactionInfo()
+            if tx is None:
+                break
+            program.endTransaction(int(tx.getID()), True)
+        except Exception:  # noqa: BLE001 - jpype raises whatever Java chose
+            break
+        ended += 1
+    return ended
+
+
+def _domain_save(program: Any) -> None:
+    """Save the domain file, after ending whatever transaction Ghidra left on top.
+
+    GhidraProject's own `save` does this with the id it remembers; that id is
+    useless once it is stale ("Transaction not found"), so clear the stack first.
+    """
+    _end_open_transactions(program)
+    program.getDomainFile().save(MONITOR)
+
+
+def _save(program, message: str, entry: dict[str, Any] | None = None) -> str:
+    """Persist the program through its domain file.
+
+    One way in, and it is the domain file: `_entry` opens programs with
+    `DomainFile.getDomainObject`, which leaves no transaction behind, so a save is
+    "end our own transaction, then save".
+
+    `GhidraProject.save` is deliberately *not* used as a fallback.  It ends the id
+    it remembered from `openProgram`; if that save ever fails, the id stays and the
+    next save ends a transaction that is not on the stack -- "Attempted to end
+    Transaction more than once", then "Unable to lock due to active transaction"
+    forever.  A fallback chain over a stateful resource makes a bad state worse.
+
+    A failure worth retrying is still "Unable to lock due to active transaction":
+    Ghidra's auto-analysis can open one behind our back right after a commit, so the
+    first attempt may lose the race by a few milliseconds.  If both attempts fail,
+    the program is dropped from the cache: the next request reopens it from disk,
+    which is the only repair available from Python (the stale bookkeeping lives in a
+    private field of GhidraProject).
 
     Pass `entry` when the change alters what the decompiler prints: the disk cache
     is keyed by md5/prototype/comments only, so patched bytes would otherwise keep
     answering from stale source until someone remembered `--refresh`.
     """
-    attempts = (
-        ("project.save(program)", lambda: project().save(program)),
-        ("program.save(msg,monitor)", lambda: program.save(message, MONITOR)),
-        ("domain.save(monitor)", lambda: program.getDomainFile().save(MONITOR)),
-    )
-    errors = []
-    for label, fn in attempts:
+    label = "domain.save(monitor)"
+    errors: list[str] = []
+    for attempt in range(2):
         try:
-            fn()
-            if entry is not None:
-                _cache_purge(entry)
-            return label
-        except Exception as ex:  # noqa: BLE001
+            _domain_save(program)
+        except Exception as ex:  # noqa: BLE001 - jpype raises whatever Java chose
             errors.append(f"{label}: {type(ex).__name__}: {ex}")
-    raise RuntimeError("cannot save program -> " + " | ".join(errors))
+            time.sleep(0.25 * (attempt + 1))
+            continue
+        if entry is not None:
+            _cache_purge(entry)
+        return label
+    forgotten = _forget_program(program)
+    raise RuntimeError(
+        f"cannot save program for {message!r} -> "
+        + " | ".join(errors)
+        + f" | tx: {_tx_state(program)}"
+        + ("" if forgotten else " | program was not in the open cache")
+    )
+
+
+def _forget_program(program: Any) -> bool:
+    """Drop one program from the open cache so the next request reopens it.
+
+    The repair for a program that refuses to save: the stale bookkeeping is inside
+    Ghidra's own objects, so the only clean state reachable from Python is "closed".
+    """
+    for name, entry in list(_programs.items()):
+        cached = entry.get("program")
+        if not (cached is program or _same_program(cached, program)):
+            continue
+        _programs.pop(name, None)
+        with contextlib.suppress(Exception):
+            entry["decomp"].dispose()
+        with contextlib.suppress(Exception):
+            entry["program"].release(entry.get("consumer") or entry["proj"])
+        for key in [k for k in _FP_CACHE if k[0] == name]:
+            _FP_CACHE.pop(key, None)
+        return True
+    return False
+
+
+def _same_program(a: Any, b: Any) -> bool:
+    """jpype hands out one proxy per Java object, but not always *that* proxy."""
+    if a is b:
+        return True
+    try:
+        return bool(a.equals(b))
+    except Exception:  # noqa: BLE001 - jpype raises whatever Java chose
+        return False
+
+
+def _tx_state(program: Any) -> str:
+    """What transaction Ghidra thinks is current -- for save failures, which are all
+    about exactly that."""
+    with contextlib.suppress(Exception):
+        tx = program.getCurrentTransactionInfo()
+        if tx is None:
+            return "none"
+        return f"id={tx.getID()} {tx.getDescription()}"
+    return "?"
 
 
 def brief(fn) -> dict[str, Any]:
@@ -445,6 +562,10 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     proj.saveAs(program, "/", name, True)
     if a.get("analyze", True):
         _analyze_all(program)
+    # `proj.save` here, not a domain save: the program GhidraProject just imported is
+    # one *it* opened, so its "Batch Processing" transaction is on the stack and a
+    # bare domain save would refuse to take the write lock.  `close` ends that
+    # transaction and releases it, which is the other half of the import cycle.
     proj.save(program)
     out = {
         "binary": name,
@@ -455,7 +576,8 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     if language:
         out["language"] = language
         out["cspec"] = cspec
-    program.release(proj)
+    with contextlib.suppress(Exception):
+        proj.close(program)  # ends import's transaction *and* releases it
     return out
 
 
@@ -688,9 +810,12 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                 item["signature"] = _prototype(fn)
                 results.append(item)
                 continue
-            key = None if a.get("refresh") else _decomp_cache_key(e, fn)
-            cache_path = _cache_bucket(program.getExecutableMD5()) / (key + ".c") if key else None
-            code = _cache_read(cache_path) if cache_path else None
+            key = _decomp_cache_key(e, fn)
+            cache_path = _cache_bucket(program.getExecutableMD5()) / (key + ".c")
+            # `refresh` skips the *read*, not the write: a refreshed call that did not
+            # store its result left the next call decompiling again, so "refresh once,
+            # then read" never warmed anything.
+            code = None if a.get("refresh") else _cache_read(cache_path)
             cached = code is not None
             if code is None:
                 res = e["decomp"].decompileFunction(fn, timeout, MONITOR)
@@ -698,7 +823,7 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
                     results.append({"target": str(t), "error": _decomp_failure(res)})
                     continue
                 code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
-                if cache_path:
+                with contextlib.suppress(OSError):
                     _cache_write(cache_path, code)
             all_lines = code.splitlines()
             item = brief(fn)
