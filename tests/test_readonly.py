@@ -92,6 +92,13 @@ class ReadonlyTest(unittest.TestCase):
     def test_the_daemon_page_says_nothing_when_writable(self):
         self.assertFalse(json.loads(server._info_body())["readonly"])
 
+    def test_the_help_page_says_which_project_it_serves(self):
+        # `ghlab projects` compares this with the config, so a --url override shows
+        # the directory the daemon really has open instead of the config path
+        body = json.loads(server._info_body())
+        self.assertIn("project", body)
+        self.assertEqual(body["project"], session.project_location())
+
 
 if __name__ == "__main__":
     unittest.main()

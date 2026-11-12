@@ -100,8 +100,10 @@ def fmt_decompile(r: dict[str, Any]) -> str:
         return "(no function matched; widen -m/-g or raise -n)"
     out = []
     for item in r.get("results") or []:
-        if item.get("error"):
-            out.append(f"!! {item.get('target')}: {item['error']}")
+        if "error" in item:
+            # an empty message used to fall through to the "name" key and crash the CLI
+            # client with KeyError on a real daemon that had refused the decompile
+            out.append(f"!! {item.get('target')}: {item.get('error') or '(no message)'}")
             continue
         if item.get("signature") and "lines" not in item:
             out.append(f"  {item['addr']}  {item['size']:>6}b  {item['signature']}")
@@ -246,8 +248,10 @@ def fmt_struct(r: dict[str, Any]) -> str:
     out.extend(str(r.get("decl") or "").split(chr(10)))
     if r.get("created"):
         out.append(f"   installed as {r['created']} (saved via {r.get('saved_via')})")
+        # the bare name, not `struct X *`: Ghidra's C parser answers `Can't resolve
+        # datatype: struct FUN_..._t *` for a type that lives in the DataTypeManager
         out.append(
-            f'   apply it with: ghlab set-type {r["binary"]} {r["function"]} "int f(struct {r["name"]} *p)"'
+            f'   apply it with: ghlab set-type {r["binary"]} {r["function"]} "int f({r["name"]} *p)"'
         )
     elif r.get("fields"):
         out.append("   pass --create to install this type in the program")
@@ -396,6 +400,8 @@ def fmt_diff(r: dict[str, Any]) -> str:
             out.append(f"   - {f['addr']}  {f['name']}  ({f['size']}b)")
     if not (r.get("changed") or r.get("added") or r.get("removed")):
         out.append("   (no functional difference found)")
+    if r.get("note"):
+        out.append(f"!! {r['note']}")
     sem = r.get("semantic")
     if sem:
         out.extend(_semantic_lines(sem))
@@ -518,6 +524,51 @@ def _hexblock(hexstr: str, ascii_: str, width: int = 16) -> str:
         text = ascii_[off : off + width]
         lines.append(f"     {off:04x}  {hexpart}  |{text}|")
     return "\n".join(lines)
+
+
+def fmt_ping(r: dict[str, Any]) -> str:
+    # `ping` (the daemon command) carries no pid/uptime; GET / does
+    bits = [f"# {r.get('service') or 'ghlab'} up"]
+    if r.get("uptime_s") is not None:
+        bits.append(f"{r['uptime_s']}s")
+    if r.get("pid"):
+        bits.append(f"pid {r['pid']}")
+    if r.get("project"):
+        bits.append(str(r["project"]))
+    head = "  ".join(bits)
+    if r.get("readonly"):
+        head += "  [read-only]"
+    out = [head]
+    loaded = r.get("loaded") or []
+    out.append(
+        f"  {r.get('binaries', 0)} program(s), {len(loaded)} open: "
+        + (", ".join(loaded[:8]) + (" ..." if len(loaded) > 8 else "") if loaded else "-")
+    )
+    busy = r.get("busy") or {}
+    if busy:
+        out.append(f"  busy: {busy.get('cmd')} for {busy.get('elapsed_s', '?')}s")
+    return chr(10).join(out)
+
+
+def fmt_bytes(r: dict[str, Any]) -> str:
+    out = [f"== {r.get('addr')}  {r.get('size', 0)} byte(s)"]
+    if r.get("truncated"):
+        out.append("   (cut at the end of the block; ask for fewer bytes or another address)")
+    out.append(_hexblock(str(r.get("hex") or ""), str(r.get("ascii") or "")))
+    return chr(10).join(out)
+
+
+def fmt_rename(r: dict[str, Any]) -> str:
+    was = r.get("was") or r.get("old")
+    if was:
+        return f"renamed {r.get('addr')}: {was} -> {r.get('renamed')}"
+    return f"renamed {r.get('addr')} -> {r.get('renamed')}"
+
+
+def fmt_comment(r: dict[str, Any]) -> str:
+    text = str(r.get("text") or r.get("comment") or "")
+    preview = text if len(text) <= 90 else text[:87] + "..."
+    return f"comment @ {r.get('addr')} ({r.get('type') or 'plate'}): {preview}"
 
 
 def fmt_index(r: dict[str, Any]) -> str:
@@ -738,8 +789,13 @@ def fmt_map(r: dict[str, Any]) -> str:
         if item.get("error"):
             out.append(f"{label}\n      error: {item['error']}")
             continue
+        if item.get("lines") and not item.get("hits"):
+            out.append(f"{label} {item['lines']} line(s)")
+            continue
+        # the row keeps a *count* in "hits" and the matches in "matched"; iterating
+        # "hits" crashed the client with "'int' object is not iterable"
         out.append(f"{label} {item['hits']} hit(s)")
-        for hit in item["hits"]:
+        for hit in item.get("matched") or []:
             if "line" in hit:
                 out.append(f"      {hit['line']}: {str(hit.get('text', ''))[:110]}")
             else:
@@ -946,6 +1002,10 @@ def fmt_campaign(r: dict[str, Any]) -> str:
 
 
 FORMATTERS = {
+    "ping": fmt_ping,
+    "bytes": fmt_bytes,
+    "rename": fmt_rename,
+    "comment": fmt_comment,
     "binaries": fmt_binaries,
     "info": fmt_info,
     "analyze": fmt_analyze,
@@ -1384,6 +1444,9 @@ def fmt_projects(r: dict[str, Any]) -> str:
         detail = row.get("url") or ""
         if row.get("project_dir"):
             detail += f"  ({row['project_dir']})"
+            configured = row.get("configured_project_dir")
+            if configured:
+                detail += f"  [config: {configured}]"
         out.append(f" {mark}{row['project']:<10} {state:<6} {count:>4}  {detail}")
         for name in (row.get("binaries") or [])[:6]:
             out.append(f"      {name}")
@@ -2720,6 +2783,9 @@ def cmd_run(a: argparse.Namespace) -> int:
         spent = sum(int(s.get("ms") or 0) for s in summary["steps"])
         ok = summary["ran"] - summary["failed"]
         print(f"{ok}/{summary['total']} steps ok in {spent}ms")
+        for s in summary["steps"]:
+            if s.get("written"):
+                print(f"  line {s['line']} -> {s['written']}")
         for s in summary["steps"]:
             if s["status"] == "failed":
                 print(f"  line {s['line']}: {s['command']} - {s['error']}")

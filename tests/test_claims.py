@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from ghlab import session
 
@@ -115,6 +116,26 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(session._claims_status([{"ok": True}, {"ok": False}]), "fail")
         self.assertEqual(session._claims_status([{"ok": None}]), "unknown")
         self.assertEqual(session._claims_status([{"ok": True}, {"ok": None}]), "unknown")
+
+
+class NoteClaimKindTest(unittest.TestCase):
+    def test_an_uncheckable_claim_is_refused_before_anything_is_written(self):
+        # `--assert "size(0x140001008)=123"` used to be stored as an "unknown" claim,
+        # which then showed up in every verify/audit forever
+        with (
+            mock.patch.object(session, "_entry", side_effect=AssertionError("opened")),
+            self.assertRaises(ValueError) as cm,
+        ):
+            session.cmd_note(
+                {
+                    "binary": "a.exe",
+                    "text": "x",
+                    "at": "140001008",
+                    "assert": "size(140001008)=123",
+                }
+            )
+        self.assertIn("unknown kind", str(cm.exception))
+        self.assertIn("size", str(cm.exception))
 
 
 if __name__ == "__main__":

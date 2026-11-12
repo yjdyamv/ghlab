@@ -1,6 +1,7 @@
 """Script pipelines: parsing, variables, redirects, failure policy. No daemon needed."""
 
 import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -124,6 +125,33 @@ class RunTest(unittest.TestCase):
             )
             self.assertEqual(seen, [["digest", "a.exe"], ["ping"]])
             self.assertEqual(summary["script"], str(script))
+
+
+class RedirectBaseTest(unittest.TestCase):
+    def test_a_relative_redirect_lands_next_to_the_script(self):
+        # `ghlab run /elsewhere/script.gh` used to write `out/` into the caller's cwd
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "triage.gh"
+            script.write_text("functions a.exe -n 1 > out/fn.txt\n", encoding="utf-8")
+            summary = pipeline.run_file(script, execute=lambda _argv: print("140001008  f"))
+            target = Path(tmp) / "out" / "fn.txt"
+            self.assertTrue(target.exists())
+            self.assertEqual(summary["steps"][0]["written"], str(target))
+            self.assertIn("140001008", target.read_text(encoding="utf-8"))
+
+    def test_without_a_base_a_relative_redirect_still_uses_the_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old = os.getcwd()
+            os.chdir(tmp)
+            try:
+                summary = pipeline.run_steps(
+                    pipeline.parse_script("functions a.exe -n 1 > here.txt"),
+                    execute=lambda _argv: 0,
+                )
+                self.assertTrue((Path(tmp) / "here.txt").exists())
+                self.assertEqual(summary["steps"][0]["written"], "here.txt")
+            finally:
+                os.chdir(old)
 
 
 if __name__ == "__main__":

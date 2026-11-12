@@ -63,6 +63,7 @@ def _info_body() -> bytes:
         {
             "ok": True,
             "service": "ghlab",
+            "project": session.project_location(),
             "pid": os.getpid(),
             "uptime_s": round(time.time() - STARTED, 1),
             "busy": session.in_flight(),

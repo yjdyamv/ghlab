@@ -695,7 +695,7 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
             if code is None:
                 res = e["decomp"].decompileFunction(fn, timeout, MONITOR)
                 if not res.decompileCompleted():
-                    results.append({"target": str(t), "error": str(res.getErrorMessage())})
+                    results.append({"target": str(t), "error": _decomp_failure(res)})
                     continue
                 code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
                 if cache_path:
@@ -728,7 +728,11 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
             results.append({"target": str(t), "error": f"{type(ex).__name__}: {ex}"})
     if grep is not None:
         results = [r for r in results if r.get("error") or r.get("grep_hits")]
-    return {"binary": a["binary"], "decompiled": len(results), "results": results}
+    return {
+        "binary": a["binary"],
+        "decompiled": sum(1 for r in results if "error" not in r),
+        "results": results,
+    }
 
 
 def _string_refs(program, address, max_refs: int = 8) -> list[dict[str, Any]]:
@@ -1569,7 +1573,15 @@ def _install_struct(program: Any, spec: dict[str, Any]) -> str:
                 f"cannot create field {field['name']} of type {wanted!r}; "
                 f"known: {', '.join(sorted(_GHIDRA_TYPES))}, or NAME * for a pointer"
             )
-        struct.add(field["offset"], data_type, field["name"], f"{field['loads']} load(s)")
+        # jpype overloads are matched on *argument order*: StructureDataType.add takes
+        # (DataType, int offset, String name, String comment), and (int, DataType, ...)
+        # matched nothing -- found on the first real `struct --create` run
+        struct.add(
+            data_type,
+            int(field["offset"]),
+            str(field["name"]),
+            f"{field['loads']} load(s), {field['stores']} store(s)",
+        )
     manager.addDataType(struct, DataTypeConflictHandler.REPLACE_HANDLER)
     return str(struct.getPathName())
 
@@ -1584,6 +1596,19 @@ def _edit(program: Any, reason: str = "ghlab") -> Any:
         program.endTransaction(tx, True)
 
 
+def _decomp_failure(res: Any) -> str:
+    """Why the decompiler refused, in words a caller can act on.
+
+    `DecompileResults.getErrorMessage()` is empty when the monitor was already
+    cancelled, so the reply used to be the useless sentence "decompiler said: ".
+    """
+    why = str(res.getErrorMessage() or "").strip()
+    return why or (
+        "it returned nothing and gave no reason "
+        "(a cancelled job can leave the monitor flagged; retry)"
+    )
+
+
 def cmd_struct(a: dict[str, Any]) -> dict[str, Any]:
     """What struct is behind `[param+0x18]`?  Infer it from the field accesses."""
     began = time.monotonic()
@@ -1596,7 +1621,7 @@ def cmd_struct(a: dict[str, Any]) -> dict[str, Any]:
         raise KeyError(f"function {target!r} not found{_function_suggestions(p, target)}")
     res = e["decomp"].decompileFunction(fn, int(a.get("timeout", 60)), MONITOR)
     if not res.decompileCompleted():
-        raise ValueError(f"decompiler said: {res.getErrorMessage()}")
+        raise ValueError(f"decompiler said: {_decomp_failure(res)}")
     rows = _param_accesses(res.getHighFunction())
     # A parameter is what a struct pointer usually is; only fall back to locals
     # when this function keeps its object on the stack.
@@ -1629,7 +1654,10 @@ def cmd_struct(a: dict[str, Any]) -> dict[str, Any]:
     if spec["fields"] and a.get("create") in (True, "yes", "true", "1"):
         with _edit(p):
             out["created"] = _install_struct(p, spec)
-            out["saved_via"] = _save(p, "ghlab struct", e)
+        # save *after* the transaction closes: Ghidra refuses with
+        # "Unable to lock due to active transaction", which is what the first real
+        # `struct --create` run got back from all three save paths
+        out["saved_via"] = _save(p, "ghlab struct", e)
     return out
 
 
@@ -2175,7 +2203,13 @@ def cmd_comment(a: dict[str, Any]) -> dict[str, Any]:
     finally:
         p.endTransaction(tx, True)
     saved = _save(p, "ghlab comment")
-    return {"addr": str(addr), "type": ctype, "ok": True, "saved_via": saved}
+    return {
+        "addr": str(addr),
+        "type": ctype,
+        "text": str(a["text"]),
+        "ok": True,
+        "saved_via": saved,
+    }
 
 
 def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
@@ -3213,11 +3247,30 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
         "removed": removed[:limit],
         "elapsed_ms": int((time.time() - started) * 1000),
     }
+    note = _same_md5_note(left["md5"], right["md5"], identical, len(changed))
+    if note:
+        payload["note"] = note
     if a.get("semantic"):
         payload["semantic"] = _semantic_delta(
             _semantic_profile(left), _semantic_profile(right), limit=limit
         )
     return payload
+
+
+def _same_md5_note(a_md5: Any, b_md5: Any, identical: int, changed: int) -> str:
+    """Say so when two *identical files* differ only in how far each was analysed.
+
+    An imported-but-unanalysed copy has no instructions worth fingerprinting, so every
+    function reads as "changed" against an analysed twin -- a false alarm that the
+    summary alone (`identical 0, changed 455`) made look like real drift.
+    """
+    if not a_md5 or a_md5 != b_md5 or identical or not changed:
+        return ""
+    return (
+        "both programs have the same md5, so every difference above comes from how "
+        "far each one was analysed, not from different code; run `ghlab analyze` on "
+        "the one with fewer strings/imports"
+    )
 
 
 def parse_arg_spec(text: Any) -> tuple[str, Any]:
@@ -3997,6 +4050,12 @@ def cmd_decrypt(a: dict[str, Any]) -> dict[str, Any]:
     else:
         if not a.get("binary"):
             raise ValueError("decrypt needs hex=... or binary=... with addr=...")
+        if not a.get("binary"):
+            raise ValueError("decrypt needs hex=... or binary=... with addr=...")
+        if not a.get("addr"):
+            # opening the program first only to report a missing argument made the
+            # message `KeyError: 'address None not found'`
+            raise ValueError("decrypt needs addr=<address> with a binary, or hex=...")
         entry = _entry(a["binary"])
         program = entry["program"]
         offset = _hex_addr(a.get("addr"))
@@ -5048,6 +5107,14 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
         }
     at = a.get("at")
     claims = _as_list(a.get("assert") or [])
+    for raw in claims:
+        kind = _parse_claim(raw)["kind"]
+        if kind not in _CLAIM_KINDS:
+            # stored as an uncheckable claim, it only ever answers "unknown" -- say so
+            # now, while the author is still here, and before anything is written
+            raise ValueError(
+                f"claim {raw!r} has unknown kind {kind!r}; kinds: {', '.join(_CLAIM_KINDS)}"
+            )
     addr = None
     name = None
     e = None
@@ -6089,23 +6156,29 @@ def cmd_cancel(a: dict[str, Any]) -> dict[str, Any]:
     """
     if a.get("all"):
         targets = [j for j in JOBS.values() if j["state"] in ("queued", "running")]
+        idle = "nothing is queued or running; cancel has nothing to stop"
     else:
         jid = _job_id(a.get("id"))
         if not jid:
             raise ValueError("cancel needs id=<job> or all=yes")
-        job = JOBS.get(str(jid))
+        job = JOBS.get(jid)
         if job is None:
             raise KeyError(f"no job {jid!r}; `job list=yes` shows the kept ones")
-        targets = [job]
+        # a finished job has nothing to cancel, and flipping the monitor anyway left it
+        # flagged for every later decompile (found on a real run: `cancel j1` on a done
+        # job wedged the decompiler until the daemon restarted)
+        targets = [job] if job["state"] in ("queued", "running") else []
+        idle = f"{jid} is {job['state']}; nothing to cancel"
     for job in targets:
         job["cancelled"] = True
         if job["state"] == "queued":
             job["state"] = "cancelled"
             job["ended_at"] = time.monotonic()
-    if targets:
-        with contextlib.suppress(Exception):
-            if MONITOR is not None:
-                MONITOR.cancel()
+    if not targets:
+        return {"cancel_requested": [], "note": idle}
+    with contextlib.suppress(Exception):
+        if MONITOR is not None:
+            MONITOR.cancel()
     return {
         "cancel_requested": [j["id"] for j in targets],
         "note": "Ghidra checks between steps; a long single step finishes first",
@@ -6133,6 +6206,11 @@ def _run(cmd: str, params: dict[str, Any], track: bool) -> Any:
         _INFLIGHT["started"] = time.monotonic()
         _INFLIGHT["since"] = time.strftime("%H:%M:%S")
     try:
+        if not _jobs_active():
+            # a job cancelled *after* it had already finished never reached the reset in
+            # _job_thread, so the monitor stayed flagged and every later decompile came
+            # back "decompiler said: " with no message at all
+            _monitor_reset()
         if _mutates(cmd, params) and readonly():
             raise PermissionError(
                 f"daemon is read-only (GHLAB_READONLY=1); {cmd!r} changes the project"
@@ -6151,6 +6229,11 @@ def _run(cmd: str, params: dict[str, Any], track: bool) -> Any:
             _INFLIGHT["cmd"] = None
             _INFLIGHT["started"] = 0.0
             _INFLIGHT["since"] = None
+
+
+def _jobs_active() -> bool:
+    """Is anything queued or running?  (A stale cancel flag is cleared when not.)"""
+    return any(j["state"] in ("queued", "running") for j in JOBS.values())
 
 
 def in_flight() -> dict[str, Any]:

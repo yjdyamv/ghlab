@@ -111,7 +111,11 @@ class JobLifecycleTest(JobTestBase):
         # and cmd_cancel looked the bracket up and reported "no job ['j1']"
         bracketed = session.cmd_job({"id": [out["job"]]})["jobs"][0]
         self.assertEqual(bracketed["result"], {"slow": True})
-        self.assertEqual(session.cmd_cancel({"id": [out["job"]]})["cancel_requested"], [out["job"]])
+        # the job is done by now, so cancel resolves the id and says so instead of
+        # raising KeyError on "[j7]"
+        done = session.cmd_cancel({"id": [out["job"]]})
+        self.assertEqual(done["cancel_requested"], [])
+        self.assertIn(out["job"], done["note"])
 
     def test_wait_returns_the_result_inline(self):
         self.spec_testy()
@@ -354,3 +358,23 @@ class ProtocolAndCliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleCancelTest(JobTestBase):
+    def test_cancelling_a_finished_job_touches_no_monitor(self):
+        self.spec_testy()
+        self.handle(lambda _a: {"fine": True})
+        out = session.cmd_job({"run": "testy", "wait": True})
+        self.assertEqual(out["state"], "done")
+        got = session.cmd_cancel({"id": out["job"]})
+        self.assertEqual(got["cancel_requested"], [])
+        self.assertIn("nothing to cancel", got["note"])
+        self.assertFalse(self.monitor.cancelled)
+
+    def test_a_flag_left_over_from_a_finished_job_is_cleared_by_the_next_command(self):
+        # a real run: `cancel j1` on an already-done job flagged the monitor, the job
+        # thread was long gone, and every later decompile failed with an empty message
+        self.monitor.cancelled = True
+        self.spec_testy()
+        session.dispatch("testy", {"binary": "x"})
+        self.assertFalse(self.monitor.cancelled)

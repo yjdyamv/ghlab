@@ -224,6 +224,7 @@ ghlab run ~/re/pipes/triage.gh --set BIN=notepad.exe
 
 规则只有四条：一行一条命令、`#` 注释、`$VAR` 来自 `--set`、`>`/`>>` 把这一步的 stdout 写进文件。
 `--keep-going` 失败继续，`--dry-run` 只解析不执行。中转义只在引号前生效（所以 `C:\tmp\a.md` 不会被吃掉反斜杠）。
+相对路径的重定向落在**脚本所在目录**（不是当前目录），跑完会逐行告诉你写到了哪里。
 
 ## 家族聚类（`ghlab campaign`）
 

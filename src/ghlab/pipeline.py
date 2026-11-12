@@ -149,6 +149,7 @@ def run_steps(
     keep_going: bool = False,
     dry_run: bool = False,
     progress: TextIO | None = None,
+    base: Path | None = None,
 ) -> dict[str, Any]:
     execute = execute or _default_execute
     progress = progress or sys.stderr
@@ -163,7 +164,12 @@ def run_steps(
         status, error = "ok", None
         try:
             if step.out:
+                # a relative `> out/x.c` belongs to the script, not to whoever ran it:
+                # the same script from another directory used to scatter `out/` around
+                # and still report "ok"
                 path = Path(step.out).expanduser()
+                if not path.is_absolute() and base is not None:
+                    path = base / path
                 path.parent.mkdir(parents=True, exist_ok=True)
                 mode = "a" if step.append else "w"
                 with (
@@ -186,6 +192,7 @@ def run_steps(
                 "command": step.command,
                 "argv": step.argv,
                 "out": step.out,
+                "written": str(path) if step.out else "",
                 "status": status,
                 "error": error,
                 "ms": elapsed,
@@ -215,9 +222,14 @@ def run_file(
     dry_run: bool = False,
     execute: Callable[[list[str]], int] | None = None,
 ) -> dict[str, Any]:
-    text = Path(path).expanduser().read_text(encoding="utf-8")
+    script = Path(path).expanduser()
+    text = script.read_text(encoding="utf-8")
     summary = run_steps(
-        parse_script(text, variables), execute=execute, keep_going=keep_going, dry_run=dry_run
+        parse_script(text, variables),
+        execute=execute,
+        keep_going=keep_going,
+        dry_run=dry_run,
+        base=script.parent,
     )
     summary["script"] = str(path)
     return summary

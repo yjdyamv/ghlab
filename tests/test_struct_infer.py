@@ -5,9 +5,13 @@ The Ghidra half (`cmd_struct` reading p-code, `_install_struct` building a
 the layout arithmetic and the width vote, so that lives here.
 """
 
+import sys
+import types
 import unittest
+from unittest import mock
 
-from ghlab.session import _align, _infer_struct, _parse_overrides
+from ghlab import session
+from ghlab.session import _align, _infer_struct, _install_struct, _parse_overrides
 
 
 def row(offset, base="__param", size=4, op="load"):
@@ -89,6 +93,158 @@ class InferTest(unittest.TestCase):
         self.assertEqual(spec["confidence"], "measured")
         self.assertEqual(spec["name"], "Ctx")
         self.assertEqual(spec["base"], "__param")
+
+
+class InstallStructTest(unittest.TestCase):
+    """`_install_struct` cannot run without a JVM, but its *call shape* can be checked.
+
+    On the first real `struct --create` run jpype found no overload, because
+    `StructureDataType.add` takes (DataType, int offset, name, comment) and the call
+    passed the offset first.  A fake `ghidra.program.model.data` pins the order.
+    """
+
+    def _modules(self, seen):
+        class Structure:
+            def __init__(self, name, size, manager):
+                self.name = name
+                self.size = size
+                self.added = []
+
+            def add(self, *args):
+                self.added.append(args)
+                seen["struct"] = self
+
+            def getPathName(self):
+                return f"/{self.name}"
+
+        data = types.ModuleType("ghidra.program.model.data")
+        data.StructureDataType = Structure
+        data.PointerDataType = type("PointerDataType", (), {})
+        for java in ("IntegerDataType", "LongLongDataType", "WordDataType"):
+            setattr(data, java, type(java, (), {}))
+        data.DataTypeConflictHandler = type("H", (), {"REPLACE_HANDLER": "replace"})
+        data.__all__ = []
+        chain = {}
+        for name in ("ghidra", "ghidra.program", "ghidra.program.model"):
+            chain[name] = types.ModuleType(name)
+            chain[name].__path__ = []
+        chain["ghidra.program.model.data"] = data
+        chain["ghidra.program"].model = chain["ghidra.program.model"]
+        chain["ghidra.program.model"].data = data
+        chain["ghidra"].program = chain["ghidra.program"]
+        return chain
+
+    def test_the_field_is_added_type_first(self):
+        seen = {}
+
+        class Manager:
+            def addDataType(self, struct, handler):
+                seen["handler"] = handler
+                seen["size"] = struct.size
+
+        class Program:
+            def getDataTypeManager(self):
+                return Manager()
+
+        spec = {
+            "name": "Foo",
+            "size": 16,
+            "fields": [
+                {"offset": 0, "name": "field_0x0", "type": "longlong", "loads": 1, "stores": 0},
+                {"offset": 8, "name": "field_0x8", "type": "void *", "loads": 2, "stores": 1},
+            ],
+        }
+        with mock.patch.dict(sys.modules, self._modules(seen)):
+            path = _install_struct(Program(), spec)
+        self.assertEqual(path, "/Foo")
+        self.assertEqual(seen["handler"], "replace")
+        struct = seen["struct"]
+        self.assertEqual([call[1] for call in struct.added], [0, 8])
+        self.assertEqual(struct.added[0][0].__class__.__name__, "LongLongDataType")
+        self.assertEqual(struct.added[1][0].__class__.__name__, "PointerDataType")
+        self.assertEqual(struct.added[0][2], "field_0x0")
+        self.assertIn("1 load(s)", struct.added[0][3])
+
+
+class StructCreateOrderTest(unittest.TestCase):
+    """`struct --create` must save *after* the transaction: Ghidra answers a save
+    inside an open transaction with "Unable to lock due to active transaction".
+
+    The first real run got exactly that from all three save paths, so the order is
+    pinned here with fakes instead of a JVM.
+    """
+
+    def test_the_save_happens_after_the_transaction_closes(self):
+        events = []
+
+        class Decomp:
+            def decompileFunction(self, fn, timeout, monitor):
+                class Res:
+                    def decompileCompleted(self):
+                        return True
+
+                    def getHighFunction(self):
+                        return object()
+
+                return Res()
+
+        entry = {"program": object(), "decomp": Decomp()}
+
+        class Fn:
+            def getName(self):
+                return "FUN_1"
+
+            def getPrototypeString(self, _a, _b):
+                return "undefined FUN_1(void)"
+
+        rows = [row(0x0, base="param_1", size=8), row(0x8, base="param_1", size=8)]
+
+        import contextlib as _ctx
+
+        @_ctx.contextmanager
+        def fake_edit(_program, _reason="ghlab"):
+            events.append("begin")
+            try:
+                yield
+            finally:
+                events.append("end")
+
+        def fake_install(_program, spec):
+            events.append("install")
+            self.assertEqual(spec["name"], "Foo_t")
+            return "/Foo_t"
+
+        def fake_save(_program, _message, entry=None):
+            events.append("save")
+            self.assertIn("end", events, "save ran inside the transaction")
+            return "project.save(program)"
+
+        with (
+            mock.patch.object(session, "_entry", return_value=entry),
+            mock.patch.object(session, "_function", return_value=Fn()),
+            mock.patch.object(session, "_param_accesses", return_value=rows),
+            mock.patch.object(session, "_edit", fake_edit),
+            mock.patch.object(session, "_install_struct", fake_install),
+            mock.patch.object(session, "_save", fake_save),
+            mock.patch.object(
+                session,
+                "_infer_struct",
+                return_value={
+                    "name": "Foo_t",
+                    "base": "param_1",
+                    "size": 16,
+                    "fields": [{"offset": 0}],
+                    "decl": "",
+                    "confidence": "measured",
+                },
+            ),
+        ):
+            out = session.cmd_struct(
+                {"binary": "a.exe", "target": "FUN_1", "base": "param_1", "create": True}
+            )
+        self.assertEqual(events, ["begin", "install", "end", "save"])
+        self.assertEqual(out["created"], "/Foo_t")
+        self.assertEqual(out["saved_via"], "project.save(program)")
 
 
 if __name__ == "__main__":

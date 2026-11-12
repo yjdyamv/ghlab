@@ -15,6 +15,7 @@ Resolution order:
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -254,17 +255,26 @@ class Router:
         rows: list[dict[str, Any]] = []
         for name, target in self.targets.items():
             up = self.alive(name)
-            rows.append(
-                {
-                    "project": name,
-                    "url": target.url,
-                    "project_dir": target.project_dir,
-                    "project_name": target.project_name,
-                    "default": name == self.default,
-                    "alive": up,
-                    "binaries": self.binaries(name, refresh=refresh) if up else [],
-                }
-            )
+            row: dict[str, Any] = {
+                "project": name,
+                "url": target.url,
+                "project_dir": target.project_dir,
+                "project_name": target.project_name,
+                "default": name == self.default,
+                "alive": up,
+                "binaries": self.binaries(name, refresh=refresh) if up else [],
+            }
+            if up:
+                # what the daemon says it has open beats what the config says it should
+                # have: a --url override or a moved project made the two disagree, and
+                # `projects` printed the config path next to the daemon's binary count
+                reported = ""
+                with contextlib.suppress(Exception):
+                    reported = str(self.client(name).info().get("project") or "")
+                if reported and reported != target.project_dir:
+                    row["configured_project_dir"] = target.project_dir
+                    row["project_dir"] = reported
+            rows.append(row)
         return {"projects": rows, "default": self.default, "count": len(rows)}
 
 

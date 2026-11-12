@@ -17,11 +17,17 @@ from ghlab import config, router
 
 
 class FakeClient:
-    def __init__(self, url: str, binaries: list[str], up: bool = True):
+    def __init__(self, url: str, binaries: list[str], up: bool = True, project: str = ""):
         self.url = url
         self.binaries = binaries
         self.up = up
+        self.project = project
         self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    def info(self) -> dict[str, Any]:
+        if not self.up:
+            raise OSError("connection refused")
+        return {"project": self.project} if self.project else {}
 
     def alive(self) -> bool:
         if not self.up:
@@ -362,6 +368,31 @@ class DiscoverTest(unittest.TestCase):
 
     def test_missing_root_is_not_an_error(self):
         self.assertEqual(config.discover_projects([self.root / "nope"], known={}), [])
+
+    def test_projects_shows_the_directory_the_daemon_has_open(self):
+        # a --url override (or a moved project) makes the config path a lie while the
+        # daemon's own answer stays true; the row used to print the config path beside
+        # the daemon's binary count
+        targets = {"ghlab": target("ghlab", 8765, ["notepad.exe"])}
+        clients: dict[str, router.ClientLike] = {
+            "ghlab": FakeClient(
+                targets["ghlab"].url, ["notepad.exe"], project="C:/tmp/jvmcheck/jvmcheck"
+            )
+        }
+        r = router.Router(targets=targets, default="ghlab", clients=clients)
+        row = r.describe()["projects"][0]
+        self.assertEqual(row["project_dir"], "C:/tmp/jvmcheck/jvmcheck")
+        self.assertEqual(row["configured_project_dir"], "/proj/ghlab")
+
+    def test_projects_keeps_the_config_path_when_the_daemon_agrees(self):
+        targets = {"ghlab": target("ghlab", 8765, ["notepad.exe"])}
+        clients: dict[str, router.ClientLike] = {
+            "ghlab": FakeClient(targets["ghlab"].url, ["notepad.exe"], project="/proj/ghlab")
+        }
+        r = router.Router(targets=targets, default="ghlab", clients=clients)
+        row = r.describe()["projects"][0]
+        self.assertEqual(row["project_dir"], "/proj/ghlab")
+        self.assertNotIn("configured_project_dir", row)
 
 
 if __name__ == "__main__":
