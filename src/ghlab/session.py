@@ -56,6 +56,11 @@ def boot() -> None:
     from ghidra.util.task import ConsoleTaskMonitor
 
     MONITOR = ConsoleTaskMonitor()
+    # A TaskMonitorAdapter ignores cancel() unless cancellation was enabled, and the
+    # default is disabled: without this line `ghlab cancel` flipped nothing at all and
+    # a two-minute analysis ran to the end (measured: cancel at 6s, job ended at 127s
+    # with the same 130s it takes uncancelled).
+    MONITOR.setCancelEnabled(True)
 
 
 def configure(project_dir: str | os.PathLike[str], project_name: str = "ghlab") -> None:
@@ -123,7 +128,7 @@ def _entry(binary: str) -> dict[str, Any]:
         "proj": proj,
         "program": program,
         "decomp": decomp,
-        "api": FlatProgramAPI(program),
+        "api": FlatProgramAPI(program, MONITOR),
         "used": time.monotonic(),
     }
     _programs[binary] = entry
@@ -300,24 +305,37 @@ def _language_id(text: str) -> str:
 
 
 def _load_spec_rows(path: Path) -> list[dict[str, Any]]:
-    """Every (loader, language, compiler spec) this JVM could import `path` with."""
-    from ghidra.app.util.bin import RandomAccessByteProvider
-    from ghidra.app.util.opinion import LoaderService
-    from java.io import File
+    """Every (loader, language, compiler spec) this JVM could import `path` with.
 
-    provider = RandomAccessByteProvider(File(str(path)))
+    Preferred specs first: for a PE that is the one `import` will pick, and for a raw
+    image the preferred flag is the only hint among the hundreds of languages the
+    Binary loader offers.
+    """
+    from ghidra.app.util.bin import FileByteProvider
+    from ghidra.app.util.opinion import LoaderService
+    from ghidra.formats.gfilesystem import FSRL
+    from java.io import File
+    from java.nio.file import AccessMode
+
+    provider = FileByteProvider(File(str(path)), FSRL.fromString(path.as_uri()), AccessMode.READ)
     try:
         rows = []
-        for spec in LoaderService().getSupportedLoadSpecs(provider):
-            pair = spec.getLanguageCompilerSpecPair()
-            rows.append(
-                {
-                    "loader": str(spec.getLoader().getName()),
-                    "language": str(pair.getLanguageID()),
-                    "cspec": str(pair.getCompilerSpecID()),
-                }
-            )
-        return sorted(rows, key=lambda r: (r["loader"], r["language"], r["cspec"]))
+        found = LoaderService.getSupportedLoadSpecs(provider, LoaderService.ACCEPT_ALL)
+        for loader, specs in found.items():
+            for spec in specs:
+                pair = spec.getLanguageCompilerSpec()
+                rows.append(
+                    {
+                        "loader": str(loader.getName()),
+                        "language": str(pair.getLanguageID()),
+                        "cspec": str(pair.getCompilerSpecID()),
+                        "preferred": bool(spec.isPreferred()),
+                        "base": f"0x{int(spec.getDesiredImageBase()):x}",
+                    }
+                )
+        return sorted(
+            rows, key=lambda r: (not r["preferred"], r["loader"], r["language"], r["cspec"])
+        )
     finally:
         provider.close()
 
@@ -359,10 +377,41 @@ def _image_base(program: Any, text: str) -> Any:
     return space.getAddress(int(str(text), 0))
 
 
-def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
+def _analyze_all(program: Any, watch: Any = None) -> None:
+    """Run Ghidra's full analysis, with a monitor the daemon can cancel.
+
+    Two things were learned the hard way on a real JVM.  `FlatProgramAPI.analyzeAll`
+    builds its own `ConsoleTaskMonitor` unless it is handed one, so a job cancelled
+    mid-analysis ran to the end anyway; and driving `AutoAnalysisManager` ourselves
+    (even with `initializeOptions`) produced 455 one-byte functions where `analyzeAll`
+    produces 522 real ones, because the function-body analyzers are scheduled by the
+    API layer, not by `startAnalysis`.
+
+    So: keep `analyzeAll`, and give it our monitor through the constructor.
+    """
     from ghidra.app.script import GhidraScriptUtil
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.util import GhidraProgramUtilities
+
+    monitor = watch or MONITOR
+    flat = FlatProgramAPI(program, monitor)
+    GhidraScriptUtil.acquireBundleHostReference()
+    try:
+        flat.analyzeAll(program)
+    except Exception:
+        # a cancelled analysis throws out of the analyzers; that is the cancel taking
+        # effect, not a failure, so leave the program marked unanalyzed and let the job
+        # thread report "cancelled"
+        if not monitor.isCancelled():
+            raise
+        return
+    finally:
+        GhidraScriptUtil.releaseBundleHostReference()
+    if not monitor.isCancelled():
+        GhidraProgramUtilities.markProgramAnalyzed(program)
+
+
+def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     from java.io import File
 
     path = Path(a["path"]).expanduser()
@@ -395,14 +444,7 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
             program.setImageBase(_image_base(program, str(a["base"])), True)
     proj.saveAs(program, "/", name, True)
     if a.get("analyze", True):
-        api = FlatProgramAPI(program)
-        GhidraScriptUtil.acquireBundleHostReference()
-        try:
-            if GhidraProgramUtilities.shouldAskToAnalyze(program):
-                api.analyzeAll(program)
-                GhidraProgramUtilities.markProgramAnalyzed(program)
-        finally:
-            GhidraScriptUtil.releaseBundleHostReference()
+        _analyze_all(program)
     proj.save(program)
     out = {
         "binary": name,
@@ -426,17 +468,12 @@ def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
     """
     from ghidra.app.cmd.disassemble import DisassembleCommand
     from ghidra.app.cmd.function import CreateFunctionCmd
-    from ghidra.app.script import GhidraScriptUtil
 
     started = time.time()
     e = _entry(a["binary"])
     p = e["program"]
     if a.get("full"):
-        GhidraScriptUtil.acquireBundleHostReference()
-        try:
-            e["api"].analyzeAll(p)
-        finally:
-            GhidraScriptUtil.releaseBundleHostReference()
+        _analyze_all(p)
         saved = _save(p, "ghlab analyze (full)", e)
         return {
             "binary": a["binary"],
@@ -447,7 +484,10 @@ def cmd_analyze(a: dict[str, Any]) -> dict[str, Any]:
         }
     targets = _as_list(a.get("addr"))
     if not targets:
-        raise ValueError("analyze needs --addr ADDR (repeatable) or --full")
+        raise ValueError(
+            "analyze needs --addr ADDR (repeatable) or --full "
+            "(a background full analysis is `ghlab job analyze <binary> -a full=yes`)"
+        )
     space = p.getAddressFactory().getDefaultAddressSpace()
     rows = []
     tx = p.startTransaction("ghlab analyze")
@@ -4610,6 +4650,18 @@ def _renamed(before: dict[str, str], after: dict[str, str]) -> list[dict[str, st
     ]
 
 
+def _fid_folder() -> str:
+    """The directory Ghidra loads FunctionID databases from.
+
+    `fid --list` has to name it: the error message for "no libraries" points at this
+    folder, and on the first real run the folder was the one thing it did not print.
+    """
+    import jpype
+
+    root = Path(str(jpype.JClass("ghidra.framework.Application").getUserSettingsDirectory()))
+    return str(root / "FunctionID")
+
+
 def _fid_libraries() -> list[str]:
     """The .fidb files Ghidra would search, from the user settings directory."""
     import jpype
@@ -4667,7 +4719,7 @@ def cmd_fid(a: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("fid needs binary=<name>, or list=yes to see the databases")
     libs = _fid_libraries()
     if a.get("list"):
-        return {"libraries": libs, "count": len(libs)}
+        return {"libraries": libs, "count": len(libs), "folder": _fid_folder()}
     e = _entry(str(a["binary"]))
     p = e["program"]
     if not libs:
@@ -4975,6 +5027,12 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
     """
 
     binary = str(a["binary"])
+    if readonly():
+        # `_store_notes` would drop it silently, and a finding that vanishes without a
+        # word is worse than a refusal: say why, and let the caller use a writable daemon
+        raise PermissionError(
+            "daemon is read-only (GHLAB_READONLY=1); a note would be dropped, not stored"
+        )
     notes = _load_notes(binary)
     if a.get("delete"):
         gone = {_claim_int(x) for x in _as_list(a["delete"])}
@@ -5865,7 +5923,11 @@ def _job_args(text: Any) -> dict[str, Any]:
     occurs inside values is a parser bug waiting to be reported.
     """
     out: dict[str, Any] = {}
-    for pair in str(text or "").split(";"):
+    # an MCP client may send the pairs as a JSON array (its schema says string, but the
+    # `args` name is also a list for other tools, so clients that normalise by name
+    # hand us `[str]`); joining keeps that working instead of parsing "['targets'
+    pairs = ";".join(str(x) for x in text) if isinstance(text, (list, tuple)) else str(text or "")
+    for pair in pairs.split(";"):
         pair = pair.strip()
         if not pair:
             continue
@@ -5912,7 +5974,7 @@ def _monitor_reset() -> None:
     if MONITOR is None:
         return
     with contextlib.suppress(Exception):
-        MONITOR.setCanceled(False)
+        MONITOR.clearCancelled()
 
 
 def _job_trim() -> None:
@@ -5957,6 +6019,17 @@ def _job_thread(job_id: str) -> None:
             _job_trim()
 
 
+def _job_id(value: Any) -> str:
+    """The `j3` in whatever a client sent.
+
+    MCP wraps parameters whose CLI flag is repeatable (`--id`) in a list, so a tool
+    call arrives as `["j3"]`; `job` and `cancel` used to look that bracket up.
+    """
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return str(value or "").strip()
+
+
 def cmd_job(a: dict[str, Any]) -> dict[str, Any]:
     """Run a command in the background; `list=yes` shows the queue, `id=` one result.
 
@@ -5966,7 +6039,7 @@ def cmd_job(a: dict[str, Any]) -> dict[str, Any]:
     from . import protocol
 
     if a.get("list") or a.get("id"):
-        wanted = a.get("id")
+        wanted = _job_id(a.get("id"))
         if wanted:
             job = JOBS.get(str(wanted))
             if job is None:
@@ -6017,7 +6090,7 @@ def cmd_cancel(a: dict[str, Any]) -> dict[str, Any]:
     if a.get("all"):
         targets = [j for j in JOBS.values() if j["state"] in ("queued", "running")]
     else:
-        jid = a.get("id")
+        jid = _job_id(a.get("id"))
         if not jid:
             raise ValueError("cancel needs id=<job> or all=yes")
         job = JOBS.get(str(jid))
@@ -6032,7 +6105,7 @@ def cmd_cancel(a: dict[str, Any]) -> dict[str, Any]:
     if targets:
         with contextlib.suppress(Exception):
             if MONITOR is not None:
-                MONITOR.setCanceled(True)
+                MONITOR.cancel()
     return {
         "cancel_requested": [j["id"] for j in targets],
         "note": "Ghidra checks between steps; a long single step finishes first",

@@ -26,10 +26,14 @@ class BlockingMonitor:
     def isCancelled(self) -> bool:
         return self.cancelled
 
-    def setCanceled(self, value: bool) -> None:
-        self.cancelled = bool(value)
-        if not value:
-            self.resets += 1
+    def cancel(self) -> None:
+        # ConsoleTaskMonitor has cancel()/clearCancelled(), not setCanceled(): the
+        # first real run of `ghlab cancel` flipped nothing because of that difference
+        self.cancelled = True
+
+    def clearCancelled(self) -> None:
+        self.cancelled = False
+        self.resets += 1
 
 
 class JobTestBase(unittest.TestCase):
@@ -73,6 +77,15 @@ class ArgsTest(unittest.TestCase):
         self.assertEqual(session._job_args(None), {})
         self.assertEqual(session._job_args(""), {})
 
+    def test_a_list_of_pairs_is_joined(self):
+        # found with the MCP smoke test: `args` is a list for other tools, so a client
+        # that normalises by name sent ["targets=entry"] and the daemon parsed the
+        # bracket and quote as part of the key ("['targets")
+        self.assertEqual(
+            session._job_args(["targets=entry", "grep=x"]), {"targets": "entry", "grep": "x"}
+        )
+        self.assertEqual(session._job_args(["targets=entry"]), {"targets": "entry"})
+
 
 class JobLifecycleTest(JobTestBase):
     def test_a_job_returns_before_the_work_is_done_and_then_holds_the_result(self):
@@ -94,6 +107,11 @@ class JobLifecycleTest(JobTestBase):
         self.assertNotIn("result", done, "the queue view stays small")
         one = session.cmd_job({"id": out["job"]})["jobs"][0]
         self.assertEqual(one["result"], {"slow": True})
+        # MCP hands `--id` back as ["j1"] because the flag is repeatable; both cmd_job
+        # and cmd_cancel looked the bracket up and reported "no job ['j1']"
+        bracketed = session.cmd_job({"id": [out["job"]]})["jobs"][0]
+        self.assertEqual(bracketed["result"], {"slow": True})
+        self.assertEqual(session.cmd_cancel({"id": [out["job"]]})["cancel_requested"], [out["job"]])
 
     def test_wait_returns_the_result_inline(self):
         self.spec_testy()

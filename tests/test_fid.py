@@ -107,6 +107,7 @@ class CommandTest(unittest.TestCase):
             mock.patch.object(
                 session, "_fid_libraries", return_value=["/u/FunctionID/msvcrts.fidb"]
             ),
+            mock.patch.object(session, "_fid_folder", return_value="/u/FunctionID"),
             mock.patch.object(session, "_run_fid_analyzer", return_value="FidAnalyzer"),
             mock.patch.object(session, "_save", return_value="project.save"),
         ):
@@ -116,6 +117,7 @@ class CommandTest(unittest.TestCase):
         out = self._call({"list": True})
         self.assertEqual(out["count"], 1)
         self.assertTrue(out["libraries"][0].endswith("msvcrts.fidb"))
+        self.assertEqual(out["folder"], "/u/FunctionID")
 
     def test_no_binary_and_no_list_says_what_to_do(self):
         with self.assertRaises(ValueError) as ctx:

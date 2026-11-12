@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any, NoReturn
@@ -124,8 +125,12 @@ def fmt_import(r: dict[str, Any]) -> str:
     if r.get("load_specs") is not None:
         rows = r["load_specs"]
         out = [f"== {r['path']} : {len(rows)} load spec(s)"]
-        for row in rows:
+        # a plain PE matched 274 specs, most of them the binary loader's "maybe it is
+        # raw bytes at another language" fallbacks; eight rows is what a person reads
+        for row in rows[:8]:
             out.append(f"   {row['loader']:<18} {row['language']:<28} {row['cspec']}")
+        if len(rows) > 8:
+            out.append(f"   ... {len(rows) - 8} more (pick one with --language LANG --cspec CS)")
         if not rows:
             out.append("   (no loader recognised this file)")
         return chr(10).join(out)
@@ -252,6 +257,8 @@ def fmt_struct(r: dict[str, Any]) -> str:
 def fmt_fid(r: dict[str, Any]) -> str:
     if "libraries" in r and "analyzer" not in r:
         lines = [f"== FunctionID databases: {r['count']}"]
+        if r.get("folder"):
+            lines.append(f"   searched: {r['folder']}")
         lines.extend(f"   {path}" for path in r["libraries"])
         if not r["count"]:
             lines.append(
@@ -808,6 +815,15 @@ def fmt_similar(r: dict[str, Any]) -> str:
 
 
 def fmt_job(r: dict[str, Any]) -> str:
+    if "jobs" not in r:
+        # the reply to *starting* a job: {job, cmd, state}, not the queue
+        if not r.get("job"):
+            return "(no jobs; `ghlab job <cmd> <binary>` starts one)"
+        job = r["job"]
+        return (
+            f"== {job} {r.get('state', 'queued')}  {r.get('cmd', '?')}"
+            f"{chr(10)}   (watch: `ghlab job --id {job}`, stop: `ghlab cancel {job}`)"
+        )
     jobs = r.get("jobs") or []
     if not jobs:
         return "(no jobs; `ghlab job <cmd> <binary>` starts one)"
@@ -1406,13 +1422,27 @@ def cmd_start(args) -> int:
             f"ghlab: running daemon has code {have or 'unknown'}, installed is {want}; restarting"
         )
         if info.get("pid"):
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.kill(int(info["pid"]), 15)
+            pid = int(info["pid"])
+            if _terminate(pid) != "killed":
+                _force_kill(pid)
             pid_path.unlink(missing_ok=True)
             for _ in range(60):
                 if not Client(f"http://{args.host}:{args.port}/").alive():
                     break
                 time.sleep(0.5)
+            if Client(f"http://{args.host}:{args.port}/").alive():
+                # starting anyway would fail later on the project lock, which reads as a
+                # corrupted project rather than as a daemon that would not die
+                owner = _port_owner(args.host, args.port)
+                if owner:
+                    _force_kill(int(owner))
+                time.sleep(1.0)
+            if Client(f"http://{args.host}:{args.port}/").alive():
+                print(
+                    f"ghlab: {args.host}:{args.port} is still held; stop that daemon first",
+                    file=sys.stderr,
+                )
+                return 1
     if not _ghidra_env_ok():
         return 2
     LOGDIR.mkdir(parents=True, exist_ok=True)
@@ -1471,12 +1501,42 @@ def _port_owner(host: str, port: int) -> int | None:
         out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    needle = f"{host}:{port}"
+    return _parse_netstat(out, host, port)
+
+
+def _parse_netstat(out: str, host: str, port: int) -> int | None:
+    """The listening pid for port, from `netstat -ano` text.
+
+    Matching on the literal "host:port" string missed the daemons netstat reports as
+    "0.0.0.0:8771" or "[::]:8771", so `ghlab stop --port` called a live daemon "nothing
+    listening" (seen on a real run).  Compare the port and accept a wildcard address.
+    """
+    wildcard = ("0.0.0.0", "::", "*", "")
     for line in out.splitlines():
-        if needle in line and "LISTENING" in line:
-            tail = line.split()[-1]
-            return int(tail) if tail.isdigit() else None
+        parts = line.split()
+        if len(parts) < 5 or parts[-2].upper() != "LISTENING":
+            continue
+        local = parts[1]
+        if local.rsplit(":", 1)[-1] != str(port):
+            continue
+        owner = local.rsplit(":", 1)[0].strip("[]")
+        if owner in wildcard or owner == host:
+            tail = parts[-1]
+            # netstat names pid 0 (or System) for sockets it cannot attribute — a venv
+            # launcher that re-execs the interpreter does exactly that — and returning 0
+            # made `stop` print "nothing listening" over a live daemon
+            if tail.isdigit() and int(tail) > 4:
+                return int(tail)
     return None
+
+
+def _daemon_info(host: str, port: int) -> dict[str, Any]:
+    """The running daemon's own page (GET /): pid, uptime, readonly.  {} when down."""
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=10) as resp:
+            return dict(json.loads(resp.read()))
+    except (OSError, ValueError):
+        return {}
 
 
 def _port_owner_posix(port: int) -> int | None:
@@ -1527,61 +1587,83 @@ def _pidfile_by_port(port: int) -> Path | None:
     return None
 
 
-def cmd_stop(args) -> int:
-    explicit = getattr(args, "project_dir", None)
-    pid_path = (
-        Path(explicit).expanduser() / ".ghlab.pid" if explicit else _pidfile_by_port(args.port)
-    )
-    if pid_path is None:
-        owner = _port_owner(args.host, args.port)
-        if not owner:
-            print(f"ghlab: nothing listening on {args.host}:{args.port}")
-            return 0
-        _force_kill(int(owner))
-        client = Client(f"http://{args.host}:{args.port}/")
-        for _ in range(40):
-            if not client.alive():
-                break
-            time.sleep(0.25)
-        print(f"ghlab: killed pid {owner} holding {args.host}:{args.port} (no pidfile)")
-        return 0 if not client.alive() else 1
-    if not pid_path.exists():
-        print("ghlab: no pidfile; nothing to stop")
-        return 0
-    info = _pidfile(pid_path)
-    if not info.get("pid"):
-        print("ghlab: pidfile is unreadable; nothing to stop")
-        pid_path.unlink(missing_ok=True)
-        return 0
-    pid = int(info["pid"])
+def _terminate(pid: int) -> str:
+    """Ask a process to exit; returns "killed", "gone" or "denied".
+
+    Windows has no SIGTERM: `os.kill` there is `TerminateProcess`, and on a pid that
+    has already exited it raises a bare `OSError(winerror=87, "invalid parameter")`
+    instead of `ProcessLookupError`.  `ghlab stop` died on exactly that, leaving the
+    daemon running.  So on Windows ask `taskkill`, which has a real "no such process"
+    answer, and keep the signal path for POSIX.
+    """
+    if os.name == "nt":
+        done = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, text=True)
+        return "killed" if done.returncode == 0 else "gone"
     try:
         os.kill(pid, 15)
     except ProcessLookupError:
+        return "gone"
+    except PermissionError:
+        return "denied"
+    return "killed"
+
+
+def cmd_stop(args) -> int:
+    host, port = args.host, args.port
+    explicit = getattr(args, "project_dir", None)
+    pid_path = Path(explicit).expanduser() / ".ghlab.pid" if explicit else _pidfile_by_port(port)
+    client = Client(f"http://{host}:{port}/")
+    info: dict[str, Any] = {}
+    pid = 0
+    if pid_path is not None:
+        if not pid_path.exists():
+            print("ghlab: no pidfile; nothing to stop")
+            return 0
+        info = _pidfile(pid_path)
+        pid = int(info.get("pid") or 0)
+        if not pid:
+            print("ghlab: pidfile is unreadable; nothing to stop")
+            pid_path.unlink(missing_ok=True)
+            return 0
+    else:
+        # a daemon started with an ad-hoc --project-dir is in nobody's config, so
+        # _pidfile_by_port cannot find it; ask the daemon itself (GET / reports the pid
+        # it runs under) and only then fall back to netstat
+        info = _daemon_info(host, port)
+        pid = int(info.get("pid") or 0) if info.get("service") == "ghlab" else 0
+        if not pid:
+            owner = _port_owner(host, port)
+            if not owner:
+                print(f"ghlab: nothing listening on {host}:{port}")
+                return 0
+            pid = int(owner)
+    how = _terminate(pid)
+    if how == "gone":
         print(f"ghlab: pid {pid} already gone")
-    except PermissionError as ex:
-        print(f"ghlab: cannot signal pid {pid}: {ex}", file=sys.stderr)
+    elif how == "denied":
+        print(f"ghlab: cannot signal pid {pid}", file=sys.stderr)
         return 1
     else:
         print(f"ghlab: signalled pid {pid}")
     # the venv python is a shim that re-execs the real interpreter, so the pid we
     # recorded is the child; wait for the port to actually free, then clean up the
     # shim parent and anything else still holding the port
-    client = Client(f"http://{args.host}:{args.port}/")
     for _ in range(30):
         if not client.alive():
             break
         time.sleep(0.5)
     if client.alive():
-        for extra in (info.get("parent"), _port_owner(args.host, args.port)):
+        for extra in (info.get("parent"), _port_owner(host, port)):
             if extra and int(extra) != pid:
                 _force_kill(int(extra))
         for _ in range(20):
             if not client.alive():
                 break
             time.sleep(0.25)
-    pid_path.unlink(missing_ok=True)
+    if pid_path is not None:
+        pid_path.unlink(missing_ok=True)
     if client.alive():
-        print(f"ghlab: still answering on {args.host}:{args.port}", file=sys.stderr)
+        print(f"ghlab: still answering on {host}:{port}", file=sys.stderr)
         return 1
     return 0
 

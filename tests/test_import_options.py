@@ -148,6 +148,22 @@ class ImportFormatTest(unittest.TestCase):
     def test_an_unrecognised_file_says_so(self):
         self.assertIn("no loader", cli.fmt_import({"path": "x.bin", "load_specs": []}))
 
+    def test_a_long_load_spec_list_is_truncated(self):
+        # a plain PE matches 274 specs, most of them the binary loader's fallbacks
+        rows = [
+            {"loader": "BinaryLoader", "language": f"x86:LE:32:{n}", "cspec": "gcc"}
+            for n in range(274)
+        ]
+        text = cli.fmt_import({"path": "notepad.exe", "load_specs": rows})
+        self.assertIn("274 load spec(s)", text)
+        self.assertIn("... 266 more", text)
+        self.assertEqual(len([ln for ln in text.split(chr(10)) if "BinaryLoader" in ln]), 8)
+
+    def test_fid_list_names_the_folder_ghidra_searchs(self):
+        text = cli.fmt_fid({"libraries": [], "count": 0, "folder": r"C:\gs\FunctionID"})
+        self.assertIn(r"searched: C:\gs\FunctionID", text)
+        self.assertIn("drop a .fidb", text)
+
     def test_a_new_import_reports_language_and_base(self):
         text = cli.fmt_import(
             {

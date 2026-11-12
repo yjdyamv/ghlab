@@ -251,6 +251,27 @@ class StopByPortTest(unittest.TestCase):
     def test_unknown_port_is_not_guessed(self):
         self.assertIsNone(cli._pidfile_by_port(9999))
 
+    def test_netstat_wildcard_listener_counts(self):
+        # a daemon on 8771 was reported as "nothing listening" because the match
+        # looked for the literal "127.0.0.1:8771" and netstat lists 0.0.0.0 / [::]
+        out = "\n".join(
+            [
+                "  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       2148",
+                "  TCP    0.0.0.0:8766           0.0.0.0:0              LISTENING       42",
+                "  TCP    [::]:8771              [::]:0                 LISTENING       18704",
+                "  TCP    127.0.0.1:8771         127.0.0.1:56444        TIME_WAIT       0",
+            ]
+        )
+        self.assertEqual(cli._parse_netstat(out, "127.0.0.1", 8771), 18704)
+        self.assertEqual(cli._parse_netstat(out, "127.0.0.1", 8766), 42)
+        self.assertIsNone(cli._parse_netstat(out, "127.0.0.1", 9999))
+        self.assertIsNone(
+            cli._parse_netstat(
+                "  TCP    10.0.0.9:8771  0.0.0.0:0  LISTENING  7", "127.0.0.1", 8771
+            ),
+            "a listener on another interface is not this host's daemon",
+        )
+
     def test_stop_parser_does_not_inherit_a_project_dir(self):
         parser = cli.build_parser()
         args = parser.parse_args(["stop", "--port", "9202"])

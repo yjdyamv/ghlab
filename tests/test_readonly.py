@@ -73,6 +73,17 @@ class ReadonlyTest(unittest.TestCase):
             session._store_notes("a.exe", [{"id": 1}])
         written.assert_not_called()
 
+    def test_note_refuses_instead_of_dropping_the_finding(self):
+        # found on a real run: `note` "succeeded" under GHLAB_READONLY and the finding
+        # was never stored, because _store_notes returns early
+        with (
+            mock.patch.dict(os.environ, {"GHLAB_READONLY": "1"}),
+            self.assertRaises(PermissionError) as ctx,
+        ):
+            session.cmd_note({"binary": "a.exe", "text": "main calls sprintf"})
+        self.assertIn("read-only", str(ctx.exception))
+        self.assertIn("note", str(ctx.exception))
+
     def test_the_daemon_page_advertises_it(self):
         with mock.patch.dict(os.environ, {"GHLAB_READONLY": "1"}):
             body = json.loads(server._info_body())
