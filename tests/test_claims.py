@@ -219,3 +219,28 @@ class StubSpecTest(unittest.TestCase):
         self.assertEqual(_s64(-100), -100)
         self.assertEqual(_s64(0xFFFF_FFFF_FFFF_FF9C), -100)
         self.assertEqual(_s64(1), 1)
+
+
+class NoteTextTest(unittest.TestCase):
+    """`note` without text, and `note delete=True`, both used to be dead ends."""
+
+    def _call(self, params, notes=None):
+        with mock.patch.object(session, "_load_notes", lambda _b: notes if notes else []):
+            return session.cmd_note(params)
+
+    def test_delete_without_an_id_says_what_is_missing(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._call({"binary": "x.exe", "delete": True})
+        self.assertIn("delete=<id>", str(ctx.exception))
+
+    def test_neither_text_nor_delete_is_refused(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._call({"binary": "x.exe"})
+        self.assertIn("needs text", str(ctx.exception))
+
+    def test_text_is_optional_in_the_spec_so_delete_can_stand_alone(self):
+        from ghlab import protocol
+
+        spec = protocol.SPECS["note"]
+        self.assertEqual(spec.required, ("binary",))
+        self.assertIn("text", spec.optional)

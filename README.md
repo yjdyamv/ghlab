@@ -374,7 +374,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
 | `note` | `binary, text` / `at, addr, tag, assert, delete` | 追加一条结论：写 `<项目>/.ghlab/notes/<binary>.json` + 同名书签；`-a const=0x41` / `string=` / `import=` / `calls=` / `size>=` / `bytes=` / `symbol=` / `name=` 附**可复算断言**（写入时就验一次） |
 | `map` | `binary` / `from, op, grep, limit, hits` | **批量原语**：`--from` 选函数集（`all`/`name:`/`import:`/`calls:`/`string:`/`const:`/`addr:`），`--op` 取 `decompile`/`strings`/`imports`/`calls`/`consts`，`-g` 只留命中行。4 个函数反编译+过滤 ≈2.6s，回 15 行而不是 4 份源码 |
-| `pdb` | `binary, file` / `untrusted` | **吃调试符号**：`PdbUniversalAnalyzer.doAnalysis` 套壳；PDB 与二进制不匹配时不写入（`functions_before == functions_after`），日志一并返回 |
+| `pdb` | `binary, file` / `untrusted` | **吃调试符号**：`PdbUniversalAnalyzer.doAnalysis` 套壳；PDB 与二进制不匹配时不写入（`functions_before == functions_after`），日志一并返回。它必须在分析会话里跑——`doAnalysis` 直接调会 `No active analysis session`——所以 ghlab 排一个替身 analyzer 再 `startAnalysis`（见已知坑 22） |
 | `fid` | – / `binary, list, limit` | **认库函数**：用用户装的 `.fidb` 给函数改名（`list=yes` 只列数据库）。改名结果靠前后函数名快照 diff 报告，不依赖 FunctionID 的内部结果类；没有安装任何库时直接报错而不是回"0 命中" |
 | `types` | `binary, from` / `dry_run` | **批量写类型**：签名表（`.json` 分组或 `target = decl` 文本）一次应用，一个事务一次 `save`；`--dry-run` 只列计划；单条失败进 `failed` 不中断 |
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
@@ -535,3 +535,4 @@ MIT
 ```
 
 写结论时把对象名带上（`doc+0x128` 而不是 `+0x128`），否则下一个人会拿它去错的结构体上验证。
+22. `PdbUniversalAnalyzer.doAnalysis` 不能直接调：applicator 会向 `TransientProgramProperties` 要 analysis-session 作用域的状态，而那只在 `AutoAnalysisManager.isAnalyzing()` 为真时可用，于是直接调得到 `IllegalArgumentException: No active analysis session`；`setAllowUntrustedOption`/`setPdbFileOption` 走同一条检查。ghlab 的做法是用 `jpype.JProxy` 造一个只实现 `added` 的 `ghidra.app.services.Analyzer` 替身，`scheduleOneTimeAnalysis` 之后在自己开的事务里 `startAnalysis`（`startAnalysis` 自己不开事务，缺了它第一次写入就是 `db.NoTransactionException`）。这条路径在 Ghidra 12.2 上用 `/Zi` 编出的 DLL 加真 MSF PDB 验过：149 → 5848 个函数、`add_numbers`/`scaled` 等符号落地。

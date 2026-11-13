@@ -213,8 +213,8 @@ _SPECS = [
     ),
     Spec(
         "note",
-        ("binary", "text"),
-        ("at", "addr", "tag", "assert", "delete"),
+        ("binary",),
+        ("text", "at", "addr", "tag", "assert", "delete"),
         "append a durable finding (JSON on disk + bookmark), with claims",
     ),
     Spec(

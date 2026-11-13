@@ -32,103 +32,91 @@ class LanguageIdTest(unittest.TestCase):
 
 
 class AutoImportTest(unittest.TestCase):
-    class Method:
-        def __init__(self, count, calls, accept):
-            self.count = count
-            self.calls = calls
-            self.accept = accept
+    """The call shape `import --language` is pinned to on a real JVM.
 
-        def getName(self):
-            return "importByLookingForLcs"
-
-        def getParameterCount(self):
-            return self.count
-
-        def invoke(self, _target, args):
-            self.calls.append((self.count, list(args)))
-            if self.count not in self.accept:
-                raise TypeError(f"{self.count} args does not fit")
-            return "program"
-
-    class Klass:
-        def __init__(self, methods):
-            self.methods = methods
-
-        def getMethods(self):
-            return self.methods
+    Every reasonable guess failed there: the class is
+    `ghidra.program.model.lang.LanguageCompilerSpecPair`, not
+    `ghidra.program.util`; and the importer takes eight arguments with a `Language`
+    in the fourth slot, so the six-argument call that looks natural fails with
+    "wrong number of arguments: 6 expected: 8".
+    """
 
     @staticmethod
-    def _modules(fake_class):
+    def _modules(importer: mock.MagicMock) -> dict[str, types.ModuleType]:
         """A `ghidra`/`java` package tree with just the names _auto_import imports."""
-        util = types.ModuleType("ghidra.program.util")
-        util.LanguageCompilerSpecPair = mock.MagicMock(return_value="pair")
+        importer_module = types.ModuleType("ghidra.app.util.importer")
+        importer_module.AutoImporter = importer
+        importer_module.MessageLog = mock.MagicMock(return_value="LOG")
+        util = types.ModuleType("ghidra.app.util")
+        util.importer = importer_module
+        app = types.ModuleType("ghidra.app")
+        app.util = util
+        lang = types.ModuleType("ghidra.program.model.lang")
+        pair = mock.MagicMock()
+        pair.return_value.getLanguage.return_value = "LANG"
+        pair.return_value.getCompilerSpec.return_value = "CSPEC"
+        lang.LanguageCompilerSpecPair = pair
+        model = types.ModuleType("ghidra.program.model")
+        model.lang = lang
         program = types.ModuleType("ghidra.program")
-        program.util = util
+        program.model = model
         ghidra = types.ModuleType("ghidra")
+        ghidra.app = app
         ghidra.program = program
-        ghidra.importer = types.ModuleType("ghidra.importer")
         io = types.ModuleType("java.io")
         io.File = mock.MagicMock(return_value="FILE")
         java = types.ModuleType("java")
         java.io = io
-        jpype = mock.MagicMock()
-        jpype.JClass.return_value = fake_class
         return {
-            "jpype": jpype,
             "ghidra": ghidra,
+            "ghidra.app": app,
+            "ghidra.app.util": util,
+            "ghidra.app.util.importer": importer_module,
             "ghidra.program": program,
-            "ghidra.program.util": util,
+            "ghidra.program.model": model,
+            "ghidra.program.model.lang": lang,
             "java": java,
             "java.io": io,
         }
 
-    def _run(self, counts: list[int], accept: set[int]):
-        calls: list[tuple[int, list]] = []
-        methods = [self.Method(count, calls, accept) for count in counts]
-        fake = mock.MagicMock()
-        fake.class_ = self.Klass(methods)
+    def _run(self, results=None, raise_: Exception | None = None):
+        importer = mock.MagicMock()
+        if raise_ is not None:
+            importer.importByLookingForLcs.side_effect = raise_
+        else:
+            results = results if results is not None else mock.MagicMock()
+            results.getPrimaryDomainObject.return_value = "PROGRAM"
+            importer.importByLookingForLcs.return_value = results
+
+        def _proj():
+            wrapper = mock.MagicMock()
+            wrapper.getProject.return_value = "PROJ"
+            return wrapper
+
         with (
-            mock.patch.dict(sys.modules, self._modules(fake)),
-            mock.patch.object(session, "project", lambda: "PROJ"),
+            mock.patch.dict(sys.modules, self._modules(importer)),
+            mock.patch.object(session, "project", lambda: _proj()),
             mock.patch.object(session, "MONITOR", "MON"),
         ):
-            out = session._auto_import(session.Path("fw.bin"), "fw.bin", "x86:LE:32:default", "gcc")
-        return out, calls
+            out = session._auto_import(session.Path("fw.bin"), "x86:LE:32:default", "gcc")
+        return out, importer
 
-    def test_the_seven_argument_overload_gets_a_consumer_slot(self):
-        out, calls = self._run([7], accept={7})
-        self.assertEqual(out, "program")
-        count, args = calls[0]
-        self.assertEqual(count, 7)
-        self.assertEqual(args[0], "FILE")
-        self.assertEqual(args[1], "PROJ")
-        self.assertEqual(args[2], "/")
-        self.assertEqual(args[3], "fw.bin")
-        self.assertEqual(args[4], "pair")
-        self.assertIsNone(args[5])  # the ProgramConsumer slot
-        self.assertEqual(args[6], "MON")
+    def test_the_eight_arguments_ghidra_actually_takes(self):
+        _, importer = self._run()
+        args = importer.importByLookingForLcs.call_args.args
+        self.assertEqual(args, ("FILE", "PROJ", "/", "LANG", "CSPEC", None, "LOG", "MON"))
 
-    def test_the_six_argument_overload_drops_the_consumer(self):
-        out, calls = self._run([6], accept={6})
-        self.assertEqual(out, "program")
-        self.assertEqual(len(calls[0][1]), 6)
-        self.assertEqual(calls[0][1][-1], "MON")
+    def test_the_program_comes_back_not_the_load_results(self):
+        out, _ = self._run()
+        self.assertEqual(out, "PROGRAM")
 
-    def test_a_wrong_arity_is_skipped_not_fatal(self):
-        out, calls = self._run([8, 7], accept={7})
-        self.assertEqual(out, "program")
-        self.assertEqual([count for count, _ in calls], [8, 7])
-
-    def test_no_matching_overload_names_what_it_saw(self):
+    def test_a_java_failure_names_the_language_and_the_cause(self):
         with self.assertRaises(RuntimeError) as ctx:
-            self._run([3], accept=set())
-        self.assertIn("3 args", str(ctx.exception))
-        self.assertIn("failed", str(ctx.exception))
-
-    def test_a_ghidra_without_the_entry_point_says_so(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            self._run([], accept=set())
-        self.assertIn("no AutoImporter", str(ctx.exception))
+            self._run(raise_=RuntimeError("wrong number of arguments: 6 expected: 8"))
+        text = str(ctx.exception)
+        self.assertIn("x86:LE:32:default:gcc", text)
+        self.assertIn("wrong number of arguments", text)
+        self.assertIn("RuntimeError", text)
 
 
 class ImportFormatTest(unittest.TestCase):

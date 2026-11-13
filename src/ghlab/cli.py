@@ -2464,7 +2464,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("note", parents=[common], help="record a durable finding")
     p.add_argument("binary")
-    p.add_argument("text")
+    p.add_argument("text", nargs="?", default=None, help="the finding; omit only with --delete")
     p.add_argument("--at", help="function name or address")
     p.add_argument("--tag", default="note", help="group findings (auth, crypto, bug, ...)")
     p.add_argument(

@@ -315,7 +315,7 @@ def _save(program, message: str, entry: dict[str, Any] | None = None) -> str:
     for attempt in range(2):
         try:
             _domain_save(program)
-        except Exception as ex:  # noqa: BLE001 - jpype raises whatever Java chose
+        except Exception as ex:  # noqa: BLE001 - reported, not swallowed
             errors.append(f"{label}: {type(ex).__name__}: {ex}")
             time.sleep(0.25 * (attempt + 1))
             continue
@@ -457,36 +457,41 @@ def _load_spec_rows(path: Path) -> list[dict[str, Any]]:
         provider.close()
 
 
-def _auto_import(path: Path, name: str, language: str, cspec: str) -> Any:
-    """Import with an explicit language/compiler spec.
+def _auto_import(path: Path, language: str, cspec: str) -> Any:
+    """Import with an explicit language/compiler spec; return the new program.
 
-    `AutoImporter` gained and lost a `ProgramConsumer` parameter across Ghidra
-    releases, so the overload is chosen from what this JVM actually exposes rather
-    than from memory -- and a miss prints the signatures it saw instead of a
-    `NoSuchMethodError` with no context.
+    The signature is pinned down here because every obvious guess fails on a real
+    JVM: it is `(File|FSRL, Project, folderPath, Language, CompilerSpec, consumer,
+    MessageLog, TaskMonitor)` -- eight arguments, the fourth a `Language` (not the
+    `LanguageCompilerSpecPair` the name suggests), and a middle consumer/log pair
+    that makes a shorter call fail with "wrong number of arguments".
+
+    The returned program is *not* in the project: `importByLookingForLcs` hands back
+    an in-memory program, so the caller still has to `saveAs` it.
     """
-    import jpype  # the JVM only exists after boot()
-    from ghidra.program.util import LanguageCompilerSpecPair
+    from ghidra.app.util.importer import AutoImporter, MessageLog
+    from ghidra.program.model.lang import LanguageCompilerSpecPair
     from java.io import File
 
     pair = LanguageCompilerSpecPair(language, cspec)
-    cls = jpype.JClass("ghidra.app.util.importer.AutoImporter").class_
-    head = [File(str(path)), project(), "/", name, pair]
-    seen: list[str] = []
-    errors: list[str] = []
-    for method in cls.getMethods():
-        if str(method.getName()) != "importByLookingForLcs":
-            continue
-        count = int(method.getParameterCount())
-        seen.append(f"{count} args")
-        args = [*head, None, MONITOR] if count == 7 else [*head, MONITOR]
-        try:
-            return method.invoke(None, args)
-        except Exception as ex:  # noqa: BLE001 - a wrong arity shows up here
-            errors.append(f"{count} args: {type(ex).__name__}: {ex}")
-    if not seen:
-        raise RuntimeError("this Ghidra has no AutoImporter.importByLookingForLcs")
-    raise RuntimeError("importByLookingForLcs failed -> " + " | ".join(errors))
+    try:
+        results = AutoImporter.importByLookingForLcs(
+            File(str(path)),
+            project().getProject(),  # the jpype project wrapper is not a `Project`
+            "/",
+            pair.getLanguage(),
+            pair.getCompilerSpec(),
+            None,
+            MessageLog(),
+            MONITOR,
+        )
+    except Exception as ex:  # jpype raises whatever Java class the JVM chose
+        raise RuntimeError(
+            f"importByLookingForLcs({language}:{cspec}) failed -> {type(ex).__name__}: {ex}"
+        ) from ex
+    if results is None:
+        raise RuntimeError(f"AutoImporter returned nothing for {path}")
+    return results.getPrimaryDomainObject()
 
 
 def _image_base(program: Any, text: str) -> Any:
@@ -549,7 +554,7 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     if existing is not None:
         existing.delete()
     if language:
-        program = _auto_import(path, name, language, cspec)
+        program = _auto_import(path, language, cspec)
     else:
         program = proj.importProgram(File(str(path)))
     if program is None:
@@ -560,13 +565,28 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
         with _edit(program, "ghlab import base"):
             program.setImageBase(_image_base(program, str(a["base"])), True)
     proj.saveAs(program, "/", name, True)
-    if a.get("analyze", True):
-        _analyze_all(program)
-    # `proj.save` here, not a domain save: the program GhidraProject just imported is
-    # one *it* opened, so its "Batch Processing" transaction is on the stack and a
-    # bare domain save would refuse to take the write lock.  `close` ends that
-    # transaction and releases it, which is the other half of the import cycle.
-    proj.save(program)
+    if not language:
+        if a.get("analyze", True):
+            _analyze_all(program)
+        # `proj.save` here, not a domain save: the program GhidraProject just imported
+        # is one *it* opened, so its "Batch Processing" transaction is on the stack and
+        # a bare domain save would refuse to take the write lock.  `close` ends that
+        # transaction and releases it, which is the other half of the import cycle.
+        proj.save(program)
+    else:
+        # An `AutoImporter` program is not in GhidraProject's bookkeeping at all (`close`
+        # answers "unknown consumer"), so analysing it in place leaves the write lock
+        # held by the transaction `saveAs` started and the following save dies with
+        # "Unable to lock due to active transaction".  Hand the file over instead:
+        # reopen it through the cache, which is the path that is known to save cleanly.
+        with contextlib.suppress(Exception):
+            proj.close(program)
+        e = _entry(name)
+        with _edit(e["program"], "ghlab import"):
+            if a.get("analyze", True):
+                _analyze_all(e["program"])
+        _save(e["program"], "ghlab import", e)
+        program = e["program"]
     out = {
         "binary": name,
         "imported": True,
@@ -576,8 +596,9 @@ def cmd_import(a: dict[str, Any]) -> dict[str, Any]:
     if language:
         out["language"] = language
         out["cspec"] = cspec
-    with contextlib.suppress(Exception):
-        proj.close(program)  # ends import's transaction *and* releases it
+    if not language:
+        with contextlib.suppress(Exception):
+            proj.close(program)  # ends import's transaction *and* releases it
     return out
 
 
@@ -4763,42 +4784,107 @@ def cmd_types(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def cmd_pdb(a: dict[str, Any]) -> dict[str, Any]:
-    """Apply a matching PDB's symbols/types to a program.
+def _apply_pdb(program: Any, path: Path, untrusted: bool) -> tuple[bool, str]:
+    """Run the PDB through `PdbUniversalAnalyzer.doAnalysis`, inside an analysis session.
 
-    Ghidra ships the whole PDB pipeline (`PdbUniversalAnalyzer.doAnalysis`), so this is
-    a thin wrapper: sanity-check the file, run inside a transaction, keep the log. It is
-    a refusal rather than a partial import when the PDB does not match the binary.
+    Two JVM facts forced this shape.  Calling `doAnalysis` directly fails with
+    `IllegalArgumentException: No active analysis session`, because the applicator asks
+    `TransientProgramProperties` for state with analysis-session scope, and that needs
+    `AutoAnalysisManager.isAnalyzing()` to be true -- which only holds while
+    `startAnalysis` is running.  And the option writers
+    (`setAllowUntrustedOption`/`setPdbFileOption`) go through the same check, so their
+    refusal must not abort the import.
+
+    So: queue a stand-in analyzer whose `added` runs the real thing, and start the
+    session.  This exact sequence is verified on a real Ghidra 12.2 JVM against a
+    debug-built DLL and its MSF PDB (149 -> 5848 functions, symbols applied).
     """
     import jpype
     from java.io import File
 
+    analyzer = jpype.JClass("ghidra.app.plugin.core.analysis.PdbUniversalAnalyzer")
+    reader = jpype.JClass("ghidra.app.util.bin.format.pdb2.pdbreader.PdbReaderOptions")()
+    applicator = jpype.JClass("ghidra.app.util.pdb.pdbapplicator.PdbApplicatorOptions")()
+    manager = jpype.JClass("ghidra.app.plugin.core.analysis.AutoAnalysisManager")
+    AnalyzerType = jpype.JClass("ghidra.app.services.AnalyzerType")
+    AnalysisPriority = jpype.JClass("ghidra.app.services.AnalysisPriority")
+    outcome: dict[str, Any] = {}
+
+    def run(_p: Any, _set: Any, monitor: Any, msg_log: Any) -> bool:
+        # the session hands us the log the analyzer writes into; the manager's own log
+        # stays empty, and an empty log is how `pdb` would hide its own reason
+        outcome["log"] = msg_log
+        try:
+            outcome["applied"] = bool(
+                analyzer.doAnalysis(
+                    _p,
+                    File(str(path)).getAbsoluteFile(),
+                    reader,
+                    applicator,
+                    msg_log,
+                    monitor,
+                )
+            )
+        except Exception as ex:  # re-raised below, with the reason kept
+            outcome["error"] = f"{type(ex).__name__}: {ex}"
+            raise
+        return bool(outcome["applied"])
+
+    proxy = jpype.JProxy(
+        "ghidra.app.services.Analyzer",
+        dict={
+            "getName": lambda: "ghlab-pdb",
+            "getAnalysisType": lambda: AnalyzerType.BYTE_ANALYZER,
+            "getDefaultEnablement": lambda _p: True,
+            "supportsOneTimeAnalysis": lambda: True,
+            "getDescription": lambda: "apply a PDB",
+            "getPriority": lambda: AnalysisPriority.LOW_PRIORITY,
+            "canAnalyze": lambda _p: True,
+            "added": run,
+            "removed": lambda _p, _s, _m, _l: False,
+            "registerOptions": lambda _o, _p: None,
+            "optionsChanged": lambda _o, _p: None,
+            "analysisEnded": lambda _p: None,
+            "isPrototype": lambda: False,
+        },
+    )
+    with contextlib.suppress(Exception):
+        analyzer.setAllowUntrustedOption(program, untrusted)
+    mgr = manager.getAnalysisManager(program)
+    mgr.scheduleOneTimeAnalysis(proxy, program.getMemory())
+    # `startAnalysis` does not open a transaction of its own -- its callers do -- so
+    # without this the analyzer's first write is `db.NoTransactionException`.
+    with _edit(program, "ghlab-pdb"):
+        mgr.startAnalysis(MONITOR)
+    if "error" in outcome:
+        raise RuntimeError(f"pdb: {outcome['error']}")
+    text = outcome.get("log")
+    return bool(outcome.get("applied")), str(text if text is not None else mgr.getMessageLog())[
+        :2000
+    ]
+
+
+def cmd_pdb(a: dict[str, Any]) -> dict[str, Any]:
+    """Apply a matching PDB's symbols/types to a program.
+
+    Ghidra ships the whole PDB pipeline (`PdbUniversalAnalyzer.doAnalysis`); this wraps
+    it (see `_apply_pdb` for why it needs an analysis session), keeps the analyzer log,
+    and reports how many functions the program has before and after.  A PDB that does
+    not match the binary comes back as `applied: false` with the reason in `log`.
+    """
     e = _entry(a["binary"])
     p = e["program"]
     path = Path(str(a["file"])).expanduser()
     if not path.exists():
         raise FileNotFoundError(f"pdb not found: {path}")
-    analyzer = jpype.JClass("ghidra.app.plugin.core.analysis.PdbUniversalAnalyzer")
-    reader = jpype.JClass("ghidra.app.util.bin.format.pdb2.pdbreader.PdbReaderOptions")()
-    applicator = jpype.JClass("ghidra.app.util.pdb.pdbapplicator.PdbApplicatorOptions")()
-    log = jpype.JClass("ghidra.app.util.importer.MessageLog")()
     before = int(p.getFunctionManager().getFunctionCount())
-    analyzer.setAllowUntrustedOption(p, bool(a.get("untrusted", True)))
-    tx = p.startTransaction("ghlab-pdb")
-    try:
-        ok = bool(
-            analyzer.doAnalysis(
-                p, File(str(path)).getAbsoluteFile(), reader, applicator, log, MONITOR
-            )
-        )
-    finally:
-        p.endTransaction(tx, True)
+    ok, log = _apply_pdb(p, path, bool(a.get("untrusted", True)))
     out = {
         "applied": ok,
         "file": str(path),
         "functions_before": before,
         "functions_after": int(p.getFunctionManager().getFunctionCount()),
-        "log": str(log)[:2000],
+        "log": log,
     }
     if ok:
         out["saved_via"] = _save(p, "ghlab pdb", e)
@@ -4866,7 +4952,7 @@ def _run_fid_analyzer(program: Any) -> str:
     "name changed again".
     """
     import jpype
-    from ghidra.program.model.address import AddressSet
+    from ghidra.app.util.importer import MessageLog
     from ghidra.util.classfinder import ClassSearcher
 
     base = jpype.JClass("ghidra.app.services.Analyzer").class_
@@ -4886,8 +4972,11 @@ def _run_fid_analyzer(program: Any) -> str:
     # Options are optional: a missing FunctionID option package must not stop matching.
     with contextlib.suppress(Exception):
         analyzer.registerOptions(program.getOptions("FunctionID"))
+    # `added` takes four arguments -- (Program, AddressSetView, TaskMonitor, MessageLog)
+    # -- and the memory is the whole set that matters here.  Passing three (the shape
+    # the Analyzer interface suggests) fails with "No matching overloads found".
     with _edit(program, "ghlab fid"):
-        analyzer.added(program, AddressSet(), MONITOR)
+        analyzer.added(program, program.getMemory(), MONITOR, MessageLog())
     return str(cls.getSimpleName())
 
 
@@ -5218,7 +5307,14 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
             "daemon is read-only (GHLAB_READONLY=1); a note would be dropped, not stored"
         )
     notes = _load_notes(binary)
+    text = str(a.get("text") or "").strip()
     if a.get("delete"):
+        if a["delete"] is True:
+            # `delete` without an id used to be parsed as the number `True`, which
+            # failed with "invalid literal for int()"; say what is missing instead
+            raise ValueError(
+                "note delete needs the finding's id: delete=<id> (or delete=<id>,<id>)"
+            )
         gone = {_claim_int(x) for x in _as_list(a["delete"])}
         keep = [n for n in notes if _claim_int(n.get("id", 0)) not in gone]
         if len(keep) == len(notes):
@@ -5230,6 +5326,8 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
             "remaining": len(keep),
             "path": str(_notes_file(binary)),
         }
+    if not text:
+        raise ValueError("note needs text=..., or delete=<id> to retract one")
     at = a.get("at")
     claims = _as_list(a.get("assert") or [])
     for raw in claims:
@@ -5255,7 +5353,7 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
         bm = e["program"].getBookmarkManager()
         tx = e["program"].startTransaction("ghlab-note")
         try:
-            bm.setBookmark(_addr(e, addr), "Note", str(a.get("tag") or "ghlab"), str(a["text"]))
+            bm.setBookmark(_addr(e, addr), "Note", str(a.get("tag") or "ghlab"), text)
         finally:
             e["program"].endTransaction(tx, True)
     checked: list[dict[str, Any]] = []
@@ -5268,7 +5366,7 @@ def cmd_note(a: dict[str, Any]) -> dict[str, Any]:
         "addr": addr,
         "function": name,
         "tag": str(a.get("tag") or "note"),
-        "text": str(a["text"]),
+        "text": text,
         "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     if checked:
