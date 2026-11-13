@@ -37,7 +37,7 @@ from .config import (  # noqa: F401 - re-exported for callers and tests
     save_config,
     write_focus,
 )
-from .protocol import DEFAULT_HOST, DEFAULT_PORT
+from .protocol import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
 from .router import RouteError, from_config
 
 REPO = Path(__file__).resolve().parents[2]
@@ -1379,11 +1379,13 @@ def _mcp_payload(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     port = default_port()
     known = projects(cfg)
-    env: dict[str, str] = {"GHLAB_TIMEOUT": "900", "GHLAB_AUTOSTART": "1"}
+    env: dict[str, str] = {"GHLAB_TIMEOUT": str(DEFAULT_TIMEOUT), "GHLAB_AUTOSTART": "1"}
     root = _repo_root()
     if root is not None:
-        # the server imports ghlab from the checkout; the client may start it anywhere
-        env["PYTHONPATH"] = str(root / "src")
+        # the server imports ghlab from the checkout; the client may start it anywhere.
+        # os.pathsep, not ":" or ";" -- that separator is the one thing about these
+        # values that differs per OS, and it stays right if a second path is ever added.
+        env["PYTHONPATH"] = os.pathsep.join([str(root / "src")])
     if cfg.get("ghidra"):
         env["GHIDRA_INSTALL_DIR"] = str(cfg["ghidra"])
     interpreter = cfg.get("python") or _host_python()
@@ -1444,9 +1446,23 @@ def _mcp_snippet(cfg: dict[str, Any], client: str = "all") -> str:
         blocks.append(
             "every client above starts the same command; only the file and the key names "
             "differ.  If a client cuts a call off, raise its per-call timeout: a cold daemon "
-            "spends 30-45s starting Ghidra (GHLAB_TIMEOUT=900 is what the server itself waits)."
+            "spends 30-45s starting Ghidra (GHLAB_TIMEOUT is what a call waits, "
+            f"{DEFAULT_TIMEOUT}s); work that takes minutes belongs in `ghlab job`."
         )
     return "\n".join(blocks).rstrip()
+
+
+def _payload_warnings(cfg: dict[str, Any]) -> list[str]:
+    """Paths in the setup file that no longer exist, so we do not write dead env values."""
+    out = []
+    for key, hint in (
+        ("ghidra", "ghlab setup --ghidra <dir>"),
+        ("python", "GHLAB_PYTHON=<that interpreter> ghlab setup"),
+    ):
+        value = cfg.get(key)
+        if value and not Path(str(value)).exists():
+            out.append(f"ghlab: the setup file's {key} ({value}) is gone; run `{hint}`")
+    return out
 
 
 def _install_mcp(args, cfg: dict[str, Any]) -> int:
@@ -1460,6 +1476,8 @@ def _install_mcp(args, cfg: dict[str, Any]) -> int:
             print("no agent config found on this machine; `ghlab setup --print-mcp` prints")
             print("the block to paste into whichever client you install next")
             return 0
+    for line in _payload_warnings(cfg):
+        print(line)
     report = mcpconfig.install(sorted(files), _mcp_payload(cfg), dry_run=args.dry_run)
     for line in report:
         print(line)
@@ -1569,6 +1587,8 @@ def cmd_setup(args) -> int:
         print("nothing configured yet; try `ghlab setup --ghidra <dir> --project-dir <dir>")
         return 1
     if args.print_mcp:
+        for line in _payload_warnings(cfg):
+            print(line)
         print(_mcp_snippet(cfg, args.print_mcp))
     elif not changed:
         print(_mcp_snippet(cfg))

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import atomic_write_text
+from .protocol import DEFAULT_TIMEOUT
 
 # Where each client keeps its config.  Zed, VS Code and Goose follow the platform's own
 # convention (XDG on Linux, Library on macOS, %APPDATA% on Windows), so the table is built
@@ -85,8 +86,13 @@ CONTAINER: dict[str, tuple[str, ...]] = {
 
 # pi reads these next to command/args/env; the timeout has to outlast a cold daemon
 # (Ghidra takes 30-45s to answer the first call, pi's default per-call limit is 60s).
+# How long a client may wait for the server process itself to answer its first request.
+# 120s covers a cold `uv` (python download on a new machine) and a cold daemon start;
+# the per-call budget is DEFAULT_TIMEOUT everywhere.
+STARTUP_TIMEOUT = 120
+
 PI_EXTRAS: dict[str, Any] = {
-    "timeout": 900,
+    "timeout": DEFAULT_TIMEOUT,
     "exposure": "deferred",
     "description": "reverse engineering over Ghidra: decompile, xrefs, patch, notes",
 }
@@ -182,6 +188,11 @@ def entry(client: str, payload: dict[str, Any]) -> Any:
                 f"command = {json.dumps(command)}",
                 f"args = [{', '.join(json.dumps(a) for a in args)}]",
                 f"env = {{ {env_items} }}",
+                # codex kills a server that has not answered in 10s and a tool call
+                # after 60s; the tool budget has to match the one every other client
+                # gets, or a full `analyze` is cut off at 60s here and nowhere else.
+                f"startup_timeout_sec = {STARTUP_TIMEOUT}",
+                f"tool_timeout_sec = {DEFAULT_TIMEOUT}",
             ]
         )
     if dialect == "yaml":
@@ -194,7 +205,7 @@ def entry(client: str, payload: dict[str, Any]) -> Any:
                 f"    args: [{', '.join(json.dumps(a) for a in args)}]",
                 f"    envs: {{ {env_items} }}",
                 "    enabled: true",
-                "    timeout: 900",
+                f"    timeout: {DEFAULT_TIMEOUT}",
             ]
         )
     block: dict[str, Any] = {"command": command, "args": list(args), "env": dict(env)}

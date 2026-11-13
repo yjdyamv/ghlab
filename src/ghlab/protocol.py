@@ -19,6 +19,12 @@ from typing import Any
 DEFAULT_PORT = 8765
 DEFAULT_HOST = "127.0.0.1"
 
+# How long a client waits for one call.  Long enough for the slow things that are still
+# one call -- a cold daemon spends up to 90s starting Ghidra, a full `analyze` of a
+# 350 KB PE about 130s -- and short enough that a wedged daemon is noticed: anything
+# that legitimately takes minutes belongs in `ghlab job`, which answers immediately.
+DEFAULT_TIMEOUT = 300
+
 
 class ProtocolError(ValueError):
     """Bad request: unknown command, missing/extra parameter, wrong type."""

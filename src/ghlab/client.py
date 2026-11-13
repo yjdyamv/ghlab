@@ -9,7 +9,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-from .protocol import DEFAULT_HOST, DEFAULT_PORT
+from .protocol import DEFAULT_HOST, DEFAULT_PORT, DEFAULT_TIMEOUT
 
 
 class RemoteError(RuntimeError):
@@ -23,7 +23,7 @@ class Client:
         self.url = url or os.environ.get("GHLAB_URL", f"http://{DEFAULT_HOST}:{DEFAULT_PORT}/")
         # GHLAB_TIMEOUT lets an MCP/editor integration set its own budget without
         # passing it through every call.
-        self.timeout = float(timeout or os.environ.get("GHLAB_TIMEOUT", 300))
+        self.timeout = float(timeout or os.environ.get("GHLAB_TIMEOUT", DEFAULT_TIMEOUT))
 
     def raw(self, request: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(request, ensure_ascii=False).encode()

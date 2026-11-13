@@ -12,7 +12,8 @@ import json
 import unittest
 from unittest import mock
 
-from ghlab import cli
+from ghlab import cli, mcpconfig
+from ghlab.protocol import DEFAULT_TIMEOUT
 
 CFG = {
     "ghidra": "/opt/ghidra",
@@ -112,6 +113,9 @@ class TomlAndYamlClientsTest(_NoUv):
         self.assertIn('args = ["-m", "ghlab.mcp"]', text)
         self.assertIn("GHLAB_TIMEOUT", text)
         self.assertIn("GHLAB_URL", text)
+        # codex's own defaults are 10s to start the server and 60s per call
+        self.assertIn(f"startup_timeout_sec = {mcpconfig.STARTUP_TIMEOUT}", text)
+        self.assertIn(f"tool_timeout_sec = {DEFAULT_TIMEOUT}", text)
 
     def test_goose_gets_extensions_with_cmd_and_envs(self) -> None:
         text = cli._mcp_entry("goose", cli._mcp_payload(CFG))
@@ -121,7 +125,7 @@ class TomlAndYamlClientsTest(_NoUv):
         self.assertIn("envs: {", text)
         # goose calls it envs, not env, and it needs the same patience as pi
         self.assertNotIn("\n    env:", text)
-        self.assertIn("    timeout: 900", text)
+        self.assertIn(f"    timeout: {DEFAULT_TIMEOUT}", text)
 
 
 class SnippetTest(unittest.TestCase):
