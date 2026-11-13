@@ -1087,8 +1087,8 @@ def cmd_serve(args) -> int:
             file=sys.stderr,
         )
         print(
-            "       install ghlab in the venv that has them, or run this module with that "
-            "interpreter (`ghlab doctor` prints which one)",
+            "       install ghlab in the venv that has them, run this module with that "
+            "interpreter, or set GHLAB_PYTHON=<venv python> (`ghlab doctor` prints it)",
             file=sys.stderr,
         )
         return 2
@@ -1189,11 +1189,14 @@ def cmd_doctor(args) -> int:
         have_pyghidra = True
     except Exception:  # noqa: BLE001
         pass
+    said = f"jpype={have_jpype} pyghidra={have_pyghidra} ({sys.executable})"
+    if os.environ.get("GHLAB_PYTHON"):
+        said += f"; GHLAB_PYTHON={os.environ['GHLAB_PYTHON']}"
     checks.append(
         _check(
             "pyghidra + jpype",
             have_jpype and have_pyghidra,
-            f"jpype={have_jpype} pyghidra={have_pyghidra} ({sys.executable})",
+            said,
             "install them offline from the Ghidra bundle: "
             "uv pip install --python <venv> --no-index --find-links <Ghidra>/Ghidra/Features/PyGhidra/pypkg/dist jpype1 pyghidra",
         )
@@ -1248,7 +1251,9 @@ def cmd_doctor(args) -> int:
         pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
         local = _pidfile(pid_path)
         want = session.code_stamp()
-        have = local.get("stamp")
+        # the daemon knows which code *it* loaded; the pidfile here is the local one and
+        # is simply absent when the daemon belongs to another project directory
+        have = ping.get("stamp") or local.get("stamp")
         checks.append(
             _check(
                 "daemon code",
@@ -1259,12 +1264,20 @@ def cmd_doctor(args) -> int:
             )
         )
 
+    host = _host_python()
+    checks.append(
+        _check(
+            "host interpreter",
+            bool(host),
+            host or f"none of GHLAB_PYTHON, {sys.executable}, setup's python can import pyghidra",
+            "set GHLAB_PYTHON=<venv python>, or run `ghlab setup` from the interpreter that has "
+            "jpype/pyghidra -- `start` spawns the daemon with it",
+            warn=True,
+        )
+    )
+
     procs = _ghlab_processes()
-    known = {
-        int(_pidfile(Path(t.project_dir).expanduser() / ".ghlab.pid").get("pid") or 0)
-        for t in projects(load_config()).values()
-    }
-    loose = _strays(procs, known)
+    loose = _strays(procs, _recorded_pids(procs))
     detail = f"{len(procs)} ghlab process(es)"
     if loose:
         detail += ", not in any pidfile: " + ", ".join(
@@ -1338,7 +1351,9 @@ def _mcp_snippet(cfg: dict[str, Any]) -> str:
         env["GHLAB_PROJECT_NAME"] = str(cfg.get("project_name") or "ghlab")
         env["GHLAB_PORT"] = str(port)
     payload: dict[str, Any] = {
-        "command": sys.executable,
+        # the client runs this itself: an MCP server on an interpreter without pyghidra
+        # would answer "failed to start" and look like a broken install
+        "command": cfg.get("python") or _host_python() or sys.executable,
         "args": ["-m", "ghlab.mcp"],
         "env": env,
     }
@@ -1435,6 +1450,14 @@ def cmd_setup(args) -> int:
         save_config(cfg)
         changed = True
         print(f"default project = {args.default_project}")
+    # Remember the interpreter that can actually host Ghidra: `start` may be run later
+    # by a different one (uv run, the system python), and it has to know where to spawn.
+    # `_host_python` prefers GHLAB_PYTHON, so a setup run from the wrong interpreter
+    # still records the right one.
+    host = _host_python()
+    if host and cfg.get("python") != host:
+        cfg["python"] = host
+        changed = True
     if changed:
         path = save_config(cfg)
         print(f"wrote {path}")
@@ -1525,6 +1548,42 @@ def _pyghidra_ok(python: str | None = None) -> bool:
     return done.returncode == 0
 
 
+def _host_python() -> str | None:
+    """The interpreter that can host Ghidra, or None.
+
+    `start` spawns a daemon with an interpreter of its own choosing, and the CLI is
+    often run by one that cannot import pyghidra (`uv run`, the system python).  The
+    daemon then dies on its first import and the only clue is "exited with 1".
+    GHLAB_PYTHON wins, then this interpreter, then whatever `setup` recorded.
+    """
+    tried: list[str] = []
+    for candidate in (
+        os.environ.get("GHLAB_PYTHON"),
+        sys.executable,
+        load_config().get("python"),
+    ):
+        if not candidate or candidate in tried:
+            continue
+        tried.append(str(candidate))
+        if _pyghidra_ok(str(candidate)):
+            return str(candidate)
+    return None
+
+
+def _no_host_python() -> int:
+    print(
+        "ghlab: no interpreter I know of can import jpype/pyghidra, so a daemon "
+        "spawned from here would die at startup",
+        file=sys.stderr,
+    )
+    print(
+        "       point GHLAB_PYTHON at the venv python that has them "
+        "(`ghlab doctor` prints the one it is using)",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _log_tail(path: Path, lines: int = 8) -> str:
     """The last non-empty lines of the daemon log, indented for a terminal."""
     try:
@@ -1537,19 +1596,6 @@ def _log_tail(path: Path, lines: int = 8) -> str:
 
 def cmd_start(args) -> int:
     client = Client(f"http://{args.host}:{args.port}/")
-    if not client.alive() and not _pyghidra_ok():
-        # spawning would only produce a corpse and a two-line log
-        print(
-            f"ghlab: {sys.executable} cannot import jpype/pyghidra, so a daemon spawned "
-            "from it would die at startup",
-            file=sys.stderr,
-        )
-        print(
-            "       run the CLI with the interpreter that has them "
-            "(`ghlab doctor` prints which one)",
-            file=sys.stderr,
-        )
-        return 2
     pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
     running = client.alive()
     if running:
@@ -1559,6 +1605,12 @@ def cmd_start(args) -> int:
         if have == want:
             print(f"already up on {args.host}:{args.port} (pid {info.get('pid')}, code {want})")
             return 0
+    # Choose the interpreter *before* stopping anything: refusing to spawn a corpse is
+    # cheap, and it must not leave the reader with no daemon at all.
+    python = _host_python()
+    if python is None:
+        return _no_host_python()
+    if running:
         # a daemon on old code silently answers with old behaviour; restart it
         print(
             f"ghlab: running daemon has code {have or 'unknown'}, installed is {want}; restarting"
@@ -1591,7 +1643,7 @@ def cmd_start(args) -> int:
     _rotate_log(LOGDIR / "ghlab.log")
     log = open(LOGDIR / "ghlab.log", "ab")  # noqa: SIM115 - handed to the detached child
     cmd = [
-        sys.executable,
+        python,
         "-m",
         "ghlab",
         "serve",
@@ -1870,6 +1922,32 @@ def _kill_tree(pid: int, table: list[dict[str, Any]] | None = None) -> str:
 def _terminate(pid: int) -> str:
     """Backwards-compatible name for `_kill_tree` (older call sites and tests)."""
     return _kill_tree(pid)
+
+
+def _recorded_pids(procs: list[dict[str, Any]]) -> set[int]:
+    """Every pid a pidfile in play names: configured projects and ad-hoc --project-dir.
+
+    `doctor` and `stop --all` both need this, and reading only the configured projects
+    made a daemon started with `--project-dir` look like a leftover.
+    """
+    paths = [
+        Path(t.project_dir).expanduser() / ".ghlab.pid" for t in projects(load_config()).values()
+    ]
+    for proc in procs:
+        if proc.get("project_dir"):
+            paths.append(Path(proc["project_dir"]).expanduser() / ".ghlab.pid")
+    pids: set[int] = set()
+    for path in paths:
+        pid = _pidfile(path).get("pid")
+        if pid:
+            pids.add(int(pid))
+    for pid in list(pids):
+        pids.update(_descendants(pid, procs))
+    # the venv launcher and the interpreter it re-execs are one daemon on one port:
+    # the pidfile names one of them, and the other is not a leftover
+    ports = {p["port"] for p in procs if p["port"] and p["pid"] in pids}
+    pids.update(p["pid"] for p in procs if p["port"] and p["port"] in ports)
+    return pids
 
 
 def _strays(procs: list[dict[str, Any]], known: set[int]) -> list[dict[str, Any]]:

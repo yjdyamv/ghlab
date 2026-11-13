@@ -279,5 +279,57 @@ class StopUsesTheDaemonsPidTest(unittest.TestCase):
         sweep.assert_called_once_with()
 
 
+class RecordedPidsTest(unittest.TestCase):
+    def test_configured_and_adhoc_pidfiles_are_both_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "proj").mkdir()
+            (root / "proj" / ".ghlab.pid").write_text('{"pid": 40, "stamp": "x"}', encoding="utf-8")
+            (root / "verify").mkdir()
+            (root / "verify" / ".ghlab.pid").write_text(
+                '{"pid": 50, "stamp": "x"}', encoding="utf-8"
+            )
+            target = type("T", (), {"project_dir": str(root / "proj")})()
+            procs = cli._ghlab_processes(
+                [
+                    _row(40, 1, "python -m ghlab.cli serve --port 8771"),
+                    _row(
+                        50,
+                        1,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                ]
+            )
+            with mock.patch.object(cli, "projects", return_value={"p": target}):
+                known = cli._recorded_pids(procs)
+        self.assertEqual(known, {40, 50})
+
+    def test_the_launcher_sharing_a_port_is_recorded_too(self):
+        # the pidfile names the interpreter; the shim on the same port is not a leftover
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "verify").mkdir()
+            (root / "verify" / ".ghlab.pid").write_text(
+                '{"pid": 71, "stamp": "x"}', encoding="utf-8"
+            )
+            procs = cli._ghlab_processes(
+                [
+                    _row(
+                        70,
+                        1,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                    _row(
+                        71,
+                        70,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                ]
+            )
+            with mock.patch.object(cli, "projects", return_value={}):
+                known = cli._recorded_pids(procs)
+        self.assertEqual(known, {70, 71})
+
+
 if __name__ == "__main__":
     unittest.main()
