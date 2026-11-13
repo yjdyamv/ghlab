@@ -4330,13 +4330,20 @@ _TYPE_ALIASES = {
 }
 
 
-def code_stamp() -> str:
-    """Fingerprint of the installed package, so a stale daemon is detectable.
+_STAMP: str | None = None
 
-    Editing a handler and restarting the daemon used to be the only way to notice
-    that the running process still served the old module; `ghlab start` now
-    compares this stamp and restarts by itself.
+
+def code_stamp(refresh: bool = False) -> str:
+    """Fingerprint of the code this process loaded, so a stale daemon is detectable.
+
+    Cached on first use: a daemon that re-hashed the files on every call would always
+    report the *installed* code -- the one thing that just changed -- and `ghlab start`
+    would never notice that the running process still serves the old module.
+    `refresh=True` re-reads (for a caller that has just written the files).
     """
+    global _STAMP
+    if _STAMP is not None and not refresh:
+        return _STAMP
     root = Path(__file__).resolve().parent
     parts = []
     for path in sorted(root.glob("*.py")):
@@ -4345,7 +4352,8 @@ def code_stamp() -> str:
         except OSError:
             continue
         parts.append(f"{path.name}:{st.st_size}:{int(st.st_mtime)}")
-    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+    _STAMP = hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+    return _STAMP
 
 
 def _hex_bytes(text: str) -> bytes:

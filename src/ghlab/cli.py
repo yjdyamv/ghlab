@@ -1909,12 +1909,25 @@ def _stop_all() -> int:
             continue
         path = Path(where).expanduser() / ".ghlab.pid"
         add_pidfile(path, f"daemon {path.parent.name}")
+    # Two processes can be one daemon: the venv launcher and the interpreter it
+    # re-execs share a command line and a port, and either one may be the pid the
+    # pidfile recorded.  Calling the other one a stray sends the reader hunting.
+    ports = {
+        proc["port"]: labels[int(proc["pid"])]
+        for proc in procs
+        if proc["port"] and int(proc["pid"]) in labels
+    }
     for proc in procs:
         pid = int(proc["pid"])
         if pid in labels:
             continue
         at = f":{proc['port']}" if proc["port"] else ""
-        kind = "child" if proc["parent"] in labels else "stray"
+        if proc["port"] in ports:
+            kind = "same daemon"
+        elif proc["parent"] in labels:
+            kind = "child"
+        else:
+            kind = "stray"
         labels[pid] = f"{proc['role']}{at} ({kind})"
     if not labels:
         print("ghlab: nothing to stop")

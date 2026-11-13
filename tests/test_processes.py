@@ -191,8 +191,40 @@ class StopAllTest(unittest.TestCase):
             text = out.getvalue()
             self.assertIn("daemon verify", text)
             self.assertNotIn("(stray)", text)
-            self.assertIn("serve:8775 (child)", text)
+            self.assertIn("serve:8775 (same daemon)", text)
             self.assertFalse((root / "verify" / ".ghlab.pid").exists())
+
+    def test_the_launcher_and_its_interpreter_are_one_daemon(self):
+        # the pidfile names one of the two; the other shares the port, and saying
+        # "(stray)" about it reads like a leak that does not exist
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._project("verify", 20, root)
+            procs = cli._ghlab_processes(
+                [
+                    _row(
+                        20,
+                        1,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                    _row(
+                        21,
+                        1,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                ]
+            )
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "projects", return_value={}),
+                mock.patch.object(cli, "_ghlab_processes", return_value=procs),
+                mock.patch.object(cli, "_kill_tree", lambda *_a, **_k: "killed"),
+                contextlib.redirect_stdout(out),
+            ):
+                cli._stop_all()
+            text = out.getvalue()
+            self.assertIn("serve:8775 (same daemon)", text)
+            self.assertNotIn("(stray)", text)
 
     def test_nothing_to_stop_needs_no_process_table(self):
         with (
