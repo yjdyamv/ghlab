@@ -249,9 +249,9 @@ _SPECS = [
     ),
     Spec(
         "notes",
-        ("binary",),
-        ("tag", "at", "query", "limit"),
-        "list stored findings with optional filters",
+        (),
+        ("binary", "tag", "at", "query", "limit"),
+        "list stored findings with optional filters (no binary: every program)",
     ),
     Spec(
         "family",

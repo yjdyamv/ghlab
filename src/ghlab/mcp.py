@@ -515,7 +515,8 @@ TOOLS: list[dict[str, Any]] = [
         "name": "ghlab_notes",
         "description": (
             "Read back stored findings (the project's long-term memory) with filters. "
-            "Use this before re-deriving something an earlier session already established."
+            "Omit `binary` to read every program's findings. Use this before re-deriving "
+            "something an earlier session already established."
         ),
         "inputSchema": {
             "type": "object",

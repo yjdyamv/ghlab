@@ -5159,6 +5159,14 @@ def _claim_int(text: Any) -> int:
     return int(str(text).strip(), 0)
 
 
+def _claim_int_or(text: Any, default: int = 1 << 30) -> int:
+    """Sort key for finding ids: integers on disk, but a hand-edited file is possible."""
+    try:
+        return _claim_int(text)
+    except (TypeError, ValueError):
+        return default
+
+
 def _compare(value: int, op: str, want: int) -> bool:
     if op == "=":
         return value == want
@@ -5275,7 +5283,10 @@ def _notes_file(binary: str) -> Path:
 
 
 def _load_notes(binary: str) -> list[dict[str, Any]]:
-    path = _notes_file(binary)
+    return _load_notes_path(_notes_file(binary))
+
+
+def _load_notes_path(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     try:
@@ -5446,8 +5457,24 @@ def cmd_verify(a: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
-    binary = str(a["binary"])
-    notes = _load_notes(binary)
+    """Read findings back.  Without `binary`, every program's findings, tagged with
+    the program they came from -- finding ids are per program, so the name has to
+    travel with them."""
+    binary = str(a["binary"]) if a.get("binary") else ""
+    if binary:
+        notes = _load_notes(binary)
+        path = str(_notes_file(binary))
+        programs = 1
+    else:
+        files = sorted(_notes_dir().glob("*.json"))
+        notes = []
+        for file in files:
+            for note in _load_notes_path(file):
+                note.setdefault("binary", file.stem)
+                notes.append(note)
+        notes.sort(key=lambda n: (str(n.get("binary")), _claim_int_or(n.get("id"))))
+        path = str(_notes_dir())
+        programs = len(files)
     tag = a.get("tag")
     at = a.get("at")
     query = a.get("query")
@@ -5469,7 +5496,8 @@ def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
         "notes": out[:cap],
         "count": len(out),
         "total": len(notes),
-        "path": str(_notes_file(binary)),
+        "path": path,
+        "programs": programs,
     }
 
 

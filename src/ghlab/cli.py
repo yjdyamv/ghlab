@@ -10,6 +10,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import textwrap
 import time
 import urllib.request
 from collections import Counter
@@ -737,10 +738,16 @@ def fmt_notes(r: dict[str, Any]) -> str:
     if not r["notes"]:
         return f"(no notes matched; {r['total']} stored in {r['path']})"
     out = []
+    programs = int(r.get("programs") or 1)
     for n in r["notes"]:
         where = f"{n.get('addr') or ''} {n.get('function') or ''}".strip() or "(general)"
-        out.append(f"  #{n['id']} [{n['tag']}] {where}\n      {n['text']}")
-    out.append(f"  ({r['count']} shown / {r['total']} total)")
+        # finding ids restart per program, so name the program when several are in play
+        who = f"{n['binary']} " if programs > 1 and n.get("binary") else ""
+        out.append(f"  {who}#{n['id']} [{n['tag']}] {where}\n      {n['text']}")
+    tail = f"  ({r['count']} shown / {r['total']} total"
+    if programs > 1:
+        tail += f" across {programs} program(s)"
+    out.append(tail + ")")
     return "\n".join(out)
 
 
@@ -1783,6 +1790,130 @@ class _Parser(argparse.ArgumentParser):
         super().error(message)
 
 
+# What each command is for, in the order a session needs them.  The text of each
+# entry comes from the subparser's own `help=`, so this table only has to stay
+# complete (a test asserts that) and the two can never disagree.
+_HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "the machine and the daemon",
+        ("setup", "doctor", "projects", "serve", "start", "stop", "status"),
+    ),
+    (
+        "questions (read-only)",
+        (
+            "ping",
+            "binaries",
+            "info",
+            "functions",
+            "decompile",
+            "strings",
+            "imports",
+            "exports",
+            "names",
+            "xrefs",
+            "bytes",
+            "scan",
+            "offsets",
+            "struct",
+            "types",
+            "graph",
+            "digest",
+            "find",
+            "index",
+            "map",
+            "notes",
+            "journal",
+            "overview",
+            "audit",
+            "report",
+            "verify",
+            "emulate",
+            "decrypt",
+            "diff",
+            "similar",
+            "cross-xref",
+            "slice",
+            "campaign",
+            "family",
+            "use",
+        ),
+    ),
+    (
+        "changes (they write the project)",
+        (
+            "import",
+            "analyze",
+            "rename",
+            "comment",
+            "bookmark",
+            "note",
+            "patch",
+            "revert",
+            "set-type",
+            "fid",
+            "pdb",
+        ),
+    ),
+    ("long jobs and interfaces", ("job", "cancel", "run", "mcp")),
+)
+
+
+def _friendly(message: str) -> str:
+    """The daemon prefixes errors with the Java/Python class; drop it when it is noise.
+
+    `ghlab: ValueError: unknown group 'dll'` reads like a crash.  Anything a user can
+    act on loses the class; an unexpected one keeps it, plus GHLAB_DEBUG=1 shows the
+    remote trace.
+    """
+    head, sep, rest = message.partition(": ")
+    if not sep or head not in _CALM_ERRORS:
+        return message
+    rest = rest.strip()
+    if len(rest) > 1 and rest[0] == rest[-1] == '"':
+        rest = rest[1:-1]
+    return rest or message
+
+
+_CALM_ERRORS = (
+    "ValueError",
+    "KeyError",
+    "FileNotFoundError",
+    "PermissionError",
+    "TimeoutError",
+    "IsADirectoryError",
+    "ProtocolError",
+)
+
+
+def _grouped_help(helps: dict[str, str]) -> str:
+    """The `--help` tail: commands by what they do, then a few real invocations."""
+    names = list(helps)
+    width = max([len(n) for n in names] + [12])
+    lines = ["commands by what they are for:", ""]
+    for title, group in _HELP_GROUPS:
+        lines.append(f"{title}")
+        for name in group:
+            head = f"  {name:<{width}}  "
+            wrapped = textwrap.wrap(helps.get(name, ""), 78 - len(head)) or [""]
+            lines.append(head + wrapped[0])
+            lines.extend(" " * len(head) + rest for rest in wrapped[1:])
+        lines.append("")
+    lines.extend(
+        [
+            "examples:",
+            "  ghlab setup --ghidra C:/ghidra_12.2_PUBLIC --project C:/re/proj",
+            "  ghlab start; ghlab import notepad.exe; ghlab functions notepad.exe -q crypt",
+            "  ghlab decompile notepad.exe -t 140001230 --json",
+            "  ghlab job analyze notepad.exe -a full=yes; ghlab job --id j1; ghlab cancel j1",
+            "  ghlab patch notepad.exe 0x140001230 '90 90'; ghlab revert notepad.exe --all",
+            "",
+            "binary '-' means the program picked by `ghlab use`; --json works anywhere",
+            "on the line and prints the daemon's reply untouched; GHLAB_URL picks the daemon.",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = _Parser(add_help=False)
     common.add_argument("--url", default=os.environ.get("GHLAB_URL"))
@@ -1804,7 +1935,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="Warm Ghidra bridge: persistent headless Ghidra behind a JSON API.",
     )
     ap.add_argument("--version", action="version", version=f"ghlab {__version__}")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.formatter_class = argparse.RawDescriptionHelpFormatter
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="<command>")
 
     p = sub.add_parser("serve", parents=[daemon], help="run the daemon in the foreground")
     p.set_defaults(func=cmd_serve)
@@ -2150,6 +2282,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("target", nargs="+")
     p.set_defaults(func=lambda a: _call(a, "xrefs", {"binary": a.binary, "targets": a.target}))
 
+    p = sub.add_parser("strings", parents=[common], help="string data, and who reads it")
+    p.add_argument("binary")
+    p.add_argument("-q", "--query", help="substring to look for")
+    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
+    p.add_argument("--offset", help="start of the range to scan")
+    p.add_argument("--refs", action="store_true", help="also report which functions read each one")
+    p.add_argument("--refresh", action="store_true", help="rebuild the cached table")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "strings",
+            {
+                "binary": a.binary,
+                "query": a.query,
+                "limit": a.limit,
+                "offset": a.offset,
+                "refs": a.refs,
+                "refresh": a.refresh,
+            },
+        )
+    )
+
     p = sub.add_parser("bytes", parents=[common], help="raw memory")
     p.add_argument("binary")
     p.add_argument("addr")
@@ -2424,7 +2578,13 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    p = sub.add_parser("set-type", parents=[common], help="apply a prototype or a data type")
+    # the daemon (and MCP) spell these with an underscore; both spellings work here
+    p = sub.add_parser(
+        "set-type",
+        parents=[common],
+        aliases=["set_type"],
+        help="apply a prototype or a data type",
+    )
     p.add_argument("binary")
     p.add_argument("target", help="function name/address, or a data address")
     p.add_argument("decl", help="'int f(char *s, unsigned n)' or 'char[64]' / 'void*'")
@@ -2531,7 +2691,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser("notes", parents=[common], help="list recorded findings")
-    p.add_argument("binary")
+    p.add_argument("binary", nargs="?", help="one program, or every program when omitted")
     p.add_argument("--tag")
     p.add_argument("--at")
     p.add_argument("-q", "--query")
@@ -2625,7 +2785,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = sub.add_parser(
-        "cross-xref", parents=[common], help="search a string/import across all programs"
+        "cross-xref",
+        parents=[common],
+        aliases=["cross_xref"],
+        help="search a string/import across all programs",
     )
     p.add_argument("query", help="regex over string data")
     p.add_argument("--binary", help="restrict to one program")
@@ -2719,6 +2882,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    helps = {action.dest: (action.help or "") for action in getattr(sub, "_choices_actions", [])}
+    ap.epilog = _grouped_help(helps)
+    ap.command_help = helps  # the grouped listing is built from this; tests read it too
+    # The grouped epilog is the listing now.  Drop the flat one argparse would print
+    # above it: it repeats every line, in registration order, with no grouping.
+    getattr(sub, "_choices_actions", []).clear()
     return ap
 
 
@@ -2746,8 +2915,9 @@ def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
     try:
         result = client.call(cmd, **params)
     except RemoteError as ex:
-        print(f"ghlab: {ex}", file=sys.stderr)
-        if ex.trace and os.environ.get("GHLAB_DEBUG"):
+        debug = bool(os.environ.get("GHLAB_DEBUG"))
+        print(f"ghlab: {str(ex) if debug else _friendly(str(ex))}", file=sys.stderr)
+        if ex.trace and debug:
             print(ex.trace, file=sys.stderr)
         return 1
     if getattr(args, "json", False) or cmd not in FORMATTERS:

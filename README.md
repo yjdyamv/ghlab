@@ -378,7 +378,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `fid` | – / `binary, list, limit` | **认库函数**：用用户装的 `.fidb` 给函数改名（`list=yes` 只列数据库）。改名结果靠前后函数名快照 diff 报告，不依赖 FunctionID 的内部结果类；没有安装任何库时直接报错而不是回"0 命中" |
 | `types` | `binary, from` / `dry_run` | **批量写类型**：签名表（`.json` 分组或 `target = decl` 文本）一次应用，一个事务一次 `save`；`--dry-run` 只列计划；单条失败进 `failed` 不中断 |
 | `verify` | `binary` / `id` | **重算所有断言**：`PASS`/`FAIL`/`UNKNOWN` + 每条证据行；发现 agent 说错了就靠这个 |
-| `notes` | `binary` / `tag, at, query, limit` | 按标签/位置/关键词检索结论 |
+| `notes` | – / `binary, tag, at, query, limit` | 按标签/位置/关键词检索结论；**不带 `binary` 就是整个项目**（每条结论标出所属程序，因为 id 是按程序编号的） |
 | `cross-xref` | `query` / `binary, limit` | **跨程序**搜字符串数据，附每个命中的引用者；省掉"逐个程序 decompile 找字符串" |
 | `slice` | `binary, to` / `from, depth, limit, code, direction` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译；`--forward` 反向问"这个函数能到达哪些导入、路径是什么" |
 | `similar` | `binary, target` / `against, limit, min_score` | **跨程序同构函数**：字符串/导入/常量/大小四路指纹打分；零特征的 thunk 一律压到 0.3 以下，避免 stub 互相当成 1.00 |
