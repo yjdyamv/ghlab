@@ -1336,8 +1336,26 @@ def cmd_doctor(args) -> int:
     return 0
 
 
-def _mcp_snippet(cfg: dict[str, Any]) -> str:
-    """The two config shapes an agent client needs, filled in from this machine."""
+# Every client speaks the same stdio protocol; only the file and the key names differ.
+# Each entry: (where the file lives, the renderer for that file's dialect).
+_MCP_CLIENTS: dict[str, tuple[str, str]] = {
+    "pi": ("~/.pi/agent/mcp.json (or .pi/mcp.json in a project)", "json"),
+    "claude": (
+        "~/.claude.json, and .mcp.json in a project; the same shape works for "
+        "Claude Desktop (claude_desktop_config.json), Cursor, Windsurf, Cline, "
+        "Roo, Copilot CLI and Gemini CLI (~/.gemini/settings.json)",
+        "json",
+    ),
+    "codex": ("~/.codex/config.toml", "toml"),
+    "vscode": (".vscode/mcp.json, and .github/mcp.json (VS Code + Copilot)", "vscode"),
+    "zed": ("Zed settings.json (%APPDATA%/Zed/settings.json)", "zed"),
+    "opencode": ("~/.config/opencode/opencode.json", "opencode"),
+    "goose": ("~/.config/goose/config.yaml (%APPDATA%/Block/goose/config/config.yaml)", "goose"),
+}
+
+
+def _mcp_payload(cfg: dict[str, Any]) -> dict[str, Any]:
+    """The command, args and env an agent needs to start `ghlab mcp` on this machine."""
     port = default_port()
     known = projects(cfg)
     env: dict[str, str] = {"GHLAB_TIMEOUT": "900", "GHLAB_AUTOSTART": "1"}
@@ -1350,23 +1368,121 @@ def _mcp_snippet(cfg: dict[str, Any]) -> str:
         env["GHLAB_PROJECT_DIR"] = str(cfg.get("project_dir") or "")
         env["GHLAB_PROJECT_NAME"] = str(cfg.get("project_name") or "ghlab")
         env["GHLAB_PORT"] = str(port)
-    payload: dict[str, Any] = {
+    return {
         # the client runs this itself: an MCP server on an interpreter without pyghidra
         # would answer "failed to start" and look like a broken install
         "command": cfg.get("python") or _host_python() or sys.executable,
         "args": ["-m", "ghlab.mcp"],
         "env": env,
     }
-    return chr(10).join(
+
+
+def _mcp_entry(client: str, payload: dict[str, Any]) -> str:
+    """One client's config text, with the file it belongs in as a comment where allowed."""
+    where, dialect = _MCP_CLIENTS[client]
+    command, args, env = payload["command"], payload["args"], payload["env"]
+    if dialect == "json":
+        entry: dict[str, Any] = {"command": command, "args": args, "env": env}
+        if client == "pi":
+            # the daemon answers, or spends 30-45s cold-starting Ghidra before it does;
+            # pi's default 60s would cut the first call off.  Progress notifications
+            # reset the clock, and ghlab sends none.
+            entry["timeout"] = 900
+            entry["exposure"] = "deferred"
+            entry["description"] = "reverse engineering over Ghidra: decompile, xrefs, patch, notes"
+        return json.dumps({"mcpServers": {"ghlab": entry}}, indent=2)
+    if dialect == "toml":
+        env_items = ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in env.items())
+        arg_items = ", ".join(json.dumps(a) for a in args)
+        return "\n".join(
+            [
+                f"# {where}",
+                "[mcp_servers.ghlab]",
+                f"command = {json.dumps(command)}",
+                f"args = [{arg_items}]",
+                f"env = {{ {env_items} }}",
+            ]
+        )
+    if dialect == "vscode":
+        return "\n".join(
+            [
+                f"// {where}",
+                json.dumps(
+                    {
+                        "servers": {
+                            "ghlab": {"type": "stdio", "command": command, "args": args, "env": env}
+                        }
+                    },
+                    indent=2,
+                ),
+            ]
+        )
+    if dialect == "zed":
+        return "\n".join(
+            [
+                f"// {where} -- Zed reads `context_servers`, not `mcpServers`",
+                json.dumps(
+                    {"context_servers": {"ghlab": {"command": command, "args": args, "env": env}}},
+                    indent=2,
+                ),
+            ]
+        )
+    if dialect == "opencode":
+        return "\n".join(
+            [
+                f"// {where} -- a local server takes the command as an array and `environment`",
+                json.dumps(
+                    {
+                        "mcp": {
+                            "ghlab": {
+                                "type": "local",
+                                "command": [command, *args],
+                                "environment": env,
+                                "enabled": True,
+                            }
+                        }
+                    },
+                    indent=2,
+                ),
+            ]
+        )
+    # goose: YAML, `extensions`, `cmd`/`envs`, and a timeout in seconds
+    env_items = ", ".join(f"{json.dumps(k)}: {json.dumps(v)}" for k, v in env.items())
+    arg_items = ", ".join(json.dumps(a) for a in args)
+    return "\n".join(
         [
-            f"config: {config_path()} ({len(known)} project(s): {', '.join(known)})",
-            "pi  (~/.pi/agent/mcp.json):",
-            json.dumps({"mcpServers": {"ghlab": {**payload, "exposure": "deferred"}}}, indent=2),
-            "",
-            "Claude Code / other MCP clients (claude_desktop_config.json shape):",
-            json.dumps({"mcpServers": {"ghlab": payload}}, indent=2),
+            f"# {where}",
+            "extensions:",
+            "  ghlab:",
+            "    type: stdio",
+            f"    cmd: {json.dumps(command)}",
+            f"    args: [{arg_items}]",
+            f"    envs: {{ {env_items} }}",
+            "    enabled: true",
+            "    timeout: 900",
         ]
     )
+
+
+def _mcp_snippet(cfg: dict[str, Any], client: str = "all") -> str:
+    """Config text for one agent client, or for every client we know the shape of."""
+    payload = _mcp_payload(cfg)
+    known = projects(cfg)
+    header = f"config: {config_path()} ({len(known)} project(s): {', '.join(known)})"
+    names = list(_MCP_CLIENTS) if client == "all" else [client]
+    blocks = [header, ""]
+    for name in names:
+        where = _MCP_CLIENTS[name][0]
+        blocks.append(f"== {name}  ({where})")
+        blocks.append(_mcp_entry(name, payload))
+        blocks.append("")
+    if client == "all":
+        blocks.append(
+            "every client above starts the same command; only the file and the key names "
+            "differ.  If a client cuts a call off, raise its per-call timeout: a cold daemon "
+            "spends 30-45s starting Ghidra (GHLAB_TIMEOUT=900 is what the server itself waits)."
+        )
+    return "\n".join(blocks).rstrip()
 
 
 def cmd_setup(args) -> int:
@@ -1464,7 +1580,9 @@ def cmd_setup(args) -> int:
     if not cfg:
         print("nothing configured yet; try `ghlab setup --ghidra <dir> --project-dir <dir>")
         return 1
-    if args.print_mcp or not changed:
+    if args.print_mcp:
+        print(_mcp_snippet(cfg, args.print_mcp))
+    elif not changed:
         print(_mcp_snippet(cfg))
     else:
         print(f"ghidra      {cfg.get('ghidra') or '(unset)'}")
@@ -2350,7 +2468,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--dry-run", action="store_true", help="with --discover: only list what was found"
     )
-    p.add_argument("--print-mcp", action="store_true", help="print MCP config snippets and exit")
+    p.add_argument(
+        "--print-mcp",
+        nargs="?",
+        const="all",
+        choices=["all", *sorted(_MCP_CLIENTS)],
+        metavar="CLIENT",
+        help="print the MCP config for one agent client (default: all of them) and exit",
+    )
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser(

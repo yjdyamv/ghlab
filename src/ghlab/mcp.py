@@ -20,7 +20,10 @@ from . import __version__, config
 from . import router as routing
 from .client import RemoteError
 
-PROTOCOL_VERSION = "2025-06-18"
+# The revision we implement; clients that ask for an older one get their own back, which
+# the spec requires when the version is supported (a strict client disconnects otherwise).
+PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 
 _BIN = {"type": "string", "description": "program name in the project (unique substring is enough)"}
 _LIMIT = {"type": "integer", "minimum": 1, "description": "max results"}
@@ -972,9 +975,10 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
         return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": text}}
 
     if method == "initialize":
+        asked = str(params.get("protocolVersion") or "")
         return ok(
             {
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": asked if asked in SUPPORTED_VERSIONS else PROTOCOL_VERSION,
                 "capabilities": {
                     "tools": {"listChanged": False},
                     "resources": {"subscribe": False},
@@ -989,6 +993,12 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
         )
     if method == "ping":
         return ok({})
+    if method == "logging/setLevel":
+        # we log to stderr, which needs no level; answering beats -32601 in a client log
+        return ok({})
+    if method == "resources/templates/list":
+        # every ghlab:// uri is concrete (ghlab://programs, ghlab://notes/...), so none
+        return ok({"resourceTemplates": []})
     if method == "tools/list":
         return ok({"tools": TOOLS})
     if method == "tools/call":

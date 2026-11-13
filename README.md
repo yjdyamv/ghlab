@@ -342,7 +342,25 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 
 - **`GHLAB_AUTOSTART=1`**：daemon 没起时首次工具调用自己把它拉起来（冷启 30–45s，之后毫秒级），agent 不需要先开 shell。
 - **一个 MCP 条目 = 一个 daemon**：换项目就再写一个条目（不同 `GHLAB_PORT` / `GHLAB_PROJECT_DIR`）。
-- 其他 MCP 客户端（Claude Code 等）用同一个块，删掉 `exposure` 即可；`ghlab doctor` 负责回答"这台机器为什么跑不起来"。
+- `ghlab doctor` 负责回答"这台机器为什么跑不起来"。
+
+### 其他 agent 客户端
+
+同一套 stdio server，只是各家配置文件的位置和键名不同。`ghlab setup --print-mcp <client>` 按本机真实路径打印可直接粘贴的版本（`--print-mcp` 不带参数则全部打印）：
+
+| client | 配置文件 | 键名 |
+|---|---|---|
+| pi | `~/.pi/agent/mcp.json` | `mcpServers`（还认 `timeout` 秒数、`exposure`） |
+| Claude Code / Desktop / Cursor / Windsurf / Cline / Roo / Copilot CLI / Gemini CLI | `~/.claude.json`、`.mcp.json`、`~/.cursor/mcp.json`、`~/.gemini/settings.json` …… | `mcpServers` |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.ghlab]` |
+| VS Code + Copilot | `.vscode/mcp.json`、`.github/mcp.json` | `servers`，每条要 `"type": "stdio"` |
+| Zed | `settings.json` | `context_servers`（**不是** `mcpServers`） |
+| OpenCode | `~/.config/opencode/opencode.json` | `mcp.<名字>`，`command` 是数组、`environment` 而非 `env` |
+| Goose | `~/.config/goose/config.yaml` | `extensions`，用 `cmd` / `envs` / `timeout` |
+
+协议是标准 MCP，不需要每家单独适配：`initialize` 回显客户端请求的版本（支持 `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`，更新的版本回我们自己的 2025-11-25）；`logging/setLevel`、`resources/templates/list` 都有应答，不会在客户端日志里刷 `-32601`；工具报错按规范作为 `isError` 的工具结果返回，而不是协议错误（官方 Python SDK 已实测：35 个工具、2 个资源、2 个 prompt 都正常）。
+
+唯一需要每家自己调的是**超时**：默认 60s 的客户端会被冷启（30–45s）卡掉第一次调用，`--print-mcp pi|goose` 里已经写成 900 秒。
 
 ## 命令一览
 
