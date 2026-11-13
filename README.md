@@ -355,12 +355,21 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | Codex | `~/.codex/config.toml` | `[mcp_servers.ghlab]` |
 | VS Code + Copilot | `.vscode/mcp.json`、`.github/mcp.json` | `servers`，每条要 `"type": "stdio"` |
 | Zed | `settings.json` | `context_servers`（**不是** `mcpServers`） |
-| OpenCode | `~/.config/opencode/opencode.json` | `mcp.<名字>`，`command` 是数组、`environment` 而非 `env` |
+| OpenCode | `~/.config/opencode/opencode.json` | v2 起是 `mcp.servers.<名字>`（v1 是 `mcp.<名字>`），`command` 是数组、`environment` 而非 `env` |
+| Command Code | `~/.commandcode/mcp.json`（用户级；`cmd mcp add -s user`） | `mcpServers`，每条要 `transport: "stdio"` + `command`/`args`/`env`；工具名是 `mcp__ghlab__<tool>` |
 | Goose | `~/.config/goose/config.yaml` | `extensions`，用 `cmd` / `envs` / `timeout` |
 
 协议是标准 MCP，不需要每家单独适配：`initialize` 回显客户端请求的版本（支持 `2025-11-25` / `2025-06-18` / `2025-03-26` / `2024-11-05`，更新的版本回我们自己的 2025-11-25）；`logging/setLevel`、`resources/templates/list` 都有应答，不会在客户端日志里刷 `-32601`；工具报错按规范作为 `isError` 的工具结果返回，而不是协议错误（官方 Python SDK 已实测：35 个工具、2 个资源、2 个 prompt 都正常）。
 
-唯一需要每家自己调的是**超时**：默认 60s 的客户端会被冷启（30–45s）卡掉第一次调用，`--print-mcp pi|goose` 里已经写成 900 秒。
+唯一需要每家自己调的是**超时**：默认 60s 的客户端会被冷启（30—45s）卡掉第一次调用，`--print-mcp pi|goose` 里已经写成 900 秒。
+
+用 OpenCode 实测过一遍（v2.2.7，免费模型）：`opencode mcp list` 显示 `✓ ghlab  connected`，`opencode run` 能直接调到 `ghlab_projects` 与 `ghlab_decompile`（后者还顺带验证了「第一次调用按需拉起 daemon」这条路径，约一分钟）。客户端退出时不一定会关掉 stdio 子进程，留下的 `python -m ghlab.mcp` 用 `ghlab stop --all` 一起收（`ghlab doctor` 的 stray 一行也会列出来）。
+
+不想手粘也可以让 ghlab 自己写：`ghlab setup --install-mcp` 会把条目**合并**进本机找到的客户端配置文件（`--install-mcp claude` 只装一家，`--dry-run` 只报告不改）。合并是文本手术，不是整体重写：文件里的注释、缩进、别的 server 原样保留；已经正确时输出与输入逐字节相同，所以重复运行没有副作用；首次修改会留一份 `<文件名>.ghlab.bak`。写入用 `atomic_write_text`（临时文件 + `os.replace`），解析不了的文件只报告失败，绝不覆盖。本机实测：Zed 那份带注释、带尾逗号的 `settings.json` 与 pi 的 `mcp.json` 都只多了一条 `ghlab`，第二次运行四家全部报 `current`。
+
+有 `uv` 就用 `uv`：写进去的 `command` 是 `uv run --quiet --no-project --python '>=3.10' python -m ghlab.mcp`（`uv` 用绝对路径，因为从图标启动的客户端 PATH 比你 shell 里小得多）。MCP 进程本身零第三方依赖，只需 `PYTHONPATH` 指向这个 checkout 的 `src`；真正需要 Ghidra 的是 daemon，所以能 import `jpype` 的解释器单独放在 `GHLAB_PYTHON` 里（`ghlab setup` 记的、或 `_host_python()` 探到的），`ghlab start` 会用它。没有 `uv` 的机器上退回"解释器 + `-m ghlab.mcp`"。这样配置里不会出现 `C:\...\Scripts\python.exe` 这种平台专属的虚拟环境路径，Windows / macOS / Linux 同一份写法。
+
+配置文件位置按平台走：Zed 在 Windows 是 `%APPDATA%\Zed\settings.json`、macOS/Linux 是 `~/.config/zed/settings.json`；VS Code 是 `%APPDATA%\Code\User\mcp.json` / `~/Library/Application Support/Code/User/mcp.json` / `~/.config/Code/User/mcp.json`；Goose 在 Windows 是 `%APPDATA%\Block\goose\config\config.yaml`、其它平台 `~/.config/goose/config.yaml`；其余客户端三平台都是家目录下的同一个相对路径。
 
 ## 命令一览
 

@@ -95,10 +95,9 @@ class Router:
 
     def alive(self, name: str) -> bool:
         try:
-            self.client(name).alive()
+            return self.client(name).alive()
         except (RemoteError, OSError):
             return False
-        return True
 
     def binaries(self, name: str, *, refresh: bool = False) -> list[str]:
         cached = self._cache.get(name)
@@ -187,8 +186,10 @@ class Router:
             return self._owner_for(str(binary)), params
         return self.default, params
 
-    def _aggregate(self, cmd: str, params: dict[str, Any]) -> dict[str, Any]:
-        started = time.monotonic()
+    def _collect(
+        self, cmd: str, params: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Ask every daemon that is up, and note which ones were down."""
         merged: list[dict[str, Any]] = []
         projects: list[dict[str, Any]] = []
         for name in self.targets:
@@ -206,6 +207,24 @@ class Router:
                 row = {"binary": item} if isinstance(item, str) else dict(item)
                 row["project"] = name
                 merged.append(row)
+        return merged, projects
+
+    def _aggregate(self, cmd: str, params: dict[str, Any]) -> dict[str, Any]:
+        started = time.monotonic()
+        merged, projects = self._collect(cmd, params)
+        if not any(row["alive"] for row in projects) and self.autostart and self._start:
+            # `overview` is an agent's first question; an empty answer would read as
+            # "no programs" when the truth is "no daemon".  Start the default one.
+            self._start(self.targets[self.default])
+            merged, projects = self._collect(cmd, params)
+        if not merged and not any(row["alive"] for row in projects):
+            # An empty list would read as "this project has no programs" when the
+            # truth is "nothing is running": say which, so the caller can start one.
+            names = ", ".join(row["project"] for row in projects)
+            raise RouteError(
+                f"no daemon is running ({names}); `ghlab start` starts the default one, "
+                "and any call that names a binary starts the project that owns it"
+            )
         return {
             cmd: merged,
             "projects": projects,

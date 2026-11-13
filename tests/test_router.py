@@ -87,6 +87,30 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(payload["cmd"], "decompile")
         self.assertNotIn("project", clients["ghlab"].calls[-1][1])
 
+    def test_a_daemon_that_says_it_is_down_is_down(self):
+        # Client.alive() reports False instead of raising; the router used to ignore the
+        # answer and call every configured project alive, which made autostart a no-op.
+        class Refusing(FakeClient):
+            def alive(self) -> bool:
+                return False
+
+        targets = {"ghlab": target("ghlab", 8765, ["notepad.exe"])}
+        r = router.Router(
+            targets=targets,
+            default="ghlab",
+            clients={"ghlab": Refusing(targets["ghlab"].url, ["notepad.exe"])},
+        )
+        self.assertFalse(r.alive("ghlab"))
+
+    def test_a_daemon_that_raises_on_the_probe_is_down(self):
+        targets = {"ghlab": target("ghlab", 8765, ["notepad.exe"])}
+        r = router.Router(
+            targets=targets,
+            default="ghlab",
+            clients={"ghlab": FakeClient(targets["ghlab"].url, [], up=False)},
+        )
+        self.assertFalse(r.alive("ghlab"))
+
     def test_unknown_binary_names_the_projects_and_what_they_hold(self):
         r, _ = self.make()
         with self.assertRaises(router.RouteError) as cm:
@@ -172,6 +196,54 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(payload["binaries"][0]["project"], "ghlab")
         states = {row["project"]: row["alive"] for row in payload["projects"]}
         self.assertEqual(states, {"ghlab": True, "wps": False})
+
+    def test_aggregation_says_nothing_is_running_instead_of_returning_nothing(self):
+        # `{"overview": []}` reads as "the project holds no programs"; with every
+        # daemon down the honest answer is "nothing is running, start one".
+        targets = {
+            "ghlab": target("ghlab", 8765, ["notepad.exe"]),
+            "wps": target("wps", 8766, ["wpscore.dll"]),
+        }
+        clients: dict[str, router.ClientLike] = {
+            "ghlab": FakeClient(targets["ghlab"].url, ["notepad.exe"], up=False),
+            "wps": FakeClient(targets["wps"].url, ["wpscore.dll"], up=False),
+        }
+        r = router.Router(targets=targets, default="ghlab", clients=clients)
+        with self.assertRaises(router.RouteError) as cm:
+            r.call("overview")
+        self.assertIn("no daemon is running", str(cm.exception))
+        self.assertIn("ghlab start", str(cm.exception))
+
+    def test_an_aggregate_starts_the_default_and_answers(self):
+        # An agent's first call is usually `overview`; with nothing running it must
+        # start one daemon and answer, not hand back a dead end it cannot act on.
+        targets = {
+            "ghlab": target("ghlab", 8765, ["notepad.exe"]),
+            "wps": target("wps", 8766, ["wpscore.dll"]),
+        }
+        clients: dict[str, router.ClientLike] = {
+            "ghlab": FakeClient(targets["ghlab"].url, ["notepad.exe"], up=False),
+            "wps": FakeClient(targets["wps"].url, ["wpscore.dll"], up=False),
+        }
+        started: list[str] = []
+
+        def start(t):
+            started.append(t.name)
+            clients["ghlab"] = FakeClient(targets["ghlab"].url, ["notepad.exe"])
+            return True
+
+        r = router.Router(
+            targets=targets, default="ghlab", clients=clients, start=start, autostart=True
+        )
+        payload = r.call("overview")
+        self.assertEqual(started, ["ghlab"])
+        self.assertEqual([row["binary"] for row in payload["overview"]], ["notepad.exe"])
+
+    def test_a_running_but_empty_project_still_answers_with_an_empty_list(self):
+        targets = {"ghlab": target("ghlab", 8765, [])}
+        clients: dict[str, router.ClientLike] = {"ghlab": FakeClient(targets["ghlab"].url, [])}
+        r = router.Router(targets=targets, default="ghlab", clients=clients)
+        self.assertEqual(r.call("overview")["overview"], [])
 
     def test_aggregation_reports_how_long_it_took(self):
         # `elapsed_ms` used to be a hardcoded 0, which made "why is `binaries` slow

@@ -30,7 +30,17 @@ def _json_part(text: str) -> dict:
     return json.loads(body)
 
 
-class PayloadTest(unittest.TestCase):
+class _NoUv(unittest.TestCase):
+    """These cases describe the entry for a machine without uv: the interpreter form."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        patcher = mock.patch.object(cli.shutil, "which", return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class PayloadTest(_NoUv):
     def test_the_command_is_the_interpreter_that_can_host_ghidra(self) -> None:
         with mock.patch.object(cli, "_host_python", return_value="/venv/bin/python"):
             payload = cli._mcp_payload(CFG)
@@ -61,7 +71,7 @@ class PayloadTest(unittest.TestCase):
         self.assertNotIn("GHLAB_URL", env)
 
 
-class JsonClientsTest(unittest.TestCase):
+class JsonClientsTest(_NoUv):
     def test_pi_takes_mcp_servers_and_a_timeout_that_survives_a_cold_daemon(self) -> None:
         entry = _json_part(cli._mcp_entry("pi", cli._mcp_payload(CFG)))["mcpServers"]["ghlab"]
         self.assertEqual(entry["command"], "/venv/bin/python")
@@ -86,14 +96,15 @@ class JsonClientsTest(unittest.TestCase):
 
     def test_opencode_wants_one_command_array_and_environment(self) -> None:
         doc = _json_part(cli._mcp_entry("opencode", cli._mcp_payload(CFG)))
-        server = doc["mcp"]["ghlab"]
+        # opencode v2 nests its servers: {"mcp": {"servers": {"ghlab": ...}}}
+        server = doc["mcp"]["servers"]["ghlab"]
         self.assertEqual(server["type"], "local")
         self.assertEqual(server["command"], ["/venv/bin/python", "-m", "ghlab.mcp"])
         self.assertIn("GHLAB_TIMEOUT", server["environment"])
         self.assertTrue(server["enabled"])
 
 
-class TomlAndYamlClientsTest(unittest.TestCase):
+class TomlAndYamlClientsTest(_NoUv):
     def test_codex_gets_an_mcp_servers_table(self) -> None:
         text = cli._mcp_entry("codex", cli._mcp_payload(CFG))
         self.assertIn("[mcp_servers.ghlab]", text)

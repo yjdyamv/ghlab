@@ -752,7 +752,10 @@ def _start_target(target: Any) -> bool:
     )
     sys.stderr.flush()
     try:
-        return cli.cmd_start(args) == 0
+        # cmd_start narrates on stdout ("spawning pid", ".ready on ..."), and our stdout
+        # *is* the JSON-RPC stream: one stray line and every client reports a parse error.
+        with contextlib.redirect_stdout(sys.stderr):
+            return cli.cmd_start(args) == 0
     except Exception as ex:  # noqa: BLE001 - a failed autostart must not kill the MCP server
         sys.stderr.write(
             f"ghlab.mcp: autostart of {target.name} failed: {type(ex).__name__}: {ex}{chr(10)}"
@@ -1023,6 +1026,26 @@ def handle(msg: dict[str, Any], call: Callable[..., Any]) -> dict[str, Any] | No
     return fail(-32601, f"method not found: {method}")
 
 
+def _trace(msg: Any, reply: dict[str, Any] | None) -> None:
+    """Append the method (and any error) to `GHLAB_MCP_LOG`, for client bug reports.
+
+    Only the method name, the id, and whether we answered with an error: no arguments
+    and no results, so the file stays small and carries no binary content.
+    """
+    path = os.environ.get("GHLAB_MCP_LOG")
+    if not path or not isinstance(msg, dict):
+        return
+    method = msg.get("method") or "<reply>"
+    line = f"{method} id={msg.get('id')}"
+    if reply is not None and "error" in reply:
+        error = reply["error"]
+        line += f" -> error {error.get('code')} {error.get('message')}"
+    elif reply is not None:
+        line += " -> ok"
+    with contextlib.suppress(OSError), open(path, "a", encoding="utf-8") as log:
+        log.write(line + chr(10))
+
+
 def serve(
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
@@ -1068,6 +1091,7 @@ def serve(
                     "error": {"code": -32600, "message": "invalid request: not an object"},
                 }
             )
+        _trace(msg, reply)
         if reply is not None:
             stdout.write(json.dumps(reply, ensure_ascii=False) + "\n")
             stdout.flush()

@@ -12,18 +12,20 @@ import subprocess
 import sys
 import textwrap
 import time
+import urllib.parse
 import urllib.request
 from collections import Counter
 from pathlib import Path
 from typing import Any, NoReturn
 
-from . import __version__, session
+from . import __version__, config, mcpconfig, session
 from .client import Client, RemoteError
 from .config import (  # noqa: F401 - re-exported for callers and tests
     config_path,
     default_port,
     default_project,
     default_project_dir,
+    default_project_name,
     discover_projects,
     focus_path,
     ghidra_dir,
@@ -1338,130 +1340,93 @@ def cmd_doctor(args) -> int:
 
 # Every client speaks the same stdio protocol; only the file and the key names differ.
 # Each entry: (where the file lives, the renderer for that file's dialect).
-_MCP_CLIENTS: dict[str, tuple[str, str]] = {
-    "pi": ("~/.pi/agent/mcp.json (or .pi/mcp.json in a project)", "json"),
-    "claude": (
-        "~/.claude.json, and .mcp.json in a project; the same shape works for "
-        "Claude Desktop (claude_desktop_config.json), Cursor, Windsurf, Cline, "
-        "Roo, Copilot CLI and Gemini CLI (~/.gemini/settings.json)",
-        "json",
-    ),
-    "codex": ("~/.codex/config.toml", "toml"),
-    "vscode": (".vscode/mcp.json, and .github/mcp.json (VS Code + Copilot)", "vscode"),
-    "zed": ("Zed settings.json (%APPDATA%/Zed/settings.json)", "zed"),
-    "opencode": ("~/.config/opencode/opencode.json", "opencode"),
-    "goose": ("~/.config/goose/config.yaml (%APPDATA%/Block/goose/config/config.yaml)", "goose"),
+# Every client speaks the same stdio protocol; only the file and the key names differ.
+# ``mcpconfig`` owns the shapes and the writing; these are the human-facing labels.
+_MCP_CLIENTS: dict[str, str] = {
+    "pi": "~/.pi/agent/mcp.json (or .pi/mcp.json in a project); takes a `timeout` in seconds",
+    "claude": "~/.claude.json and .mcp.json in a project (Claude Code)",
+    "claude-desktop": "claude_desktop_config.json (Claude Desktop)",
+    "gemini": "~/.gemini/settings.json (Gemini CLI)",
+    "cursor": "~/.cursor/mcp.json and .cursor/mcp.json (Cursor)",
+    "windsurf": "mcp_config.json (Windsurf / Devin Desktop)",
+    "codex": "~/.codex/config.toml",
+    "vscode": ".vscode/mcp.json and .github/mcp.json (VS Code + Copilot)",
+    "zed": "Zed settings.json; reads `context_servers`, not `mcpServers`",
+    "opencode": "~/.config/opencode/opencode.json; `command` is one array",
+    "goose": "~/.config/goose/config.yaml; YAML, `cmd`/`envs`",
+    "commandcode": "~/.commandcode/mcp.json (`cmd mcp add -s user`); `transport: stdio`",
 }
+
+# Names that are the same file shape as another client (installed() reports the files).
+_ALIAS = {"claude-desktop": "claude"}
+
+
+def _repo_root() -> Path | None:
+    """The checkout this ghlab runs from, if it is one (an installed wheel has none)."""
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "pyproject.toml").is_file() and (parent / "src" / "ghlab").is_dir():
+            return parent
+    return None
 
 
 def _mcp_payload(cfg: dict[str, Any]) -> dict[str, Any]:
-    """The command, args and env an agent needs to start `ghlab mcp` on this machine."""
+    """The command, args and env an agent needs to start `ghlab mcp` on this machine.
+
+    ``uv`` comes first when it is installed: the MCP server itself has no third-party
+    dependencies, so `uv run --no-project python` is a portable launcher that needs no
+    venv path, no shell activation and no per-OS layout.  The daemon still needs the
+    interpreter that can import Ghidra, so that one is passed along in GHLAB_PYTHON.
+    """
     port = default_port()
     known = projects(cfg)
     env: dict[str, str] = {"GHLAB_TIMEOUT": "900", "GHLAB_AUTOSTART": "1"}
+    root = _repo_root()
+    if root is not None:
+        # the server imports ghlab from the checkout; the client may start it anywhere
+        env["PYTHONPATH"] = str(root / "src")
+    if cfg.get("ghidra"):
+        env["GHIDRA_INSTALL_DIR"] = str(cfg["ghidra"])
+    interpreter = cfg.get("python") or _host_python()
+    if interpreter:
+        env["GHLAB_PYTHON"] = interpreter
     if len(known) > 1:
         # More than one project: the router needs the registry, and a pinned
         # GHLAB_URL would collapse it back to a single daemon.
         env["GHLAB_CONFIG"] = str(config_path())
     else:
         env["GHLAB_URL"] = f"http://{cfg.get('host') or DEFAULT_HOST}:{port}"
-        env["GHLAB_PROJECT_DIR"] = str(cfg.get("project_dir") or "")
+        env["GHLAB_PROJECT_DIR"] = str(cfg.get("project_dir") or default_project_dir())
         env["GHLAB_PROJECT_NAME"] = str(cfg.get("project_name") or "ghlab")
         env["GHLAB_PORT"] = str(port)
+    uv = shutil.which("uv")
+    if uv:
+        return {
+            # absolute: a client started from a dock icon has a much smaller PATH than
+            # this shell, and "uv" would then simply not be found
+            "command": uv,
+            "args": [
+                "run",
+                "--quiet",
+                "--no-project",
+                "--python",
+                ">=3.10",
+                "python",
+                "-m",
+                "ghlab.mcp",
+            ],
+            "env": env,
+        }
     return {
-        # the client runs this itself: an MCP server on an interpreter without pyghidra
-        # would answer "failed to start" and look like a broken install
-        "command": cfg.get("python") or _host_python() or sys.executable,
+        # no uv: the interpreter the client runs has to be the one that can import us
+        "command": interpreter or sys.executable,
         "args": ["-m", "ghlab.mcp"],
         "env": env,
     }
 
 
 def _mcp_entry(client: str, payload: dict[str, Any]) -> str:
-    """One client's config text, with the file it belongs in as a comment where allowed."""
-    where, dialect = _MCP_CLIENTS[client]
-    command, args, env = payload["command"], payload["args"], payload["env"]
-    if dialect == "json":
-        entry: dict[str, Any] = {"command": command, "args": args, "env": env}
-        if client == "pi":
-            # the daemon answers, or spends 30-45s cold-starting Ghidra before it does;
-            # pi's default 60s would cut the first call off.  Progress notifications
-            # reset the clock, and ghlab sends none.
-            entry["timeout"] = 900
-            entry["exposure"] = "deferred"
-            entry["description"] = "reverse engineering over Ghidra: decompile, xrefs, patch, notes"
-        return json.dumps({"mcpServers": {"ghlab": entry}}, indent=2)
-    if dialect == "toml":
-        env_items = ", ".join(f"{json.dumps(k)} = {json.dumps(v)}" for k, v in env.items())
-        arg_items = ", ".join(json.dumps(a) for a in args)
-        return "\n".join(
-            [
-                f"# {where}",
-                "[mcp_servers.ghlab]",
-                f"command = {json.dumps(command)}",
-                f"args = [{arg_items}]",
-                f"env = {{ {env_items} }}",
-            ]
-        )
-    if dialect == "vscode":
-        return "\n".join(
-            [
-                f"// {where}",
-                json.dumps(
-                    {
-                        "servers": {
-                            "ghlab": {"type": "stdio", "command": command, "args": args, "env": env}
-                        }
-                    },
-                    indent=2,
-                ),
-            ]
-        )
-    if dialect == "zed":
-        return "\n".join(
-            [
-                f"// {where} -- Zed reads `context_servers`, not `mcpServers`",
-                json.dumps(
-                    {"context_servers": {"ghlab": {"command": command, "args": args, "env": env}}},
-                    indent=2,
-                ),
-            ]
-        )
-    if dialect == "opencode":
-        return "\n".join(
-            [
-                f"// {where} -- a local server takes the command as an array and `environment`",
-                json.dumps(
-                    {
-                        "mcp": {
-                            "ghlab": {
-                                "type": "local",
-                                "command": [command, *args],
-                                "environment": env,
-                                "enabled": True,
-                            }
-                        }
-                    },
-                    indent=2,
-                ),
-            ]
-        )
-    # goose: YAML, `extensions`, `cmd`/`envs`, and a timeout in seconds
-    env_items = ", ".join(f"{json.dumps(k)}: {json.dumps(v)}" for k, v in env.items())
-    arg_items = ", ".join(json.dumps(a) for a in args)
-    return "\n".join(
-        [
-            f"# {where}",
-            "extensions:",
-            "  ghlab:",
-            "    type: stdio",
-            f"    cmd: {json.dumps(command)}",
-            f"    args: [{arg_items}]",
-            f"    envs: {{ {env_items} }}",
-            "    enabled: true",
-            "    timeout: 900",
-        ]
-    )
+    """One client's config, in the dialect its file is written in."""
+    return mcpconfig.render(_ALIAS.get(client, client), payload)
 
 
 def _mcp_snippet(cfg: dict[str, Any], client: str = "all") -> str:
@@ -1472,8 +1437,7 @@ def _mcp_snippet(cfg: dict[str, Any], client: str = "all") -> str:
     names = list(_MCP_CLIENTS) if client == "all" else [client]
     blocks = [header, ""]
     for name in names:
-        where = _MCP_CLIENTS[name][0]
-        blocks.append(f"== {name}  ({where})")
+        blocks.append(f"== {name}  ({_MCP_CLIENTS[name]})")
         blocks.append(_mcp_entry(name, payload))
         blocks.append("")
     if client == "all":
@@ -1485,12 +1449,36 @@ def _mcp_snippet(cfg: dict[str, Any], client: str = "all") -> str:
     return "\n".join(blocks).rstrip()
 
 
+def _install_mcp(args, cfg: dict[str, Any]) -> int:
+    """Write our entry into each installed client's config file (in place, merged)."""
+    wanted = list(_MCP_CLIENTS) if args.install_mcp == "all" else [args.install_mcp]
+    files = {_ALIAS.get(name, name) for name in wanted}
+    if args.install_mcp == "all":
+        have = set(mcpconfig.installed())
+        files = {name for name in files if name in have}
+        if not files:
+            print("no agent config found on this machine; `ghlab setup --print-mcp` prints")
+            print("the block to paste into whichever client you install next")
+            return 0
+    report = mcpconfig.install(sorted(files), _mcp_payload(cfg), dry_run=args.dry_run)
+    for line in report:
+        print(line)
+    wrote = sum(1 for line in report if "wrote" in line or "would" in line)
+    print(
+        f"\n{wrote} of {len(report)} file(s) {('to write' if args.dry_run else 'changed')}; "
+        "restart the client to pick it up"
+    )
+    return 0
+
+
 def cmd_setup(args) -> int:
     """Write ~/.ghlab/config.json so no environment variables are needed.
 
     `--print-mcp` is the useful half for wiring a *different* agent: it prints the
     config with the real interpreter path, daemon URL and autostart env baked in.
     """
+    if args.install_mcp:
+        return _install_mcp(args, load_config())
     cfg = load_config()
     changed = False
     if args.ghidra:
@@ -1592,6 +1580,19 @@ def cmd_setup(args) -> int:
         print("")
         print(_mcp_snippet(cfg))
     return 0
+
+
+def _default_target(cfg: dict[str, Any] | None = None) -> config.Target:
+    """The project a bare `ghlab start` / `serve` / `status` means: the configured default.
+
+    The legacy top-level ``project_dir`` / ``port`` keys describe whichever project was
+    set up first, so a registry with several projects would otherwise start (and probe)
+    that one while every other command routed to the default.  `projects()` reads the
+    registry, falls back to the legacy keys, and always returns something.
+    """
+    cfg = config.load_config() if cfg is None else cfg
+    targets = config.projects(cfg)
+    return targets.get(config.default_project(cfg)) or next(iter(targets.values()))
 
 
 def _autostart_enabled() -> bool:
@@ -2407,12 +2408,14 @@ def build_parser() -> argparse.ArgumentParser:
     # anything typed on the command line still wins.
     cfg = load_config()
     daemon = _Parser(add_help=False)
-    daemon.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
-    daemon.add_argument("--port", type=int, default=default_port())
+    home = _default_target(cfg)
+    home_url = urllib.parse.urlsplit(home.url)
+    daemon.add_argument("--host", default=home_url.hostname or cfg.get("host") or DEFAULT_HOST)
+    daemon.add_argument("--port", type=int, default=home_url.port or default_port())
+    daemon.add_argument("--project-dir", default=home.project_dir or default_project_dir())
     daemon.add_argument(
-        "--project-dir", default=str(cfg.get("project_dir") or default_project_dir())
+        "--project-name", default=home.project_name or home.name or default_project_name()
     )
-    daemon.add_argument("--project-name", default=str(cfg.get("project_name") or "ghlab"))
 
     ap = _Parser(
         prog="ghlab",
@@ -2466,7 +2469,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="find Ghidra projects (*.gpr + *.rep) under DIR (default: ~/re) and register them",
     )
     p.add_argument(
-        "--dry-run", action="store_true", help="with --discover: only list what was found"
+        "--dry-run",
+        action="store_true",
+        help="with --discover: only list what was found; with --install-mcp: write nothing",
     )
     p.add_argument(
         "--print-mcp",
@@ -2475,6 +2480,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["all", *sorted(_MCP_CLIENTS)],
         metavar="CLIENT",
         help="print the MCP config for one agent client (default: all of them) and exit",
+    )
+    p.add_argument(
+        "--install-mcp",
+        nargs="?",
+        const="all",
+        choices=["all", *sorted(_MCP_CLIENTS)],
+        metavar="CLIENT",
+        help="write the MCP entry into the config files of installed clients (default: all found)",
     )
     p.set_defaults(func=cmd_setup)
 

@@ -1,11 +1,13 @@
 """MCP facade tests: protocol shape and argument forwarding, no Ghidra involved."""
 
+import contextlib
 import io
 import json
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from ghlab import mcp, protocol
+from ghlab import cli, config, mcp, protocol
 from ghlab.client import RemoteError
 
 
@@ -346,3 +348,39 @@ if __name__ == "__main__":
         """A README that says "15 tools" while the code has 22 is worse than no README."""
         readme = (Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
         self.assertIn(f"{len(mcp.TOOLS)} 个工具", readme)
+
+
+class AutostartTest(unittest.TestCase):
+    """Autostart happens mid-conversation, on the very stream the client is reading."""
+
+    def target(self) -> config.Target:
+        return config.Target(
+            name="proj", url="http://127.0.0.1:8765", project_dir="/p", project_name="proj"
+        )
+
+    def test_starting_a_daemon_does_not_write_on_the_protocol_stream(self) -> None:
+        def start(args):  # cmd_start narrates: that is the whole point of the guard
+            print(f"ghlab: spawning pid 1 for {args.project_name}")
+            return 0
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(cli, "cmd_start", start),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            self.assertTrue(mcp._start_target(self.target()))
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("starting it", err.getvalue())
+
+    def test_a_daemon_that_will_not_start_is_false_not_an_exception(self) -> None:
+        def start(args):
+            raise OSError("no interpreter")
+
+        err = io.StringIO()
+        with (
+            mock.patch.object(cli, "cmd_start", start),
+            contextlib.redirect_stderr(err),
+        ):
+            self.assertFalse(mcp._start_target(self.target()))
+        self.assertIn("autostart of proj failed", err.getvalue())
