@@ -86,6 +86,57 @@ class ReachabilityTest(unittest.TestCase):
         self.assertEqual(seen, ["set_type", "cross_xref"])
 
 
+class FilterFlagTest(unittest.TestCase):
+    def test_functions_takes_q_like_strings_and_names(self):
+        for flag in ("-q", "-m", "--match", "--query"):
+            with self.subTest(flag=flag):
+                args = _parser().parse_args(["functions", "a.exe", flag, "crypt"])
+                self.assertEqual(args.match, "crypt")
+
+
+class StatusUrlTest(unittest.TestCase):
+    def test_status_probes_the_url_it_was_given(self):
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, url):
+                seen["url"] = url
+                self.url = url
+
+            def call(self, _cmd):
+                raise OSError("down")
+
+        args = _parser().parse_args(["status", "--url", "http://127.0.0.1:9/"])
+        restore = cli.Client
+        cli.Client = FakeClient  # type: ignore[assignment]
+        try:
+            code = cli.cmd_status(args)
+        finally:
+            cli.Client = restore  # type: ignore[assignment]
+        self.assertEqual(seen["url"], "http://127.0.0.1:9/")
+        self.assertEqual(code, 1)
+
+    def test_status_falls_back_to_host_and_port(self):
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, url):
+                seen["url"] = url
+                self.url = url
+
+            def call(self, _cmd):
+                raise OSError("down")
+
+        args = _parser().parse_args(["status", "--url", "", "--host", "h", "--port", "9"])
+        restore = cli.Client
+        cli.Client = FakeClient  # type: ignore[assignment]
+        try:
+            cli.cmd_status(args)
+        finally:
+            cli.Client = restore  # type: ignore[assignment]
+        self.assertEqual(seen["url"], "http://h:9/")
+
+
 class FriendlyErrorTest(unittest.TestCase):
     def test_a_user_error_loses_the_class(self):
         self.assertEqual(cli._friendly("ValueError: unknown group 'dll'"), "unknown group 'dll'")

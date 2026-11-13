@@ -1739,7 +1739,8 @@ def cmd_stop(args) -> int:
 
 
 def cmd_status(args) -> int:
-    client = Client(f"http://{args.host}:{args.port}/")
+    # --url / GHLAB_URL wins: a daemon on another port is exactly what status is for
+    client = Client(args.url or f"http://{args.host}:{args.port}/")
     pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
     want = session.code_stamp()
     try:
@@ -2060,7 +2061,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("functions", parents=[common], help="list functions")
     p.add_argument("binary")
-    p.add_argument("-m", "--match", default=None, help="regex on function name")
+    # -q is what `strings` and `names` use for the same idea; keep both
+    p.add_argument(
+        "-m", "-q", "--match", "--query", dest="match", default=None, help="regex on function name"
+    )
     p.add_argument("-n", "--limit", type=int, default=60)
     p.set_defaults(
         func=lambda a: _call(
