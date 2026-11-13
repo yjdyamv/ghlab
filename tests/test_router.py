@@ -54,6 +54,66 @@ def target(name: str, port: int, binaries: list[str] | None = None, up: bool = T
     )
 
 
+class LazyClient(FakeClient):
+    """A daemon that only answers once its process exists."""
+
+    def alive(self) -> bool:
+        return self.up
+
+    def call(self, cmd: str, **params: Any) -> Any:
+        if not self.up:
+            raise OSError("connection refused")
+        return super().call(cmd, **params)
+
+
+class AutostartTest(unittest.TestCase):
+    def make(self, owners: dict[str, list[str]]):
+        targets = {name: target(name, 8100 + i) for i, name in enumerate(owners)}
+        clients = {n: LazyClient(t.url, owners[n], up=False) for n, t in targets.items()}
+        started: list[str] = []
+
+        def start(t):
+            started.append(t.name)
+            clients[t.name].up = True
+            return True
+
+        r = router.Router(
+            targets=targets, default="a", clients=clients, start=start, autostart=True
+        )
+        return r, started
+
+    def test_it_starts_the_default_first_and_stops_there(self):
+        r, started = self.make({"a": ["x.exe"], "b": [], "c": []})
+        r.call("decompile", binary="x.exe")
+        self.assertEqual(started, ["a"])
+
+    def test_it_walks_to_the_owner_one_daemon_at_a_time(self):
+        r, started = self.make({"a": [], "b": [], "c": ["x.exe"]})
+        r.call("decompile", binary="x.exe")
+        self.assertEqual(started, ["a", "b", "c"])
+
+    def test_when_nobody_owns_it_the_error_still_names_the_projects(self):
+        r, started = self.make({"a": [], "b": []})
+        with self.assertRaises(router.RouteError) as cm:
+            r.call("decompile", binary="nope.exe")
+        self.assertEqual(started, ["a", "b"])
+        self.assertIn("nope.exe", str(cm.exception))
+
+    def test_autostart_off_means_no_daemon_is_started(self):
+        targets = {"a": target("a", 8100)}
+        started: list[str] = []
+        r = router.Router(
+            targets=targets,
+            default="a",
+            clients={"a": LazyClient(targets["a"].url, [], up=False)},
+            start=lambda t: started.append(t.name) or True,
+            autostart=False,
+        )
+        with self.assertRaises(router.RouteError):
+            r.call("decompile", binary="x.exe")
+        self.assertEqual(started, [])
+
+
 class RouterTest(unittest.TestCase):
     def make(self, **kw):
         targets = {

@@ -2085,18 +2085,29 @@ def _stop_all() -> int:
     pid_paths: list[Path] = []
     seen_paths: set[str] = set()
 
-    def add_pidfile(path: Path, label: str) -> None:
+    def add_pidfile(path: Path, label: str, known_pids: set[int] | None = None) -> None:
         if str(path) in seen_paths:
             return
         seen_paths.add(str(path))
         pid_paths.append(path)
         pid = int(_pidfile(path).get("pid") or 0)
+        # A pidfile can outlive its process, and Windows reuses pids: killing whatever
+        # now wears that number is how a tool stops something it does not own.  When the
+        # process table is readable, trust it over the file.
+        if known_pids is not None and pid not in known_pids:
+            return
         if pid and pid not in labels:
             labels[pid] = label
 
+    table = _process_table()
+    procs = _ghlab_processes(table)
+    # Only pids we can identify as ghlab's own are safe to kill; an unreadable table
+    # means "cannot tell", and then the pidfile is all we have.
+    known_pids = {int(proc["pid"]) for proc in procs} if table else None
     for name, target in projects(load_config()).items():
-        add_pidfile(Path(target.project_dir).expanduser() / ".ghlab.pid", f"daemon {name}")
-    procs = _ghlab_processes()
+        add_pidfile(
+            Path(target.project_dir).expanduser() / ".ghlab.pid", f"daemon {name}", known_pids
+        )
     # A daemon started with an ad-hoc `--project-dir` is not in the config, but it did
     # write its pidfile there -- that file is how we can name it instead of calling it
     # a stray (it is not lost; it is just not registered).
@@ -2105,7 +2116,7 @@ def _stop_all() -> int:
         if not where:
             continue
         path = Path(where).expanduser() / ".ghlab.pid"
-        add_pidfile(path, f"daemon {path.parent.name}")
+        add_pidfile(path, f"daemon {path.parent.name}", known_pids)
     # Two processes can be one daemon: the venv launcher and the interpreter it
     # re-execs share a command line and a port, and either one may be the pid the
     # pidfile recorded.  Calling the other one a stray sends the reader hunting.

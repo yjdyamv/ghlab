@@ -160,6 +160,28 @@ class StopAllTest(unittest.TestCase):
             self.assertEqual(sorted(killed), [10, 11, 30])
             self.assertFalse(pidfile.exists())
 
+    def test_a_pidfile_whose_pid_now_belongs_to_something_else_is_ignored(self):
+        # Windows reuses pids; a stale pidfile must not turn into a kill of a stranger.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._project("proj", 999, root)
+            targets = {
+                "proj": type("T", (), {"project_dir": str(root / "proj"), "url": "http://h:1/"})()
+            }
+            killed: list[int] = []
+
+            def kill(pid, table=None):
+                killed.append(pid)
+                return "killed"
+
+            with (
+                mock.patch.object(cli, "projects", return_value=targets),
+                mock.patch.object(cli, "_process_table", return_value=[_row(50, 1, "code.exe")]),
+                mock.patch.object(cli, "_kill_tree", kill),
+            ):
+                self.assertEqual(cli._stop_all(), 0)
+            self.assertEqual(killed, [])
+
     def test_a_daemon_outside_the_config_is_named_not_called_a_stray(self):
         # `--project-dir` daemons are not in the config, but they did write a pidfile;
         # calling them strays sends the reader looking for a leak that is not there.

@@ -240,10 +240,11 @@ class Router:
             name, clean = self.resolve(cmd, params)
         except RouteError:
             # A down daemon cannot say which binaries it holds, so the owner lookup
-            # fails before autostart gets a chance. Start whatever is down, then retry.
-            if not (self.autostart and self._start is not None) or not self._start_down():
+            # fails before autostart gets a chance: start the default first, look
+            # again, and only then touch the next project.
+            if not (self.autostart and self._start is not None):
                 raise
-            name, clean = self.resolve(cmd, params)
+            name, clean = self._start_owner(cmd, params)
         try:
             return self.client(name).call(cmd, **clean)
         except (RemoteError, OSError):
@@ -253,18 +254,25 @@ class Router:
                 raise
             return self.client(name).call(cmd, **clean)
 
-    def _start_down(self) -> bool:
-        started = False
-        for name, target in self.targets.items():
-            if self.binary_count(name) or self.alive(name):
-                continue
-            if self._start is not None and self._start(target):
-                started = True
-                self._cache.pop(name, None)
-        return started
+    def _start_owner(self, cmd: str, params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        """Start daemons one at a time until one of them owns the binary.
 
-    def binary_count(self, name: str) -> int:
-        return len(self.binaries(name))
+        Starting every project on the first miss costs one JVM each (~1 GB, 30-60 s)
+        for a binary that only one of them has -- and left the rest running.  The
+        default project is tried first because that is where `import` puts things.
+        """
+        order = [self.default] + [name for name in self.targets if name != self.default]
+        for name in order:
+            if self._start is None or self.alive(name):
+                continue
+            if not self._start(self.targets[name]):
+                continue
+            self._cache.pop(name, None)
+            try:
+                return self.resolve(cmd, params)
+            except RouteError:
+                continue  # this one was up already, just not the owner
+        return self.resolve(cmd, params)  # raises with the current picture
 
     # ---- introspection -----------------------------------------------------
     def describe(self, *, refresh: bool = False) -> dict[str, Any]:
