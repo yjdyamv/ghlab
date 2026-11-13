@@ -1079,6 +1079,17 @@ def cmd_serve(args) -> int:
 
     if not _ghidra_env_ok():
         return 2
+    if not _pyghidra_ok():
+        print(
+            f"ghlab: {sys.executable} cannot import jpype/pyghidra, so it cannot host Ghidra",
+            file=sys.stderr,
+        )
+        print(
+            "       install ghlab in the venv that has them, or run this module with that "
+            "interpreter (`ghlab doctor` prints which one)",
+            file=sys.stderr,
+        )
+        return 2
     serve(args.host, args.port, args.project_dir, args.project_name)
     return 0
 
@@ -1245,6 +1256,27 @@ def cmd_doctor(args) -> int:
                 warn=True,
             )
         )
+
+    procs = _ghlab_processes()
+    known = {
+        int(_pidfile(Path(t.project_dir).expanduser() / ".ghlab.pid").get("pid") or 0)
+        for t in projects(load_config()).values()
+    }
+    loose = _strays(procs, known)
+    detail = f"{len(procs)} ghlab process(es)"
+    if loose:
+        detail += ", not in any pidfile: " + ", ".join(
+            f"{p['pid']} {p['role']}" + (f":{p['port']}" if p["port"] else "") for p in loose[:6]
+        )
+    checks.append(
+        _check(
+            "stray processes",
+            not loose,
+            detail,
+            "a leftover daemon keeps its port and project lock; `ghlab stop --all`",
+            warn=True,
+        )
+    )
 
     project = Path(args.project_dir).expanduser()
     writable = False
@@ -1476,8 +1508,48 @@ def cmd_projects(args) -> int:
     return 0
 
 
+def _pyghidra_ok(python: str | None = None) -> bool:
+    """Can that interpreter import the JVM bridge?
+
+    `start` spawns `sys.executable`, so a CLI running from another interpreter (a
+    `uv run`, a system python) would spawn a daemon that dies on `import pyghidra`
+    and only say "exited with 1".  Ask first, cheaply.
+    """
+    exe = python or sys.executable
+    try:
+        done = subprocess.run(
+            [exe, "-c", "import jpype, pyghidra"], capture_output=True, timeout=90
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def _log_tail(path: Path, lines: int = 8) -> str:
+    """The last non-empty lines of the daemon log, indented for a terminal."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = [line for line in text.splitlines() if line.strip()][-lines:]
+    return "\n".join("  " + line for line in tail)
+
+
 def cmd_start(args) -> int:
     client = Client(f"http://{args.host}:{args.port}/")
+    if not client.alive() and not _pyghidra_ok():
+        # spawning would only produce a corpse and a two-line log
+        print(
+            f"ghlab: {sys.executable} cannot import jpype/pyghidra, so a daemon spawned "
+            "from it would die at startup",
+            file=sys.stderr,
+        )
+        print(
+            "       run the CLI with the interpreter that has them "
+            "(`ghlab doctor` prints which one)",
+            file=sys.stderr,
+        )
+        return 2
     pid_path = Path(args.project_dir).expanduser() / ".ghlab.pid"
     running = client.alive()
     if running:
@@ -1556,6 +1628,10 @@ def cmd_start(args) -> int:
             return 0
         if proc.poll() is not None:
             print(f"ghlab: daemon exited with {proc.returncode}", file=sys.stderr)
+            tail = _log_tail(LOGDIR / "ghlab.log")
+            if tail:
+                print(f"  last lines of {LOGDIR / 'ghlab.log'}:", file=sys.stderr)
+                print(tail, file=sys.stderr)
             return 3
         print(".", end="", flush=True)
         time.sleep(2)
@@ -1657,17 +1733,19 @@ def _pidfile_by_port(port: int) -> Path | None:
     return None
 
 
-def _terminate(pid: int) -> str:
-    """Ask a process to exit; returns "killed", "gone" or "denied".
+def _terminate_one(pid: int) -> str:
+    """Ask one process to exit; returns "killed", "gone" or "denied".
 
     Windows has no SIGTERM: `os.kill` there is `TerminateProcess`, and on a pid that
     has already exited it raises a bare `OSError(winerror=87, "invalid parameter")`
     instead of `ProcessLookupError`.  `ghlab stop` died on exactly that, leaving the
-    daemon running.  So on Windows ask `taskkill`, which has a real "no such process"
-    answer, and keep the signal path for POSIX.
+    daemon running.  So on Windows ask `taskkill` (which has a real "no such process"
+    answer), and keep the signal path for POSIX.
     """
     if os.name == "nt":
-        done = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, text=True)
+        done = subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, text=True
+        )
         return "killed" if done.returncode == 0 else "gone"
     try:
         os.kill(pid, 15)
@@ -1678,62 +1756,209 @@ def _terminate(pid: int) -> str:
     return "killed"
 
 
+def _process_table() -> list[dict[str, Any]]:
+    """Every python process: pid, parent pid, command line.  Best effort, no deps.
+
+    Windows has no `ps`; the CIM database has the full command line.  This is the only
+    way to tell a daemon from a stray interpreter, and it is slow (~0.5s), so callers
+    only pay for it when something is wrong.
+    """
+    rows: list[dict[str, Any]] = []
+    if os.name == "nt":
+        script = (
+            "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+            'ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)" }'
+        )
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return []
+        for line in out.splitlines():
+            parts = line.strip().split("	")
+            if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+                continue
+            rows.append({"pid": int(parts[0]), "parent": int(parts[1]), "cmd": parts[2]})
+        return rows
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,args="], capture_output=True, text=True, timeout=15
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        rows.append({"pid": int(parts[0]), "parent": int(parts[1]), "cmd": parts[2]})
+    return rows
+
+
+def _ghlab_processes(table: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """The python processes that are a ghlab daemon or an MCP server.
+
+    A venv `python.exe` is a launcher that re-execs the real interpreter, so a single
+    daemon shows up twice: the shim (the pid a pidfile names) and its child (the one
+    holding the port and the project lock).  Both are returned, because both have to go.
+    """
+    rows = _process_table() if table is None else table
+    found: list[dict[str, Any]] = []
+    for row in rows:
+        cmd = str(row.get("cmd") or "")
+        if "ghlab" not in cmd:
+            continue
+        if "serve" not in cmd and "mcp" not in cmd:
+            continue
+        words = cmd.split()
+        port = 0
+        for index, word in enumerate(words):
+            if word == "--port" and index + 1 < len(words) and words[index + 1].isdigit():
+                port = int(words[index + 1])
+            elif word.startswith("--port=") and word.split("=", 1)[1].isdigit():
+                port = int(word.split("=", 1)[1])
+        found.append(
+            {
+                "pid": int(row["pid"]),
+                "parent": int(row.get("parent") or 0),
+                "role": "mcp" if "mcp" in cmd else "serve",
+                "port": port,
+            }
+        )
+    return found
+
+
+def _descendants(pid: int, table: list[dict[str, Any]]) -> list[int]:
+    """Every pid below `pid`, parents first (a shim's child is the real work)."""
+    kids: list[int] = []
+    frontier = {pid}
+    while frontier:
+        nxt: set[int] = set()
+        for row in table:
+            if row["parent"] in frontier and row["pid"] not in kids and row["pid"] != pid:
+                kids.append(row["pid"])
+                nxt.add(row["pid"])
+        frontier = nxt
+    return kids
+
+
+def _kill_tree(pid: int, table: list[dict[str, Any]] | None = None) -> str:
+    """Kill a process and everything it spawned.
+
+    Killing only the pid a pidfile names leaves the real interpreter running: it keeps
+    the port bound and the project lock held, and the next `ghlab start` reports a lock
+    error that reads like a corrupted project.  That is what "stray python" was.
+    """
+    rows = _process_table() if table is None else table
+    kids = _descendants(pid, rows)
+    how = _terminate_one(pid)
+    for kid in kids:
+        _terminate_one(kid)
+    return how
+
+
+def _terminate(pid: int) -> str:
+    """Backwards-compatible name for `_kill_tree` (older call sites and tests)."""
+    return _kill_tree(pid)
+
+
+def _strays(procs: list[dict[str, Any]], known: set[int]) -> list[dict[str, Any]]:
+    """ghlab processes whose pid and parent are in no pidfile: leftovers."""
+    return [p for p in procs if p["pid"] not in known and p["parent"] not in known]
+
+
+def _stop_all() -> int:
+    """Stop every daemon and every MCP server on this machine, recorded or not.
+
+    Orphans are the reason this exists: a `serve` whose pidfile was lost (ad-hoc
+    --project-dir, a killed terminal) answers on its port and blocks the project lock,
+    and nothing in the CLI would name it.
+    """
+    labels: dict[int, str] = {}
+    pid_paths: list[Path] = []
+    for name, target in projects(load_config()).items():
+        path = Path(target.project_dir).expanduser() / ".ghlab.pid"
+        pid_paths.append(path)
+        pid = int(_pidfile(path).get("pid") or 0)
+        if pid:
+            labels[pid] = f"daemon {name}"
+    procs = _ghlab_processes()
+    known = set(labels)
+    for proc in procs:
+        pid = int(proc["pid"])
+        if pid in labels:
+            continue
+        where = f":{proc['port']}" if proc["port"] else ""
+        kind = "stray" if pid not in known and proc["parent"] not in known else "child"
+        labels[pid] = f"{proc['role']}{where} ({kind})"
+    if not labels:
+        print("ghlab: nothing to stop")
+        return 0
+    killed = 0
+    for pid, label in sorted(labels.items()):
+        how = _kill_tree(pid)
+        killed += how == "killed"
+        print(f"  {how:<8} pid {pid:<7} {label}")
+    for path in pid_paths:
+        path.unlink(missing_ok=True)
+    print(f"ghlab: {killed} process(es) stopped of {len(labels)}")
+    return 0
+
+
 def cmd_stop(args) -> int:
+    if getattr(args, "all", False):
+        return _stop_all()
     host, port = args.host, args.port
     explicit = getattr(args, "project_dir", None)
     pid_path = Path(explicit).expanduser() / ".ghlab.pid" if explicit else _pidfile_by_port(port)
     client = Client(f"http://{host}:{port}/")
-    info: dict[str, Any] = {}
-    pid = 0
-    if pid_path is not None:
-        if not pid_path.exists():
-            print("ghlab: no pidfile; nothing to stop")
-            return 0
-        info = _pidfile(pid_path)
-        pid = int(info.get("pid") or 0)
-        if not pid:
-            print("ghlab: pidfile is unreadable; nothing to stop")
+    # Ask the daemon first: it reports the pid of the interpreter that is really
+    # working, while the pidfile names the venv shim in front of it.
+    info = _daemon_info(host, port)
+    pid = int(info.get("pid") or 0) if info.get("service") == "ghlab" else 0
+    if not pid and pid_path is not None and pid_path.exists():
+        pid = int(_pidfile(pid_path).get("pid") or 0)
+    if not pid:
+        owner = _port_owner(host, port)
+        pid = int(owner) if owner else 0
+    if not pid:
+        print(f"ghlab: nothing listening on {host}:{port}")
+        if pid_path is not None and pid_path.exists():
             pid_path.unlink(missing_ok=True)
-            return 0
-    else:
-        # a daemon started with an ad-hoc --project-dir is in nobody's config, so
-        # _pidfile_by_port cannot find it; ask the daemon itself (GET / reports the pid
-        # it runs under) and only then fall back to netstat
-        info = _daemon_info(host, port)
-        pid = int(info.get("pid") or 0) if info.get("service") == "ghlab" else 0
-        if not pid:
-            owner = _port_owner(host, port)
-            if not owner:
-                print(f"ghlab: nothing listening on {host}:{port}")
-                return 0
-            pid = int(owner)
-    how = _terminate(pid)
+            print("ghlab: removed the stale pidfile")
+        return 0
+    how = _kill_tree(pid)
     if how == "gone":
         print(f"ghlab: pid {pid} already gone")
     elif how == "denied":
         print(f"ghlab: cannot signal pid {pid}", file=sys.stderr)
         return 1
     else:
-        print(f"ghlab: signalled pid {pid}")
-    # the venv python is a shim that re-execs the real interpreter, so the pid we
-    # recorded is the child; wait for the port to actually free, then clean up the
-    # shim parent and anything else still holding the port
+        print(f"ghlab: signalled pid {pid} (and anything it spawned)")
     for _ in range(30):
         if not client.alive():
             break
         time.sleep(0.5)
     if client.alive():
-        for extra in (info.get("parent"), _port_owner(host, port)):
-            if extra and int(extra) != pid:
-                _force_kill(int(extra))
+        # something still answers: name it, then try once more without the table walk
+        left = [p for p in _ghlab_processes() if p["role"] == "serve" and p["port"] in (0, port)]
+        for proc in left:
+            _kill_tree(int(proc["pid"]), table=[])
         for _ in range(20):
             if not client.alive():
                 break
             time.sleep(0.25)
-    if pid_path is not None:
+    if pid_path is not None and not client.alive():
         pid_path.unlink(missing_ok=True)
     if client.alive():
-        print(f"ghlab: still answering on {host}:{port}", file=sys.stderr)
+        pids = ", ".join(str(p["pid"]) for p in left) or "unknown pid"
+        print(
+            f"ghlab: {host}:{port} is still answering ({pids}); try `ghlab stop --all`",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
@@ -1886,6 +2111,26 @@ _CALM_ERRORS = (
 )
 
 
+def _shape_hint(cmd: str, message: str) -> str:
+    """After "missing ['target']", show the command's shape: one line, no --help round trip."""
+    low = message.lower()
+    if (
+        "missing [" not in low
+        and "unknown parameter" not in low
+        and "takes no parameters" not in low
+    ):
+        return ""
+    from . import protocol  # local: cli.py keeps protocol imports inside handlers
+
+    spec = protocol.SPECS.get(cmd)
+    if spec is None:
+        return ""
+    words = [f"{p}=..." for p in spec.required]
+    words += [f"[{p}=...]" for p in spec.optional[:6]]
+    spelling = cmd.replace("_", "-")
+    return f"  shape: ghlab {spelling} {' '.join(words)}   (ghlab {spelling} --help)"
+
+
 def _grouped_help(helps: dict[str, str]) -> str:
     """The `--help` tail: commands by what they do, then a few real invocations."""
     names = list(helps)
@@ -1957,6 +2202,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
     p.add_argument("--port", type=int, default=int(cfg.get("port") or DEFAULT_PORT))
     p.add_argument("--project-dir", help="stop this project's daemon (default: by --port)")
+    p.add_argument(
+        "--all",
+        action="store_true",
+        help="stop every daemon and stray ghlab process on this machine",
+    )
     p.set_defaults(func=cmd_stop)
 
     p = sub.add_parser("status", parents=[common, daemon], help="daemon health")
@@ -2921,6 +3171,9 @@ def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
     except RemoteError as ex:
         debug = bool(os.environ.get("GHLAB_DEBUG"))
         print(f"ghlab: {str(ex) if debug else _friendly(str(ex))}", file=sys.stderr)
+        shape = _shape_hint(cmd, str(ex))
+        if shape:
+            print(shape, file=sys.stderr)
         if ex.trace and debug:
             print(ex.trace, file=sys.stderr)
         return 1

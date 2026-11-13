@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -37,13 +38,39 @@ class Client:
                 payload = json.loads(ex.read())
             except Exception:  # noqa: BLE001
                 raise RemoteError(f"HTTP {ex.code}: {ex.reason}") from ex
-        except urllib.error.URLError as ex:
+        except TimeoutError as ex:
             raise RemoteError(
-                f"cannot reach {self.url} ({ex.reason}); start it with `ghlab start`"
+                f"the daemon did not answer within {self.timeout:g}s; a long analysis may "
+                f"still be running -- `ghlab job --list` or `ghlab ping` show what it is doing"
             ) from ex
+        except urllib.error.URLError as ex:
+            # The OS message is localised (and mojibake in a non-UTF console), so name the
+            # situation instead: an agent reading this needs the next command, not errno text.
+            reason = getattr(ex, "reason", ex)
+            debug = bool(os.environ.get("GHLAB_DEBUG"))
+            if isinstance(reason, ConnectionRefusedError):
+                message = f"nothing is listening on {self.url}"
+            else:
+                message = f"cannot reach {self.url}"
+            if debug:
+                message += f" ({reason})"
+            port = self._port()
+            message += (
+                f"; start it with `ghlab start --port {port}`"
+                if port
+                else "; start it with `ghlab start`"
+            )
+            raise RemoteError(message) from ex
         if not payload.get("ok"):
             raise RemoteError(payload.get("error", "unknown error"), payload.get("trace", ""))
         return payload
+
+    def _port(self) -> int:
+        """The port in `self.url`, or 0: useful for "start it with --port N"."""
+        try:
+            return int(urllib.parse.urlsplit(self.url).port or 0)
+        except ValueError:
+            return 0
 
     def call(self, cmd: str, **params: Any) -> Any:
         return self.raw({"cmd": cmd, **params})["result"]

@@ -56,6 +56,7 @@ ghlab doctor                         # 逐项检查 Ghidra/JDK/pyghidra/wheels/d
   ok    offline wheels       25 wheel(s)
   ok    daemon               http://127.0.0.1:8765/ project=... binaries=4 busy=-
   warn  daemon code          running=3b57affee3fa installed=210d7b59c8bb
+  ok    stray processes      0 ghlab process(es)
   ok    project dir          C:\Users\admin\re\proj
   ok    versions             ghlab 0.1.0 | python 3.12.16 | Windows-11-...
 ```
@@ -72,11 +73,19 @@ Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`，`export GHID
 | 路径 | 实测（`C:\...`、venv shim） | 全部走 `pathlib`；`~/.ghlab/focus`、`<project>/.ghlab/*` 用 home 相对路径 |
 | 安装 | 实测（Ghidra 自带 wheel 离线装） | 同样吃 Ghidra 发行包里的 `pypkg/dist`（含该平台 jpype1 wheel）；若目录里没有对应平台 wheel，就只能 `uv pip install pyghidra`（需联网） |
 
-已知未覆盖：Windows 专属的“venv shim 父进程”处理在 POSIX 上是空转；`ghlab stop` 在 POSIX 靠 `lsof`/`ss` 找残留监听进程，两个都没装时只能靠 pidfile 的 pid。
+`ghlab start` 会先确认**它自己要 spawn 的那个解释器**能 `import jpype, pyghidra`；不能就直接拒绝（`uv run python -m ghlab.cli start` 这种会 spawn 出必死的 daemon，以前只留下一句 `daemon exited with 1`）。现在 daemon 真的起不来时，`start` 会把日志最后 8 行打到终端。
+
+关于“残留 python”：venv 的 `python.exe` 是个 launcher，它会再 exec 一个真解释器当子进程，**占端口和项目锁的是那个子进程**，而 pidfile 记的是 launcher。所以 `ghlab stop` 现在杀整棵进程树（Windows `taskkill /F /T`，POSIX 杀 pid 及其后代），并且优先用 daemon 自己上报的 pid；`ghlab stop --all` 连 pidfile 丢了、终端被关掉的孤儿一起收。`ghlab doctor` 的 `stray processes` 一行会列出“跑着但不在任何 pidfile 里”的进程。
+
+已知未覆盖：`ghlab stop --all` 依赖系统自带的进程列表（Windows 走 PowerShell 的 CIM 查询，POSIX 走 `ps`）；两个都拿不到时只能靠 pidfile 与端口探测。
 
 ## 用法
 
 ```bash
+ghlab stop                           # 停默认端口上的 daemon（默认端口）
+ghlab stop --port 8775               # 停临时项目起的那个
+ghlab stop --all                     # 连孤儿 daemon / MCP 服务一起收（换机器、杀不干净时用）
+
 ghlab import C:/Windows/System32/notepad.exe   # 导入 + 全量分析（约 75s，仅一次）
 ghlab import big.exe --no-analyze              # 只导入：字符串/导入立刻可查，分析稍后补
 ghlab import fw.bin --show-loaders             # 这个文件能被哪些 loader/语言组合导入
