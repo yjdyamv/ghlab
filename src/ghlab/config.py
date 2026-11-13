@@ -71,7 +71,21 @@ def default_host() -> str:
 
 
 def default_port() -> int:
+    """GHLAB_PORT, then the setup file, then 8765 -- one place that decides."""
     return int(os.environ.get("GHLAB_PORT") or load_config().get("port") or DEFAULT_PORT)
+
+
+def default_project_dir() -> str:
+    """Where a project lives when nothing said otherwise.
+
+    GHLAB_PROJECT_DIR exists so that an MCP entry (or a shell profile) can point at a
+    project without repeating it in every command; `~/re/proj` is only the last resort.
+    """
+    return os.environ.get("GHLAB_PROJECT_DIR") or str(Path.home() / "re" / "proj")
+
+
+def default_project_name() -> str:
+    return os.environ.get("GHLAB_PROJECT_NAME") or "ghlab"
 
 
 @dataclass(frozen=True)
@@ -137,9 +151,9 @@ def projects(cfg: dict[str, Any] | None = None) -> dict[str, Target]:
         else:
             out["default"] = Target(
                 name="default",
-                url=f"http://{default_host()}:{DEFAULT_PORT}",
-                project_dir=str(Path.home() / "re" / "proj"),
-                project_name="ghlab",
+                url=f"http://{default_host()}:{default_port()}",
+                project_dir=default_project_dir(),
+                project_name=default_project_name(),
             )
     return out
 

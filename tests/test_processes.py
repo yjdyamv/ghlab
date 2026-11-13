@@ -9,6 +9,8 @@ success while the port stayed busy.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -52,6 +54,18 @@ class GhlabProcessesTest(unittest.TestCase):
         self.assertEqual([p["pid"] for p in procs], [10, 11, 12])
         self.assertEqual([p["role"] for p in procs], ["serve", "serve", "mcp"])
         self.assertEqual([p["port"] for p in procs], [8775, 8775, 0])
+
+    def test_the_project_dir_is_read_off_the_command_line(self):
+        win = chr(92) * 1
+        path = f"C:{win}re{win}tmp{win}verify"
+        procs = cli._ghlab_processes(
+            [
+                _row(1, 0, f"python -m ghlab.cli serve --port 8775 --project-dir {path}"),
+                _row(2, 0, "python -m ghlab.cli serve --port 8776 --project-dir=C:/re/proj"),
+                _row(3, 0, "python -m ghlab.cli serve --port 8777"),
+            ]
+        )
+        self.assertEqual([p["project_dir"] for p in procs], [path, "C:/re/proj", ""])
 
     def test_port_equals_form_is_understood(self):
         procs = cli._ghlab_processes([_row(1, 0, "python -m ghlab.cli serve --port=8766")])
@@ -145,6 +159,40 @@ class StopAllTest(unittest.TestCase):
                 self.assertEqual(cli._stop_all(), 0)
             self.assertEqual(sorted(killed), [10, 11, 30])
             self.assertFalse(pidfile.exists())
+
+    def test_a_daemon_outside_the_config_is_named_not_called_a_stray(self):
+        # `--project-dir` daemons are not in the config, but they did write a pidfile;
+        # calling them strays sends the reader looking for a leak that is not there.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._project("verify", 20, root)
+            procs = cli._ghlab_processes(
+                [
+                    _row(
+                        20,
+                        1,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                    _row(
+                        21,
+                        20,
+                        f"python -m ghlab.cli serve --port 8775 --project-dir {root / 'verify'}",
+                    ),
+                ]
+            )
+            out = io.StringIO()
+            with (
+                mock.patch.object(cli, "projects", return_value={}),
+                mock.patch.object(cli, "_ghlab_processes", return_value=procs),
+                mock.patch.object(cli, "_kill_tree", lambda *_a, **_k: "killed"),
+                contextlib.redirect_stdout(out),
+            ):
+                self.assertEqual(cli._stop_all(), 0)
+            text = out.getvalue()
+            self.assertIn("daemon verify", text)
+            self.assertNotIn("(stray)", text)
+            self.assertIn("serve:8775 (child)", text)
+            self.assertFalse((root / "verify" / ".ghlab.pid").exists())
 
     def test_nothing_to_stop_needs_no_process_table(self):
         with (

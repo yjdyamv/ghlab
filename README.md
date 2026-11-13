@@ -75,7 +75,7 @@ Linux/macOS 同理，把 `Scripts/python.exe` 换成 `bin/python`，`export GHID
 
 `ghlab start` 会先确认**它自己要 spawn 的那个解释器**能 `import jpype, pyghidra`；不能就直接拒绝（`uv run python -m ghlab.cli start` 这种会 spawn 出必死的 daemon，以前只留下一句 `daemon exited with 1`）。现在 daemon 真的起不来时，`start` 会把日志最后 8 行打到终端。
 
-关于“残留 python”：venv 的 `python.exe` 是个 launcher，它会再 exec 一个真解释器当子进程，**占端口和项目锁的是那个子进程**，而 pidfile 记的是 launcher。所以 `ghlab stop` 现在杀整棵进程树（Windows `taskkill /F /T`，POSIX 杀 pid 及其后代），并且优先用 daemon 自己上报的 pid；`ghlab stop --all` 连 pidfile 丢了、终端被关掉的孤儿一起收。`ghlab doctor` 的 `stray processes` 一行会列出“跑着但不在任何 pidfile 里”的进程。
+关于“残留 python”：venv 的 `python.exe` 是个 launcher，它会再 exec 一个真解释器当子进程，**占端口和项目锁的是那个子进程**，而 pidfile 记的是 launcher。所以 `ghlab stop` 现在杀整棵进程树（Windows `taskkill /F /T`，POSIX 杀 pid 及其后代），并且优先用 daemon 自己上报的 pid；`ghlab stop --all` 连 pidfile 丢了、终端被关掉的孤儿一起收。`ghlab doctor` 的 `stray processes` 一行会列出“跑着但不在任何 pidfile 里”的进程。用 `--project-dir` 起在配置之外的项目不会被当成孤儿：`stop --all` 会从进程命令行里读出它的 `--project-dir`，按那个目录的 `.ghlab.pid` 给它起名字（`daemon verify`），只有真的没有归属的才标 `(stray)`。
 
 已知未覆盖：`ghlab stop --all` 依赖系统自带的进程列表（Windows 走 PowerShell 的 CIM 查询，POSIX 走 `ps`）；两个都拿不到时只能靠 pidfile 与端口探测。
 
@@ -359,6 +359,7 @@ pi 里注册（`ghlab setup --print-mcp` 会按本机真实路径打印可直接
 | `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `exports` | `binary` / `match, query, limit` | **导出面**：这个二进制对外开放的入口（PE 导出表 / ELF `.dynsym`），每个都附还原后的 C++ 名字（`_Z`/`?` 开头的走 Ghidra 自带 demangler）。`imports` 问"我调用了谁"，这个问"别人能调用我什么"——拿到 DLL/SO 先看它，能直接看出 SDK 边界与插件入口 |
+| `names` | `binary` / `query, limit, min_len` | **从断言串还原方法名**：C++/Rust 的 `Class::Method : failure` 一类字符串里带着符号名，建表后可用 `--query` 按正则查（忽略大小写）。表缓存在项目里，`--refresh` 重建；`sub_1400xxxx` 变成可读名字后，`xrefs`/`slice` 的结论才好读 |
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii。一次 `getBytes` 读完（不是逐字节），按“包含首地址的已初始化块”截断，上限 64 KiB；读短了或超上限返回 `size` 与 `truncated: true` |
 | `scan` | `binary, offset`（或 `hex`）/ `range, func, limit, op, stack, imm, writes, sequence, window` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）。给 `--hex` 则改成**掩码字节搜索**（`48 8B ?? 05`），返回命中地址 + 所在段 + 所属函数。实测 650 万条指令 38s |
 | `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |

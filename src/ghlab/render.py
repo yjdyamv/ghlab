@@ -38,15 +38,27 @@ def _label(node: dict[str, Any]) -> str:
     return f"{node['name']} ({node.get('size', 0)}b)"
 
 
+def _quoted(text: str) -> str:
+    """A DOT/Mermaid string literal: quotes and newlines would end the label early."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def _mermaid(text: str) -> str:
+    """Mermaid escapes a quote as an entity, not with a backslash."""
+    newline = chr(10)
+    return '"' + text.replace('"', "#quot;").replace(newline, " ") + '"'
+
+
 def dot(result: dict[str, Any]) -> str:
     lines = ["digraph calls {", "  rankdir=LR;", "  node [shape=box, fontname=monospace];"]
     for node in result.get("nodes") or []:
         style = (
             ", style=filled, fillcolor=lightyellow" if node["name"] == result.get("root") else ""
         )
-        lines.append(f'  "{node["name"]}" [label="{_label(node)}"{style}];')
+        lines.append(f"  {_quoted(node['name'])} [label={_quoted(_label(node))}{style}];")
     for edge in result.get("edges") or []:
-        lines.append(f'  "{edge["from"]}" -> "{edge["to"]}";')
+        lines.append(f"  {_quoted(edge['from'])} -> {_quoted(edge['to'])};")
     lines.append("}")
     return "\n".join(lines)
 
@@ -55,7 +67,7 @@ def mermaid(result: dict[str, Any]) -> str:
     lines = ["flowchart LR"]
     ids = {node["name"]: f"n{i}" for i, node in enumerate(result.get("nodes") or [])}
     for node in result.get("nodes") or []:
-        lines.append(f'  {ids[node["name"]]}["{_label(node)}"]')
+        lines.append(f"  {ids[node['name']]}[{_mermaid(_label(node))}]")
     for edge in result.get("edges") or []:
         if edge["from"] in ids and edge["to"] in ids:
             lines.append(f"  {ids[edge['from']]} --> {ids[edge['to']]}")

@@ -31,6 +31,8 @@ class ClientLike(Protocol):
 
     def call(self, cmd: str, **params: Any) -> Any: ...
 
+    def info(self) -> dict[str, Any]: ...
+
 
 AGGREGATE = ("binaries", "overview")
 DIFF_PAIR = ("a", "b")
@@ -38,11 +40,6 @@ DIFF_PAIR = ("a", "b")
 
 class RouteError(RuntimeError):
     """The call cannot be sent as asked; the message says what to do about it."""
-
-
-def _port_of(url: str) -> int:
-    tail = url.rsplit(":", 1)[-1].strip("/")
-    return int(tail) if tail.isdigit() else 0
 
 
 class Router:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 
 from ghlab import cli
@@ -115,6 +117,30 @@ class StatusUrlTest(unittest.TestCase):
             cli.Client = restore  # type: ignore[assignment]
         self.assertEqual(seen["url"], "http://127.0.0.1:9/")
         self.assertEqual(code, 1)
+
+    def test_status_trusts_the_daemons_own_stamp(self):
+        # a daemon started by `serve` (or from another directory) has no pidfile here;
+        # it still knows which code it is running, and that is what status must report
+        from ghlab import session
+
+        class FakeClient:
+            def __init__(self, url):
+                self.url = url
+
+            def call(self, _cmd):
+                return {"service": "ghlab", "stamp": session.code_stamp(), "binaries": 1}
+
+        args = _parser().parse_args(["status", "--url", "http://127.0.0.1:9/"])
+        out = io.StringIO()
+        restore = cli.Client
+        cli.Client = FakeClient  # type: ignore[assignment]
+        try:
+            with contextlib.redirect_stdout(out):
+                code = cli.cmd_status(args)
+        finally:
+            cli.Client = restore  # type: ignore[assignment]
+        self.assertEqual(code, 0)
+        self.assertIn(f"code={session.code_stamp()} [current]", out.getvalue())
 
     def test_status_falls_back_to_host_and_port(self):
         seen = {}

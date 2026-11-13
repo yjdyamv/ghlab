@@ -10,6 +10,7 @@ anywhere.
 
 from __future__ import annotations
 
+import difflib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -21,6 +22,19 @@ DEFAULT_HOST = "127.0.0.1"
 
 class ProtocolError(ValueError):
     """Bad request: unknown command, missing/extra parameter, wrong type."""
+
+
+def _did_you_mean(given: list[Any], known: Any) -> str:
+    """`; did you mean decompile?` — a list of 47 names is noise, one good guess is not."""
+    names = list(known)
+    hits: list[str] = []
+    for item in given:
+        if not isinstance(item, str):
+            continue
+        for hit in difflib.get_close_matches(item, names, n=1, cutoff=0.6):
+            if hit not in hits:
+                hits.append(hit)
+    return f"; did you mean {', '.join(hits)}?" if hits else ""
 
 
 @dataclass(frozen=True)
@@ -40,7 +54,8 @@ class Spec:
         unknown = sorted(k for k in params if k not in allowed)
         if unknown:
             raise ProtocolError(
-                f"{self.name}: unknown parameter(s) {unknown}; allowed={sorted(allowed)}"
+                f"{self.name}: unknown parameter(s) {unknown}"
+                f"{_did_you_mean(unknown, allowed)}; allowed={sorted(allowed)}"
             )
         return dict(params)
 
@@ -325,7 +340,10 @@ def validate(request: dict[str, Any]) -> tuple[Spec, dict[str, Any]]:
         raise ProtocolError("request must be a JSON object")
     cmd = request.get("cmd")
     if not isinstance(cmd, str) or cmd not in SPECS:
-        raise ProtocolError(f"unknown cmd {cmd!r}; known={COMMAND_NAMES}")
+        raise ProtocolError(
+            f"unknown cmd {cmd!r}{_did_you_mean([cmd] if isinstance(cmd, str) else [], SPECS)}"
+            "; `GET /` on the daemon lists every command with its parameters"
+        )
     params = {k: v for k, v in request.items() if k != "cmd"}
     return SPECS[cmd], SPECS[cmd].check(params)
 

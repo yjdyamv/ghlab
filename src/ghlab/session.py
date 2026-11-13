@@ -19,7 +19,8 @@ from typing import Any
 
 from . import config, render
 
-MONITOR = None
+# The daemon's ConsoleTaskMonitor: the handle `job`/`cancel` reach through.
+MONITOR: Any = None
 LOCK = threading.RLock()
 # What the dispatcher is running right now. Requests are threaded, but every
 # Ghidra call takes LOCK, so exactly one command runs at a time and this is also
@@ -77,7 +78,7 @@ def project():
     from ghidra.framework.model import ProjectLocator
 
     if _project_dir is None:
-        configure(Path.home() / "re" / "proj")
+        configure(Path(config.default_project_dir()))
     loc = str(_project_dir)
     if ProjectLocator(loc, _project_name).exists():
         _proj = GhidraProject.openProject(loc, _project_name, True)
@@ -99,6 +100,38 @@ def binary_names() -> list[str]:
     return sorted(str(f.getName()) for f in proj.getRootFolder().getFiles())
 
 
+def _num(a: dict[str, Any], key: str, default: int, *, minimum: int | None = None) -> int:
+    """One integer argument, with a message that names it.
+
+    `limit=all` used to surface as `ValueError: invalid literal for int() with base 10:
+    'all'`, which names neither the argument nor the fix.  `True` is refused rather than
+    becoming 1: a boolean in a numeric slot is a caller bug, not a limit of one.
+    """
+    value = a.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a number, got {value!r}")
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number, got {value!r}") from None
+    if minimum is not None and out < minimum:
+        raise ValueError(f"{key} must be >= {minimum}, got {out}")
+    return out
+
+
+def _binary_hint(binary: str, names: list[str]) -> str:
+    """Why a name missed, in the terms the caller used: a path, a typo, an empty project."""
+    if not names:
+        return "the project has no programs yet; `ghlab import <path>` adds one"
+    if any(sep in binary for sep in ("/", "\\")):
+        return f"that looks like a path; programs are named by file name ({len(names)} available)"
+    near = difflib.get_close_matches(binary, names, n=2, cutoff=0.6)
+    if near:
+        return f"did you mean {', '.join(near)}?"
+    shown = ", ".join(names[:12]) + (" ..." if len(names) > 12 else "")
+    return f"project has {shown}"
+
+
 def _entry(binary: str) -> dict[str, Any]:
     """Open (and cache) one program; `binary` may be a unique substring."""
     if binary in _programs:
@@ -107,8 +140,13 @@ def _entry(binary: str) -> dict[str, Any]:
     names = binary_names()
     if binary not in names:
         cand = [n for n in names if binary.lower() in n.lower()]
-        if len(cand) != 1:
-            raise KeyError(f"binary {binary!r} not found; project has {names}")
+        if len(cand) > 1:
+            shown = ", ".join(cand[:8]) + (" ..." if len(cand) > 8 else "")
+            raise KeyError(
+                f"binary {binary!r} matches {len(cand)} programs ({shown}); name one exactly"
+            )
+        if not cand:
+            raise KeyError(f"binary {binary!r} not found: {_binary_hint(binary, names)}")
         binary = cand[0]
         # the substring spelling may still hit an already-open program
         if binary in _programs:
@@ -393,6 +431,9 @@ def ping(_: dict[str, Any]) -> dict[str, Any]:
         "project": project_location(),
         "binaries": len(binary_names()),
         "loaded": sorted(_programs),
+        # the code this process is actually running: `ghlab status` compares it with
+        # what is installed, and it must not depend on finding a pidfile first
+        "stamp": code_stamp(),
     }
     if readonly():
         out["readonly"] = True
@@ -682,8 +723,8 @@ def cmd_info(a: dict[str, Any]) -> dict[str, Any]:
 def cmd_functions(a: dict[str, Any]) -> dict[str, Any]:
     p = _entry(a["binary"])["program"]
     pat = re.compile(a.get("match") or ".*", re.I)
-    limit = int(a.get("limit", 100))
-    skip = int(a.get("offset", 0))
+    limit = _num(a, "limit", 100)
+    skip = _num(a, "offset", 0)
     total = 0
     out = []
     for fn in p.getFunctionManager().getFunctions(True):
@@ -709,7 +750,7 @@ def _grep_code(code: str, pattern: re.Pattern[str]) -> list[dict[str, Any]]:
 
 
 def _cache_dir() -> Path:
-    base = _project_dir or (Path.home() / "re" / "proj")
+    base = _project_dir or Path(config.default_project_dir())
     d = Path(base) / ".ghlab" / "cache"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -797,11 +838,11 @@ def cmd_decompile(a: dict[str, Any]) -> dict[str, Any]:
     e = _entry(a["binary"])
     program = e["program"]
     fm = program.getFunctionManager()
-    timeout = int(a.get("timeout", 60))
-    max_lines = int(a.get("max_lines", 0))
+    timeout = _num(a, "timeout", 60)
+    max_lines = _num(a, "max_lines", 0)
     grep = re.compile(a["grep"], re.I) if a.get("grep") else None
     include_code = bool(a.get("include_code", grep is None))
-    limit = int(a.get("limit", 25))
+    limit = _num(a, "limit", 25)
 
     targets: list[Any] = []
     if a.get("targets"):
@@ -924,7 +965,7 @@ def cmd_imports(a: dict[str, Any]) -> dict[str, Any]:
     group = a.get("group")
     if group and group not in RISK:
         raise ValueError(f"unknown group {group!r}; pick one of {', '.join(sorted(RISK))}")
-    limit = int(a.get("limit", 0))
+    limit = _num(a, "limit", 0)
     fm = p.getFunctionManager()
     rm = p.getReferenceManager()
     rows: list[dict[str, Any]] = []
@@ -1031,7 +1072,7 @@ def cmd_exports(a: dict[str, Any]) -> dict[str, Any]:
     p = _entry(binary)["program"]
     pattern = a.get("match") or a.get("query")
     rx = re.compile(str(pattern), re.I) if pattern else None
-    limit = int(a.get("limit", 0))
+    limit = _num(a, "limit", 0)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for sym in p.getSymbolTable().getAllSymbols(True):
@@ -1506,7 +1547,7 @@ def cmd_offsets(a: dict[str, Any]) -> dict[str, Any]:
         hint = _function_suggestions(e["program"], target)
         raise KeyError(f"function {target!r} not found{hint}")
     began = time.monotonic()
-    res = e["decomp"].decompileFunction(fn, int(a.get("timeout", 60)), MONITOR)
+    res = e["decomp"].decompileFunction(fn, _num(a, "timeout", 60), MONITOR)
     if not res.decompileCompleted():
         return {
             "binary": binary,
@@ -1563,7 +1604,7 @@ def cmd_offsets(a: dict[str, Any]) -> dict[str, Any]:
     for row in rows:
         key = (row["base"], row["kind"], row["offset"])
         counts[key] = counts.get(key, 0) + 1
-    limit = int(a.get("limit", 120))
+    limit = _num(a, "limit", 120)
     accesses = [
         {"base": base, "kind": kind, "offset": offset, "count": count}
         for (base, kind, offset), count in sorted(
@@ -1765,7 +1806,7 @@ def cmd_struct(a: dict[str, Any]) -> dict[str, Any]:
     fn = _function(e, target)
     if fn is None:
         raise KeyError(f"function {target!r} not found{_function_suggestions(p, target)}")
-    res = e["decomp"].decompileFunction(fn, int(a.get("timeout", 60)), MONITOR)
+    res = e["decomp"].decompileFunction(fn, _num(a, "timeout", 60), MONITOR)
     if not res.decompileCompleted():
         raise ValueError(f"decompiler said: {_decomp_failure(res)}")
     rows = _param_accesses(res.getHighFunction())
@@ -1922,7 +1963,7 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     """
     binary = a["binary"]
     p = _entry(binary)["program"]
-    limit = int(a.get("limit", 60))
+    limit = _num(a, "limit", 60)
     if limit <= 0:
         raise ValueError("limit must be positive")
     start, end = _scan_bounds(p, a)
@@ -1944,7 +1985,7 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     if len(offsets) < 2:
         a["sequence"] = False
     if a.get("sequence"):
-        window = int(a.get("window", 32))
+        window = _num(a, "window", 32)
         if window < 1:
             raise ValueError("window must be >= 1")
         return _scan_sequence(
@@ -2168,7 +2209,7 @@ def load_names(entry, refresh: bool = False, min_len: int = 12) -> dict[str, Any
 def cmd_names(a: dict[str, Any]) -> dict[str, Any]:
     """Recover method names from assertion strings."""
     entry = _entry(a["binary"])
-    table = load_names(entry, refresh=bool(a.get("refresh")), min_len=int(a.get("min_len", 12)))
+    table = load_names(entry, refresh=bool(a.get("refresh")), min_len=_num(a, "min_len", 12))
     query = a.get("query") or ""
     pattern = re.compile(query, re.I) if query else None
     rows = []
@@ -2176,7 +2217,7 @@ def cmd_names(a: dict[str, Any]) -> dict[str, Any]:
         if pattern is not None and not pattern.search(name):
             continue
         rows.append({"name": name, **row})
-    limit = int(a.get("limit", 200))
+    limit = _num(a, "limit", 200)
     return {
         "binary": a["binary"],
         "count": len(table["names"]),
@@ -2192,8 +2233,8 @@ def cmd_strings(a: dict[str, Any]) -> dict[str, Any]:
     entry = _entry(a["binary"])
     p = entry["program"]
     q = (a.get("query") or "").lower()
-    limit = int(a.get("limit", 200))
-    skip = int(a.get("offset", 0))
+    limit = _num(a, "limit", 200)
+    skip = _num(a, "offset", 0)
     want_refs = bool(a.get("refs"))
     table = load_strings(entry, refresh=bool(a.get("refresh")))
     out = []
@@ -2240,7 +2281,7 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
             fn = _function(e, t)
             addr = fn.getEntryPoint() if fn else _addr(e, t)
         refs = []
-        limit = int(a.get("limit", 400))
+        limit = _num(a, "limit", 400)
         for r in p.getReferenceManager().getReferencesTo(addr):
             holder = p.getFunctionManager().getFunctionContaining(r.getFromAddress())
             refs.append(
@@ -2294,7 +2335,7 @@ def cmd_bytes(a: dict[str, Any]) -> dict[str, Any]:
     e = _entry(a["binary"])
     p = e["program"]
     addr = _addr(e, a["addr"])
-    size = int(a.get("size", 64))
+    size = _num(a, "size", 64)
     if size <= 0:
         raise ValueError("size must be positive")
     capped = min(size, MAX_BYTES)
@@ -2362,8 +2403,8 @@ def cmd_graph(a: dict[str, Any]) -> dict[str, Any]:
     """Breadth-first call tree. direction: calling (callees) | called (callers)."""
     e = _entry(a["binary"])
     direction = str(a.get("direction", "calling"))
-    depth = int(a.get("depth", 2))
-    cap = int(a.get("limit", 80))
+    depth = _num(a, "depth", 2)
+    cap = _num(a, "limit", 80)
     root = _function(e, a["target"])
     if root is None:
         raise KeyError(f"function {a['target']!r} not found")
@@ -2627,8 +2668,8 @@ def _size_buckets(program) -> dict[str, int]:
 def cmd_digest(a: dict[str, Any]) -> dict[str, Any]:
     """One call, whole-picture triage — composition of existing commands only."""
     p = _entry(a["binary"])["program"]
-    top = int(a.get("top", 8))
-    per_kind = int(a.get("strings", 3))
+    top = _num(a, "top", 8)
+    per_kind = _num(a, "strings", 3)
     imports = _imports(p)
     names = [i["name"] for i in imports]
     low_names = [n.lower() for n in names]
@@ -2683,7 +2724,7 @@ def cmd_find(a: dict[str, Any]) -> dict[str, Any]:
     Reads the persistent index, so repeats cost milliseconds instead of a full scan.
     """
     e = _entry(a["binary"])
-    limit = int(a.get("limit", 20))
+    limit = _num(a, "limit", 20)
     any_mode = bool(a.get("any", False))
     filters = {
         "import": [re.compile(x, re.I) for x in _as_list(a.get("import"))],
@@ -2756,7 +2797,7 @@ def _find_by_scan(a: dict[str, Any]) -> dict[str, Any]:
     e = _entry(a["binary"])
     p = e["program"]
     fm = p.getFunctionManager()
-    limit = int(a.get("limit", 20))
+    limit = _num(a, "limit", 20)
     any_mode = bool(a.get("any", False))
     filters = {
         "import": [re.compile(x, re.I) for x in _as_list(a.get("import"))],
@@ -2932,7 +2973,7 @@ _INDEX_SET_KEYS = ("strings", "imports", "consts", "callees")
 
 
 def _ghlab_dir() -> Path:
-    base = _project_dir or (Path.home() / "re" / "proj")
+    base = _project_dir or Path(config.default_project_dir())
     d = Path(base) / ".ghlab"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -3262,9 +3303,9 @@ def cmd_diff(a: dict[str, Any]) -> dict[str, Any]:
     left = _program_fingerprints(a["a"])
     right = _program_fingerprints(a["b"])
     la, lb = left["functions"], right["functions"]
-    limit = int(a.get("limit", 25))
+    limit = _num(a, "limit", 25)
     min_score = float(a.get("min_score", 0.55))
-    detail = max(0, int(a.get("detail", 0)))
+    detail = max(0, _num(a, "detail", 0))
 
     pattern = None
     if a.get("match"):
@@ -3846,8 +3887,8 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
     if fn is None:
         raise KeyError(f"function {a['target']!r} not found")
 
-    max_insns = int(a.get("max_insns", 200000))
-    ms = int(a.get("ms", 5000))
+    max_insns = _num(a, "max_insns", 200000)
+    ms = _num(a, "ms", 5000)
     block = _scratch_block(program)
     base = int(block.getStart().getOffset())
     size = int(block.getSize())
@@ -3867,7 +3908,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
 
     space = program.getAddressFactory().getDefaultAddressSpace()
     cursor = string_at
-    buf_size = int(a.get("buffer") or 0)
+    buf_size = _num(a, "buffer", 0)
     if buf_size > 0x700:
         raise ValueError("buffer is capped at 0x700 bytes inside the scratch block")
     buf_addr = base + 0x600
@@ -4207,7 +4248,7 @@ def cmd_decrypt(a: dict[str, Any]) -> dict[str, Any]:
         offset = _hex_addr(a.get("addr"))
         if offset is None:
             raise KeyError(f"address {a.get('addr')!r} not found")
-        size = int(a.get("len", 0) or 64)
+        size = _num(a, "len", 64)
         if size <= 0 or size > 0x4000:
             raise ValueError("len must be between 1 and 16384")
         space = program.getAddressFactory().getDefaultAddressSpace()
@@ -4215,7 +4256,7 @@ def cmd_decrypt(a: dict[str, Any]) -> dict[str, Any]:
         source = f"{a['binary']}@{hex(offset)}"
     ciphers = _as_list(a.get("ciphers")) or ["xor", "add", "rot", "utf16", "base64"]
     min_printable = float(a.get("min_printable", 0.85))
-    limit = int(a.get("limit", 5))
+    limit = _num(a, "limit", 5)
     found = _decrypt_candidates(data, ciphers, min_printable)[:limit]
     return {
         "source": source,
@@ -4526,7 +4567,7 @@ def cmd_revert(a: dict[str, Any]) -> dict[str, Any]:
 
 def _patch_dir() -> Path:
     """Where the bytes a `patch` overwrote are kept so they can be put back."""
-    base = _project_dir or (Path.home() / "re" / "proj")
+    base = _project_dir or Path(config.default_project_dir())
     d = Path(base) / ".ghlab" / "patches"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -5000,7 +5041,7 @@ def cmd_fid(a: dict[str, Any]) -> dict[str, Any]:
             "no .fidb libraries are installed; put one in Ghidra's FunctionID folder "
             "(`ghlab fid --list` shows the directory Ghidra searches)"
         )
-    cap = int(a.get("limit") or 200)
+    cap = _num(a, "limit", 200)
     started = time.monotonic()
     before, truncated = _name_snapshot(p)
     analyzer = _run_fid_analyzer(p)
@@ -5034,7 +5075,7 @@ def cmd_bookmark(a: dict[str, Any]) -> dict[str, Any]:
     category = str(a.get("category") or "ghlab")
     if action == "list":
         out = []
-        cap = int(a.get("limit", 100))
+        cap = _num(a, "limit", 100)
         it = bm.getBookmarksIterator()
         while it.hasNext() and len(out) < cap:
             b = it.next()
@@ -5271,7 +5312,7 @@ def _claims_status(rows: list[dict[str, Any]]) -> str:
 
 
 def _notes_dir() -> Path:
-    base = _project_dir or (Path.home() / "re" / "proj")
+    base = _project_dir or Path(config.default_project_dir())
     d = Path(base) / ".ghlab" / "notes"
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -5491,7 +5532,7 @@ def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
         if query and query.lower() not in (n.get("text") or "").lower():
             continue
         out.append(n)
-    cap = int(a.get("limit", 200))
+    cap = _num(a, "limit", 200)
     return {
         "notes": out[:cap],
         "count": len(out),
@@ -5504,7 +5545,7 @@ def cmd_notes(a: dict[str, Any]) -> dict[str, Any]:
 def cmd_report(a: dict[str, Any]) -> dict[str, Any]:
     """Markdown report: triage digest + findings, ready to paste into a writeup."""
     binary = str(a["binary"])
-    d = cmd_digest({"binary": binary, "top": int(a.get("top", 6)), "strings": 2})
+    d = cmd_digest({"binary": binary, "top": _num(a, "top", 6), "strings": 2})
     notes = _load_notes(binary)
     imports = d.get("imports") or {}
     strings = d.get("strings") or {}
@@ -5576,7 +5617,7 @@ def cmd_cross_xref(a: dict[str, Any]) -> dict[str, Any]:
     without opening them one by one.
     """
     pat = re.compile(str(a["query"]), re.I)
-    limit = int(a.get("limit", 20))
+    limit = _num(a, "limit", 20)
     bins = [str(a["binary"])] if a.get("binary") else binary_names()
     out = []
     for b in bins:
@@ -5682,7 +5723,7 @@ def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
         start = _function(e, a["to"])
         if start is None:
             raise KeyError(f"function {a['to']!r} not found")
-        out = _forward_slice(start, int(a.get("depth", 6)), int(a.get("limit", 40)))
+        out = _forward_slice(start, _num(a, "depth", 6), _num(a, "limit", 40))
         out["binary"] = a["binary"]
         return out
     to_pat = re.compile(str(a["to"]), re.I)
@@ -5692,8 +5733,8 @@ def cmd_slice(a: dict[str, Any]) -> dict[str, Any]:
         ),
         re.I,
     )
-    depth = int(a.get("depth", 12))
-    limit = int(a.get("limit", 4))
+    depth = _num(a, "depth", 12)
+    limit = _num(a, "limit", 4)
 
     def matching_callee(fn) -> str | None:
         try:
@@ -5797,7 +5838,7 @@ def cmd_similar(a: dict[str, Any]) -> dict[str, Any]:
         raise KeyError(f"function {a['target']!r} not found")
     mine = _fingerprint(e["program"], fn, BasicBlockModel(e["program"]))
     min_score = float(a.get("min_score", 0.4))
-    limit = int(a.get("limit", 10))
+    limit = _num(a, "limit", 10)
     bins = (
         [str(a["against"])]
         if a.get("against")
@@ -5960,8 +6001,8 @@ def cmd_map(a: dict[str, Any]) -> dict[str, Any]:
     known = ("decompile", "strings", "imports", "calls", "consts")
     if op not in known:
         raise ValueError(f"unknown op {op!r} (ops: {', '.join(known)})")
-    limit = int(a.get("limit", 200))
-    hits = int(a.get("hits", 5))
+    limit = _num(a, "limit", 200)
+    hits = _num(a, "hits", 5)
     grep = re.compile(str(a["grep"]), re.I) if a.get("grep") else None
     functions = _select_functions(e, str(a.get("from") or "all"), limit)
     rows = _map_rows(e, functions, op, grep, hits)
@@ -6018,7 +6059,7 @@ def readonly() -> bool:
 
 
 def _journal_file() -> Path:
-    base = _project_dir or (Path.home() / "re" / "proj")
+    base = _project_dir or Path(config.default_project_dir())
     d = Path(base) / ".ghlab"
     d.mkdir(parents=True, exist_ok=True)
     return d / "journal.jsonl"
@@ -6091,7 +6132,7 @@ def cmd_journal(a: dict[str, Any]) -> dict[str, Any]:
         entries = [e for e in entries if e.get("op") == op]
     if since:
         entries = [e for e in entries if str(e.get("at", "")) >= str(since)]
-    limit = int(a.get("limit") or 50)
+    limit = _num(a, "limit", 50)
     total = len(entries)
     entries = entries[-limit:]
     return {
@@ -6528,7 +6569,7 @@ def cmd_campaign(a: dict[str, Any]) -> dict[str, Any]:
             continue
         profiles[b] = campaign.profile_from_fingerprints(prints)
     clusters = campaign.cluster_programs(profiles, min_score)
-    limit = int(a.get("limit") or 0)
+    limit = _num(a, "limit", 0)
     if limit:
         clusters = clusters[:limit]
     return {
@@ -6594,7 +6635,7 @@ def cmd_family(a: dict[str, Any]) -> dict[str, Any]:
                 }
             )
         reports.append({**cluster, "programs": programs})
-    limit = int(a.get("limit") or 0)
+    limit = _num(a, "limit", 0)
     if limit:
         reports = reports[:limit]
     return {

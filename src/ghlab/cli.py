@@ -21,7 +21,9 @@ from . import __version__, session
 from .client import Client, RemoteError
 from .config import (  # noqa: F401 - re-exported for callers and tests
     config_path,
+    default_port,
     default_project,
+    default_project_dir,
     discover_projects,
     focus_path,
     ghidra_dir,
@@ -37,7 +39,7 @@ from .protocol import DEFAULT_HOST, DEFAULT_PORT
 from .router import RouteError, from_config
 
 REPO = Path(__file__).resolve().parents[2]
-LOGDIR = Path.home() / "re" / "logs"
+LOGDIR = Path(os.environ.get("GHLAB_LOG_DIR") or (Path.home() / "re" / "logs"))
 
 
 def _print_json(obj: Any) -> None:
@@ -1323,7 +1325,7 @@ def cmd_doctor(args) -> int:
 
 def _mcp_snippet(cfg: dict[str, Any]) -> str:
     """The two config shapes an agent client needs, filled in from this machine."""
-    port = int(cfg.get("port") or DEFAULT_PORT)
+    port = default_port()
     known = projects(cfg)
     env: dict[str, str] = {"GHLAB_TIMEOUT": "900", "GHLAB_AUTOSTART": "1"}
     if len(known) > 1:
@@ -1409,7 +1411,7 @@ def cmd_setup(args) -> int:
             print("ghlab: --add-project needs --port", file=sys.stderr)
             return 2
         url = f"http://{getattr(args, 'host', None) or DEFAULT_HOST}:{port}"
-        project_dir = args.cfg_project_dir or str(Path.home() / "re" / "proj")
+        project_dir = args.cfg_project_dir or default_project_dir()
         project_name = args.cfg_project_name or args.add_project
         register_project(
             args.add_project,
@@ -1444,9 +1446,7 @@ def cmd_setup(args) -> int:
     else:
         print(f"ghidra      {cfg.get('ghidra') or '(unset)'}")
         print(f"project     {cfg.get('project_dir')} ({cfg.get('project_name')})")
-        print(
-            f"daemon      http://{cfg.get('host') or DEFAULT_HOST}:{cfg.get('port') or DEFAULT_PORT}/"
-        )
+        print(f"daemon      http://{cfg.get('host') or DEFAULT_HOST}:{default_port()}/")
         print("next        ghlab start && ghlab doctor")
         print("")
         print(_mcp_snippet(cfg))
@@ -1463,7 +1463,7 @@ def _start_target(target: Any) -> bool:
     args = argparse.Namespace(
         host=str(target.url).split("//")[-1].rsplit(":", 1)[0] or DEFAULT_HOST,
         port=port,
-        project_dir=target.project_dir or str(Path.home() / "re" / "proj"),
+        project_dir=target.project_dir or default_project_dir(),
         project_name=target.project_name or target.name,
         wait=400,
     )
@@ -1815,17 +1815,24 @@ def _ghlab_processes(table: list[dict[str, Any]] | None = None) -> list[dict[str
             continue
         words = cmd.split()
         port = 0
+        project_dir = ""
         for index, word in enumerate(words):
-            if word == "--port" and index + 1 < len(words) and words[index + 1].isdigit():
-                port = int(words[index + 1])
+            nxt = words[index + 1] if index + 1 < len(words) else ""
+            if word == "--port" and nxt.isdigit():
+                port = int(nxt)
             elif word.startswith("--port=") and word.split("=", 1)[1].isdigit():
                 port = int(word.split("=", 1)[1])
+            elif word == "--project-dir" and nxt and not nxt.startswith("--"):
+                project_dir = nxt
+            elif word.startswith("--project-dir="):
+                project_dir = word.split("=", 1)[1]
         found.append(
             {
                 "pid": int(row["pid"]),
                 "parent": int(row.get("parent") or 0),
                 "role": "mcp" if "mcp" in cmd else "serve",
                 "port": port,
+                "project_dir": project_dir,
             }
         )
     return found
@@ -1879,21 +1886,36 @@ def _stop_all() -> int:
     """
     labels: dict[int, str] = {}
     pid_paths: list[Path] = []
-    for name, target in projects(load_config()).items():
-        path = Path(target.project_dir).expanduser() / ".ghlab.pid"
+    seen_paths: set[str] = set()
+
+    def add_pidfile(path: Path, label: str) -> None:
+        if str(path) in seen_paths:
+            return
+        seen_paths.add(str(path))
         pid_paths.append(path)
         pid = int(_pidfile(path).get("pid") or 0)
-        if pid:
-            labels[pid] = f"daemon {name}"
+        if pid and pid not in labels:
+            labels[pid] = label
+
+    for name, target in projects(load_config()).items():
+        add_pidfile(Path(target.project_dir).expanduser() / ".ghlab.pid", f"daemon {name}")
     procs = _ghlab_processes()
-    known = set(labels)
+    # A daemon started with an ad-hoc `--project-dir` is not in the config, but it did
+    # write its pidfile there -- that file is how we can name it instead of calling it
+    # a stray (it is not lost; it is just not registered).
+    for proc in procs:
+        where = str(proc.get("project_dir") or "")
+        if not where:
+            continue
+        path = Path(where).expanduser() / ".ghlab.pid"
+        add_pidfile(path, f"daemon {path.parent.name}")
     for proc in procs:
         pid = int(proc["pid"])
         if pid in labels:
             continue
-        where = f":{proc['port']}" if proc["port"] else ""
-        kind = "stray" if pid not in known and proc["parent"] not in known else "child"
-        labels[pid] = f"{proc['role']}{where} ({kind})"
+        at = f":{proc['port']}" if proc["port"] else ""
+        kind = "child" if proc["parent"] in labels else "stray"
+        labels[pid] = f"{proc['role']}{at} ({kind})"
     if not labels:
         print("ghlab: nothing to stop")
         return 0
@@ -1975,10 +1997,13 @@ def cmd_status(args) -> int:
         return 1
     local = _pidfile(pid_path)
     info["url"] = client.url
+    # the daemon knows its own stamp; the pidfile only matters for a daemon too old to
+    # report one (and for a project started from another directory than --url names)
+    running = info.get("stamp") or local.get("stamp")
     info["code"] = {
-        "running": local.get("stamp"),
+        "running": running,
         "installed": want,
-        "stale": bool(local.get("stamp")) and local.get("stamp") != want,
+        "stale": bool(running) and running != want,
     }
     if args.json:
         print(json.dumps(info, indent=2, ensure_ascii=False))
@@ -2000,6 +2025,9 @@ def cmd_status(args) -> int:
 
 class _Parser(argparse.ArgumentParser):
     """ArgumentParser that suggests a command on a typo instead of dumping 40 choices."""
+
+    # filled by build_parser: the grouped listing and the tests both read it
+    command_help: dict[str, str]
 
     def error(self, message: str) -> NoReturn:
         import difflib
@@ -2153,6 +2181,7 @@ def _grouped_help(helps: dict[str, str]) -> str:
             "  ghlab job analyze notepad.exe -a full=yes; ghlab job --id j1; ghlab cancel j1",
             "  ghlab patch notepad.exe 0x140001230 '90 90'; ghlab revert notepad.exe --all",
             "",
+            "aliases: set_type = set-type, cross_xref = cross-xref (protocol spellings)",
             "binary '-' means the program picked by `ghlab use`; --json works anywhere",
             "on the line and prints the daemon's reply untouched; GHLAB_URL picks the daemon.",
         ]
@@ -2170,9 +2199,9 @@ def build_parser() -> argparse.ArgumentParser:
     cfg = load_config()
     daemon = _Parser(add_help=False)
     daemon.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
-    daemon.add_argument("--port", type=int, default=int(cfg.get("port") or DEFAULT_PORT))
+    daemon.add_argument("--port", type=int, default=default_port())
     daemon.add_argument(
-        "--project-dir", default=str(cfg.get("project_dir") or (Path.home() / "re" / "proj"))
+        "--project-dir", default=str(cfg.get("project_dir") or default_project_dir())
     )
     daemon.add_argument("--project-name", default=str(cfg.get("project_name") or "ghlab"))
 
@@ -2200,7 +2229,7 @@ def build_parser() -> argparse.ArgumentParser:
     # bug killed a WPS daemon once).
     p = sub.add_parser("stop", help="stop a detached daemon")
     p.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
-    p.add_argument("--port", type=int, default=int(cfg.get("port") or DEFAULT_PORT))
+    p.add_argument("--port", type=int, default=default_port())
     p.add_argument("--project-dir", help="stop this project's daemon (default: by --port)")
     p.add_argument(
         "--all",

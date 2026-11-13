@@ -5,11 +5,26 @@ from ghlab import protocol
 
 
 class ValidateTest(unittest.TestCase):
-    def test_unknown_command_lists_known(self):
+    def test_unknown_command_points_at_the_list_instead_of_dumping_it(self):
+        # the old message inlined all 47 names: 491 characters of noise around one typo
         with self.assertRaises(protocol.ProtocolError) as ctx:
             protocol.validate({"cmd": "nope"})
-        self.assertIn("unknown cmd", str(ctx.exception))
-        self.assertIn("decompile", str(ctx.exception))
+        text = str(ctx.exception)
+        self.assertIn("unknown cmd 'nope'", text)
+        self.assertIn("GET /", text)
+        self.assertLess(len(text), 200)
+
+    def test_a_near_miss_command_is_guessed(self):
+        with self.assertRaises(protocol.ProtocolError) as ctx:
+            protocol.validate({"cmd": "decompil"})
+        self.assertIn("did you mean decompile?", str(ctx.exception))
+
+    def test_a_near_miss_parameter_is_guessed(self):
+        with self.assertRaises(protocol.ProtocolError) as ctx:
+            protocol.validate({"cmd": "scan", "binary": "a", "offst": 1})
+        text = str(ctx.exception)
+        self.assertIn("['offst']", text)
+        self.assertIn("did you mean offset?", text)
 
     def test_missing_required(self):
         with self.assertRaises(protocol.ProtocolError) as ctx:

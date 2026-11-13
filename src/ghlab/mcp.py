@@ -14,10 +14,9 @@ import json
 import os
 import sys
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, TextIO
 
-from . import __version__
+from . import __version__, config
 from . import router as routing
 from .client import RemoteError
 
@@ -740,8 +739,8 @@ def _start_target(target: Any) -> bool:
     tail = str(target.url).rsplit(":", 1)[-1].strip("/")
     args = Namespace(
         host=str(target.url).split("//")[-1].rsplit(":", 1)[0] or "127.0.0.1",
-        port=int(tail) if tail.isdigit() else 8765,
-        project_dir=target.project_dir or str(Path.home() / "re" / "proj"),
+        port=int(tail) if tail.isdigit() else config.default_port(),
+        project_dir=target.project_dir or config.default_project_dir(),
         project_name=target.project_name or target.name,
         wait=400,
     )

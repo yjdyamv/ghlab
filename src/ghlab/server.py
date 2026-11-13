@@ -47,8 +47,6 @@ def _describe(params: dict[str, Any]) -> str:
     """Compact argument summary: keys always, values only when short and safe."""
     bits = []
     for key in sorted(params):
-        if key == "binary":
-            continue
         value = params[key]
         if isinstance(value, (int, float)) or (isinstance(value, str) and len(value) <= 40):
             bits.append(f"{key}={value}")
@@ -66,6 +64,7 @@ def _info_body() -> bytes:
             "project": session.project_location(),
             "pid": os.getpid(),
             "uptime_s": round(time.time() - STARTED, 1),
+            "stamp": session.code_stamp(),
             "busy": session.in_flight(),
             "readonly": session.readonly(),
             "usage": 'POST / with {"cmd": "<name>", ...}, or GET /<name> for the '
@@ -145,6 +144,10 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             self._reject(400, "Content-Length is not a number")
+            return
+        if n < 0:
+            # rfile.read(-5) means "read until EOF", i.e. park the thread on a live socket
+            self._reject(400, f"Content-Length is negative ({n})")
             return
         if n > MAX_BODY:
             self._reject(413, f"body is {n} bytes; the limit is {MAX_BODY}")
@@ -238,7 +241,15 @@ def serve(host: str, port: int, project_dir: str, project_name: str) -> None:
     print("ghlab: starting Ghidra (JVM boot takes ~30-45s)…", flush=True)
     session.boot()
     session.project()
-    with open(pidfile(), "w", encoding="utf-8") as fh:
+    # Bind first: a pidfile that names a process which never listened is worse than
+    # none -- `status`/`stop`/`doctor` would trust it.
+    try:
+        httpd = Server((host, port), Handler)
+    except OSError as ex:
+        print(f"ghlab: cannot bind {host}:{port} ({ex})", file=sys.stderr, flush=True)
+        raise SystemExit(2) from ex
+    path = pidfile()
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(
             {
                 "pid": os.getpid(),
@@ -249,11 +260,6 @@ def serve(host: str, port: int, project_dir: str, project_name: str) -> None:
             },
             fh,
         )
-    try:
-        httpd = Server((host, port), Handler)
-    except OSError as ex:
-        print(f"ghlab: cannot bind {host}:{port} ({ex})", file=sys.stderr, flush=True)
-        raise SystemExit(2) from ex
     print(
         f"ghlab: listening on http://{host}:{port}/ project={session.project_location()} "
         f"binaries={session.binary_names()}",
@@ -265,6 +271,8 @@ def serve(host: str, port: int, project_dir: str, project_name: str) -> None:
         pass
     finally:
         httpd.server_close()
+        with contextlib.suppress(OSError):
+            os.unlink(path)
 
 
 def free_port(host: str = "127.0.0.1", start: int = protocol.DEFAULT_PORT) -> int:

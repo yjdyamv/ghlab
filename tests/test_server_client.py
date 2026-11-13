@@ -153,6 +153,30 @@ class ServerTest(unittest.TestCase):
         self.assertTrue(lines, "no log line for the failing GET")
         self.assertIn("status=500", lines[0])
 
+    def test_a_negative_content_length_is_refused(self):
+        # `rfile.read(-5)` means "until EOF": the thread parks on a live socket for
+        # GHLAB_READ_TIMEOUT instead of answering.
+        crlf = chr(13) + chr(10)
+        head = [
+            "POST / HTTP/1.1",
+            "Host: x",
+            "Content-Type: application/json",
+            "Content-Length: -5",
+            "Connection: close",
+        ]
+        status, body = self._raw((crlf.join(head) + crlf + crlf).encode())
+        self.assertEqual(status, 400)
+        self.assertIn(b"negative", body)
+
+    def test_the_log_line_names_the_binary(self):
+        # "cmd=decompile ms=9000 status=200" does not say *what* took nine seconds
+        lines: list[str] = []
+        with mock.patch("ghlab.server._log", lines.append):
+            self.client.call("decompile", binary="stub.exe", targets=["main"])
+            lines = self._wait_for(lines, "cmd=decompile")
+        self.assertTrue(lines)
+        self.assertIn("binary=stub.exe", lines[0])
+
     def test_down_daemon_gives_actionable_message(self):
         dead = Client("http://127.0.0.1:9/", timeout=1)
         self.assertFalse(dead.alive())
@@ -360,3 +384,69 @@ class ServerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _fake_session() -> mock.MagicMock:
+    """A session whose answers are strings: serve() serialises them into the pidfile."""
+    fake = mock.MagicMock()
+    fake.code_stamp.return_value = "stamp"
+    fake.project_location.return_value = "C:/re/proj"
+    return fake
+
+
+class ServePidfileTest(unittest.TestCase):
+    """The pidfile must name a process that is actually listening, or no process."""
+
+    def test_a_failed_bind_leaves_no_pidfile(self):
+        import tempfile
+        from pathlib import Path
+
+        from ghlab import server as server_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".ghlab.pid"
+            with (
+                mock.patch.object(server_mod, "session", _fake_session()),
+                mock.patch.object(server_mod, "Server", side_effect=OSError("in use")),
+                mock.patch.object(server_mod, "pidfile", return_value=str(path)),
+                self.assertRaises(SystemExit),
+            ):
+                server_mod.serve("127.0.0.1", 8765, tmp, "p")
+            self.assertFalse(path.exists())
+
+    def test_the_pidfile_is_written_after_the_bind_and_removed_on_exit(self):
+        import tempfile
+        from pathlib import Path
+
+        from ghlab import server as server_mod
+
+        events: list[object] = []
+
+        class FakeHTTPD:
+            def serve_forever(self):
+                events.append("serve")
+                raise KeyboardInterrupt
+
+            def server_close(self):
+                events.append("close")
+
+        def fake_bind(*_a: object) -> FakeHTTPD:
+            events.append("bind")
+            return FakeHTTPD()
+
+        def fake_open(target, *_a, **_k):
+            events.append(("write", str(target)))
+            return mock.mock_open()(target)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".ghlab.pid"
+            with (
+                mock.patch.object(server_mod, "session", _fake_session()),
+                mock.patch.object(server_mod, "Server", fake_bind),
+                mock.patch.object(server_mod, "pidfile", return_value=str(path)),
+                mock.patch("builtins.open", fake_open),
+            ):
+                server_mod.serve("127.0.0.1", 8765, tmp, "p")
+        self.assertEqual(
+            [e for e in events if e != "serve"], ["bind", ("write", str(path)), "close"]
+        )
