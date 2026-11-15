@@ -1229,7 +1229,10 @@ def cmd_symbols(a: dict[str, Any]) -> dict[str, Any]:
 
 def _read_cstring(program, addr, limit: int = 256) -> str:
     # One bulk read, not `limit` getByte crossings: this runs once per type descriptor.
-    data, _short = _read_region(program.getMemory(), addr, limit)
+    try:
+        data, _short = _read_region(program.getMemory(), addr, limit)
+    except Exception:  # noqa: BLE001 - an unreadable name pointer is just "no name"
+        return ""
     end = data.find(b"\0")
     return (data if end < 0 else data[:end]).decode("latin-1", "replace")
 
@@ -1395,27 +1398,35 @@ def _code_pointer(program, value: int) -> Any | None:
 
 
 def _vtable_slots(program, vtable: Any, limit: int) -> list[dict[str, Any]]:
-    """Read the pointer array of one vtable until it stops looking like code."""
+    """Read the pointer array of one vtable until it stops looking like code.
+
+    A table may end inside a block whose tail is uninitialised (Ghidra leaves the
+    padding after .rdata allocated but blank), so a readable address is not enough:
+    `getLong` there throws, and one such tail must not fail the whole dump.
+    """
     mem = program.getMemory()
     fm = program.getFunctionManager()
     st = program.getSymbolTable()
     block = mem.getBlock(vtable)
     slots: list[dict[str, Any]] = []
-    miss = 0
+    nulls = 0
     mask = 0xFFFFFFFFFFFFFFFF
     for i in range(limit):
         at = vtable.add(i * 8)
         if block is None or not block.contains(at):
             break
-        value = int(mem.getLong(at)) & mask
+        try:
+            value = int(mem.getLong(at)) & mask
+        except Exception:  # noqa: BLE001 - uninitialised tail: the table ends here
+            break
         target = _code_pointer(program, value)
         if target is None:
-            miss += 1
-            if miss >= 2:
+            if value != 0 or nulls >= 1:  # only a lone pure-virtual 0 may be skipped
                 break
+            nulls += 1
             slots.append({"slot": i, "offset": f"0x{i * 8:x}", "addr": None})
             continue
-        miss = 0
+        nulls = 0
         fn = fm.getFunctionAt(target)
         sym = st.getPrimarySymbol(target)
         row: dict[str, Any] = {
@@ -1573,6 +1584,32 @@ def cmd_vtable(a: dict[str, Any]) -> dict[str, Any]:
 
 _VTABLE_MIN_SLOTS = 3
 _VTABLE_MAX_SLOTS = 512
+_VTABLE_RULE = 2  # bumped when the slot-boundary rule changes, to drop stale caches
+
+
+def _slot_run(values, is_code, max_nulls: int = 1) -> list[int]:
+    """Slot values up to the first separator; a lone 0 is a pure-virtual placeholder.
+
+    The two ABIs separate neighbouring tables with a single non-code qword (MSVC:
+    the CompleteObjectLocator pointer at -8; Itanium: offset-to-top then &typeinfo),
+    so tolerating *two* misses happily walked from one class into the next and
+    reported a 167-slot `TextboxPageRenderContext`.  Only a zero may be skipped, and
+    only once: real slots always point into an executable block, because the test
+    is on the block, not on whether Ghidra happened to create a function there.
+    """
+    out: list[int] = []
+    nulls = 0
+    for value in values:
+        if is_code(value):
+            out.append(value)
+            nulls = 0
+            continue
+        if value == 0 and nulls < max_nulls:
+            out.append(value)
+            nulls += 1
+            continue
+        break
+    return out
 _VTABLES_SCAN_CHUNK = 1 << 22
 
 
@@ -1667,17 +1704,7 @@ def build_vtables(e, min_slots: int = _VTABLE_MIN_SLOTS) -> list[list[Any]]:
         raw, _short = _read_region(mem, addr, _VTABLE_MAX_SLOTS * 8)
         count = len(raw) // 8
         values = list(struct.unpack_from("<%dQ" % count, raw)) if count else []
-        slots: list[int] = []
-        miss = 0
-        for value in values:
-            if _in_code(los, his, value):
-                miss = 0
-                slots.append(value)
-                continue
-            miss += 1
-            if miss >= 2:
-                break
-            slots.append(value)  # one-hole tolerance, same rule as `vtable`
+        slots = _slot_run(values, lambda v: _in_code(los, his, v))
         if len(slots) < max(n, min_slots):
             continue
         rows.append([start, (rtti or {}).get("class"), name, slots])
@@ -1700,6 +1727,7 @@ def load_vtables(
                 cached_meta.get("md5") == meta["md5"]
                 and cached_meta.get("mods") == meta["mods"]
                 and int(cached_meta.get("min_slots", -1)) == min_slots
+                and int(cached_meta.get("rule", 0)) == _VTABLE_RULE
             )
         except (OSError, ValueError):
             same = False
@@ -1712,7 +1740,7 @@ def load_vtables(
                 "elapsed_ms": int((time.time() - started) * 1000),
             }
     tables = build_vtables(e, min_slots)
-    meta = dict(meta, min_slots=min_slots, built_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    meta = dict(meta, min_slots=min_slots, rule=_VTABLE_RULE, built_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")

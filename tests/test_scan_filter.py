@@ -6,6 +6,7 @@ import unittest
 
 from ghlab.session import (
     _displacements,
+    _slot_run,
     _imm_of,
     _imm_spec,
     _is_dest_operand,
@@ -162,3 +163,27 @@ class SequenceTest(unittest.TestCase):
         events = self._events({0x8}, {0x10}, set(), {0x8}, {0x10}, {0x18})
         hits = _sequence_hits(events, [0x8, 0x10, 0x18], window=8)
         self.assertEqual(hits, [{"start": 0, "end": 5}])
+
+
+class SlotRunTest(unittest.TestCase):
+    """A table ends at the separator word, not two words later.
+
+    `TextboxPageRenderContext` came out with 167 slots because the walk tolerated
+    two misses and the next class's table starts one column-pointer away: the
+    two tables fused into one, and every slot index after that belonged to the
+    neighbouring class.  Only a lone zero (pure-virtual placeholder) is skippable.
+    """
+
+    def test_stops_at_the_separator_between_two_tables(self) -> None:
+        values = [10, 11, 0x181ad2b48, 20, 21]  # the third word is the next COL
+        self.assertEqual(_slot_run(values, lambda v: v < 0x1000), [10, 11])
+
+    def test_keeps_a_single_pure_virtual_zero(self) -> None:
+        self.assertEqual(_slot_run([10, 0, 12], lambda v: v != 0), [10, 0, 12])
+
+    def test_two_zeroes_in_a_row_end_the_table(self) -> None:
+        self.assertEqual(_slot_run([10, 0, 0, 12], lambda v: v != 0), [10, 0])
+
+    def test_empty_and_zero_starts_are_safe(self) -> None:
+        self.assertEqual(_slot_run([], lambda v: True), [])
+        self.assertEqual(_slot_run([0], lambda v: v != 0), [0])
