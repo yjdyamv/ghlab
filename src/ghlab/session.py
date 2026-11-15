@@ -1113,7 +1113,7 @@ def cmd_exports(a: dict[str, Any]) -> dict[str, Any]:
 # demangle), and RTTI type descriptors as `.?AVFoo@@`.  Both are indexed here once,
 # because a full `getAllSymbols` walk on a 34 MB DLL costs seconds per call.
 _SKIP_SYMBOL_KINDS = ("Parameter", "Local Var")
-_VTABLE_NAME = re.compile(r"(\?\?_7|vftable|vtable|vtbl)", re.I)
+_VTABLE_NAME = re.compile(r"(\?\?_7|vftable|vtable|vtbl|_ZTV)", re.I)
 
 
 def _symbols_file(binary: str) -> Path:
@@ -1248,7 +1248,7 @@ def _rtti_class_name(raw: str) -> str | None:
     return "::".join(reversed(parts)) or None
 
 
-def _rtti_of_vtable(program, vtable: Any) -> dict[str, Any] | None:
+def _rtti_of_vtable_msvc(program, vtable: Any) -> dict[str, Any] | None:
     """Class name from the MSVC CompleteObjectLocator stored just before the table.
 
     Layout (x64 and x86): signature(4) offset(4) cdOffset(4) typeDescriptor(4)
@@ -1282,10 +1282,101 @@ def _rtti_of_vtable(program, vtable: Any) -> dict[str, Any] | None:
         return None
     return {
         "locator": str(col_addr),
+        "abi": "msvc",
         "type_descriptor": str(td_addr),
         "raw": raw,
         "class": _rtti_class_name(raw),
     }
+
+
+def _read_qword(program, addr) -> int | None:
+    """The 8-byte value at `addr`, or None when that address is not readable."""
+    mem = program.getMemory()
+    try:
+        block = mem.getBlock(addr)
+        if block is None or not block.isInitialized() or not block.contains(addr):
+            return None
+        return int(mem.getLong(addr)) & 0xFFFFFFFFFFFFFFFF
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _itanium_mangled(raw: str) -> str | None:
+    """Type encoding with its `_Z` prefix restored, or None when it is not one.
+
+    A typeinfo name is stored as a bare encoding (`N7TypoLib10TableSpaceE`), so the
+    prefix LLD dropped is put back; a nested name starts with `N`, a plain one with
+    its length digit, and `St` marks std::.
+    """
+    if not raw:
+        return None
+    if raw.startswith("_Z"):
+        return raw
+    if raw[0].isdigit() or raw.startswith(("N", "St")):
+        return "_Z" + raw
+    return None
+
+
+def _itanium_class(program, raw: str) -> str | None:
+    """`N7TypoLib10TableSpaceE` -> `TypoLib::TableSpace`.
+
+    The argument list of a demangled instantiation is dropped so that a class
+    regex can match the bare name.
+    """
+    text = _itanium_mangled(raw)
+    if text is None:
+        return None
+    demangled = _demangle(program, text)
+    if not demangled:
+        return None
+    return demangled.split("(", 1)[0].strip() or None
+
+
+def _rtti_of_vtable_itanium(program, vtable: Any) -> dict[str, Any] | None:
+    """Class name from the Itanium table head (GCC/Clang ELF, also old OSX).
+
+    `_ZTV<C>` opens with [offset-to-top][&typeinfo] and the code slots follow, so
+    with `vtable` naming the first *code* slot the typeinfo pointer sits at -8;
+    the typeinfo object's second word is the mangled name.  Two reads and one
+    string decide it, which is why the same run scan works on both ABIs.
+    """
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    typeinfo = _read_qword(program, vtable.subtract(8))
+    if not typeinfo:
+        return None
+    try:
+        ti_addr = space.getAddress(typeinfo)
+    except Exception:  # noqa: BLE001
+        return None
+    name_ptr = _read_qword(program, ti_addr.add(8))
+    if not name_ptr:
+        return None
+    try:
+        name_addr = space.getAddress(name_ptr)
+    except Exception:  # noqa: BLE001
+        return None
+    raw = _read_cstring(program, name_addr, 512)
+    if not raw or len(raw) > 400:
+        return None
+    klass = _itanium_class(program, raw)
+    if klass is None:
+        return None
+    return {
+        "locator": str(ti_addr),
+        "abi": "itanium",
+        "type_descriptor": str(name_addr),
+        "raw": raw,
+        "class": klass,
+    }
+
+
+def _rtti_of_vtable(program, vtable: Any) -> dict[str, Any] | None:
+    """RTTI class for a table whose first code slot is `vtable`, either ABI.
+
+    MSVC is tried first because its locator is a strict signature check; the
+    Itanium head is looser, so it only decides when the MSVC path came back empty.
+    """
+    return _rtti_of_vtable_msvc(program, vtable) or _rtti_of_vtable_itanium(program, vtable)
 
 
 def _code_pointer(program, value: int) -> Any | None:

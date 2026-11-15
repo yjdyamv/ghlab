@@ -210,6 +210,17 @@ class SymbolAndVtableFormatterTest(unittest.TestCase):
         )
         self.assertIsNone(session._rtti_class_name("not rtti"))
 
+    def test_itanium_type_encoding_gets_its_prefix_back(self):
+        # A typeinfo name is a bare encoding: no `_Z`, and `N`/digit/`St` decide it.
+        self.assertEqual(
+            session._itanium_mangled("N7TypoLib10TableSpaceE"), "_ZN7TypoLib10TableSpaceE"
+        )
+        self.assertEqual(session._itanium_mangled("15KWpsApplication"), "_Z15KWpsApplication")
+        self.assertEqual(session._itanium_mangled("St6vectorIiSaIiEE"), "_ZSt6vectorIiSaIiEE")
+        self.assertEqual(session._itanium_mangled("_ZN3foo3barEv"), "_ZN3foo3barEv")
+        self.assertIsNone(session._itanium_mangled("not a typeinfo name"))
+        self.assertIsNone(session._itanium_mangled(""))
+
     def test_symbols_shows_the_qualified_name_and_the_demangled_form(self):
         text = cli.fmt_symbols(
             {
