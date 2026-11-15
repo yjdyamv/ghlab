@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import contextlib
 import difflib
 import hashlib
@@ -10,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import threading
 import time
 from collections import Counter
@@ -1102,6 +1104,620 @@ def cmd_exports(a: dict[str, Any]) -> dict[str, Any]:
         "exports": rows,
         "elapsed_ms": int((time.time() - started) * 1000),
     }
+
+
+# ------------------------------------------------------------- symbols & vtables
+
+# The symbol table is the only place a stripped MSVC binary admits its class names:
+# vtables come back as `vftable` inside a class namespace (or `??_7Foo@@6B@` after a
+# demangle), and RTTI type descriptors as `.?AVFoo@@`.  Both are indexed here once,
+# because a full `getAllSymbols` walk on a 34 MB DLL costs seconds per call.
+_SKIP_SYMBOL_KINDS = ("Parameter", "Local Var")
+_VTABLE_NAME = re.compile(r"(\?\?_7|vftable|vtable|vtbl)", re.I)
+
+
+def _symbols_file(binary: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _ghlab_dir() / "symbols" / f"{slug}.json"
+
+
+def build_symbols(e) -> list[list[str]]:
+    program = e["program"]
+    rows: list[list[str]] = []
+    it = program.getSymbolTable().getAllSymbols(True)
+    while it.hasNext():
+        sym = it.next()
+        try:
+            kind = str(sym.getSymbolType())
+            if kind in _SKIP_SYMBOL_KINDS:
+                continue
+            addr = sym.getAddress()
+            if addr is None or not addr.isMemoryAddress():
+                continue
+            name = str(sym.getName())
+            full = str(sym.getName(True))
+        except Exception:  # noqa: BLE001 - jpype call, can raise anything
+            continue
+        rows.append([str(addr), name, kind, "" if full == name else full])
+    return rows
+
+
+def load_symbols(e, refresh: bool = False) -> dict[str, Any]:
+    """Every symbol in the program as `[addr, name, kind, qualified_name]`.
+
+    Cached on disk per `(md5, modification number)` like the string table, so the
+    `names`/`vtable` questions do not pay a 5-10 s walk each time.
+    """
+    started = time.time()
+    program = e["program"]
+    meta = _index_meta(program)
+    path = _symbols_file(str(e["binary"]))
+    if not refresh and path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cached_meta = raw.get("meta") or {}
+            same = cached_meta.get("md5") == meta["md5"] and cached_meta.get("mods") == meta["mods"]
+        except (OSError, ValueError):
+            same = False
+        if same:
+            return {
+                "symbols": raw.get("symbols") or [],
+                "meta": raw["meta"],
+                "cached": True,
+                "path": str(path),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+    rows = build_symbols(e)
+    payload = {
+        "meta": {
+            **meta,
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "symbols": len(rows),
+        },
+        "symbols": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8", newline=chr(10))
+    return {
+        "symbols": rows,
+        "meta": payload["meta"],
+        "cached": False,
+        "path": str(path),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def cmd_symbols(a: dict[str, Any]) -> dict[str, Any]:
+    """Search the symbol table: class names, vtable labels, RTTI descriptors, globals."""
+    entry = _entry(a["binary"])
+    table = load_symbols(entry, refresh=bool(a.get("refresh")))
+    query = a.get("query") or ""
+    pattern = re.compile(query, re.I) if query else None
+    kind = a.get("kind") or ""
+    kpat = re.compile(kind, re.I) if kind else None
+    skip = _num(a, "offset", 0)
+    limit = _num(a, "limit", 200)
+    matched = 0
+    rows: list[dict[str, Any]] = []
+    for addr, name, sym_kind, full in table["symbols"]:
+        if kpat is not None and not kpat.search(sym_kind):
+            continue
+        if pattern is not None and not (
+            pattern.search(name) or (full and pattern.search(full)) or pattern.search(addr)
+        ):
+            continue
+        matched += 1
+        if matched <= skip or len(rows) >= limit:
+            continue
+        row: dict[str, Any] = {"addr": addr, "name": name, "kind": sym_kind}
+        if full:
+            row["full"] = full
+        if name.startswith("?"):
+            row["demangled"] = _demangle(entry["program"], name)
+        rows.append(row)
+    return {
+        "binary": a["binary"],
+        "total": len(table["symbols"]),
+        "matched": matched,
+        "offset": skip,
+        "symbols": rows,
+        "cached": table["cached"],
+        "built_at": table["meta"].get("built_at"),
+        "elapsed_ms": table["elapsed_ms"],
+    }
+
+
+def _read_cstring(program, addr, limit: int = 256) -> str:
+    # One bulk read, not `limit` getByte crossings: this runs once per type descriptor.
+    data, _short = _read_region(program.getMemory(), addr, limit)
+    end = data.find(b"\0")
+    return (data if end < 0 else data[:end]).decode("latin-1", "replace")
+
+
+def _rtti_class_name(raw: str) -> str | None:
+    """.?AVTableLine@dicot@@ -> dicot::TableLine (MSVC encodes nested names inside-out).
+
+    A template instantiation keeps its `?$Name@Args` spelling, which is exactly how
+    Ghidra labels the symbol: better to match the symbol table than to invent a
+    `<...>` form nobody can grep for.  The raw descriptor is always returned too.
+    """
+    if not raw.startswith(".?A"):
+        return None
+    body = raw[4:].split("@@", 1)[0]
+    parts = [p for p in body.split("@") if p]
+    return "::".join(reversed(parts)) or None
+
+
+def _rtti_of_vtable(program, vtable: Any) -> dict[str, Any] | None:
+    """Class name from the MSVC CompleteObjectLocator stored just before the table.
+
+    Layout (x64 and x86): signature(4) offset(4) cdOffset(4) typeDescriptor(4)
+    classDescriptor(4); on x64 the last two are RVAs from the image base, on x86
+    they are absolute VAs.  Any surprise returns None instead of a guess.
+    """
+    mem = program.getMemory()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    mask = 0xFFFFFFFFFFFFFFFF
+    try:
+        col = int(mem.getLong(vtable.subtract(8))) & mask
+        if col in (0, mask):
+            return None
+        col_addr = space.getAddress(col)
+        block = mem.getBlock(col_addr)
+        if block is None or not block.isInitialized():
+            return None
+        signature = int(mem.getInt(col_addr))
+        td_raw = int(mem.getInt(col_addr.add(12)))
+        if signature == 1:  # x64: RVA
+            td_addr = space.getAddress(int(program.getImageBase().getOffset()) + td_raw)
+        elif signature == 0:  # x86: VA
+            td_addr = space.getAddress(td_raw & 0xFFFFFFFF)
+        else:
+            return None
+        td_block = mem.getBlock(td_addr)
+        if td_block is None or not td_block.isInitialized():
+            return None
+        raw = _read_cstring(program, td_addr.add(16))
+    except Exception:  # noqa: BLE001 - a missing/corrupt locator is not an error
+        return None
+    return {
+        "locator": str(col_addr),
+        "type_descriptor": str(td_addr),
+        "raw": raw,
+        "class": _rtti_class_name(raw),
+    }
+
+
+def _code_pointer(program, value: int) -> Any | None:
+    """Address if `value` lands in an executable block, else None."""
+    if value in (0, 0xFFFFFFFFFFFFFFFF):
+        return None
+    mem = program.getMemory()
+    try:
+        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(value)
+        block = mem.getBlock(addr)
+    except Exception:  # noqa: BLE001
+        return None
+    if block is None or not block.isInitialized() or not block.isExecute():
+        return None
+    return addr
+
+
+def _vtable_slots(program, vtable: Any, limit: int) -> list[dict[str, Any]]:
+    """Read the pointer array of one vtable until it stops looking like code."""
+    mem = program.getMemory()
+    fm = program.getFunctionManager()
+    st = program.getSymbolTable()
+    block = mem.getBlock(vtable)
+    slots: list[dict[str, Any]] = []
+    miss = 0
+    mask = 0xFFFFFFFFFFFFFFFF
+    for i in range(limit):
+        at = vtable.add(i * 8)
+        if block is None or not block.contains(at):
+            break
+        value = int(mem.getLong(at)) & mask
+        target = _code_pointer(program, value)
+        if target is None:
+            miss += 1
+            if miss >= 2:
+                break
+            slots.append({"slot": i, "offset": f"0x{i * 8:x}", "addr": None})
+            continue
+        miss = 0
+        fn = fm.getFunctionAt(target)
+        sym = st.getPrimarySymbol(target)
+        row: dict[str, Any] = {
+            "slot": i,
+            "offset": f"0x{i * 8:x}",
+            "addr": str(target),
+            "name": str(fn.getName()) if fn is not None else (str(sym.getName()) if sym else None),
+        }
+        if fn is not None:
+            row["size"] = int(fn.getBody().getNumAddresses())
+            low = str(fn.getName()).lower()
+            if low.startswith(("_purecall", "__cxa_pure", "__purecall")):
+                row["pure"] = True
+            elif row["size"] <= 3:
+                row["stub"] = True
+            try:
+                row["proto"] = str(fn.getPrototypeString(False, False))
+            except Exception:  # noqa: BLE001 - a bad datatype can throw here
+                pass
+        slots.append(row)
+    return slots
+
+
+def _vtable_addresses(entry, target: str) -> list[Any]:
+    """`0x181ae76e0`, or a class name matched against vtable labels/RTTI names."""
+    numeric = _hex_addr(target)
+    space = entry["program"].getAddressFactory().getDefaultAddressSpace()
+    if numeric is not None:
+        return [space.getAddress(numeric)]
+    rx = re.compile(str(target), re.I)
+    # `Foo::vftable_meta_ptr` is the locator slot in front of the table, not a table.
+    want_meta = "meta_ptr" in str(target).lower()
+    table = load_symbols(entry)
+    seen: list[Any] = []
+    for addr, name, _kind, full in table["symbols"]:
+        if not _VTABLE_NAME.search(name or ""):
+            continue
+        if not want_meta and "meta_ptr" in (name or "").lower():
+            continue
+        if rx.search(full or name) is None:
+            continue
+        a = space.getAddress(int(addr, 16))
+        if all(str(a) != str(x) for x in seen):
+            seen.append(a)
+    return seen
+
+
+def _pointer_hits(program, value: int, limit: int) -> list[Any]:
+    """Where the 8-byte little-endian pointer `value` appears in non-executable memory.
+
+    Read in whole blocks and use `bytes.find`: Ghidra's `Memory.findBytes` has an
+    overloaded mask signature that jpype resolves differently across versions.
+    """
+    mem = program.getMemory()
+    pattern = value.to_bytes(8, "little")
+    out: list[Any] = []
+    for block in mem.getBlocks():
+        if not block.isInitialized() or block.isExecute():
+            continue
+        size = int(block.getSize())
+        if size <= 0 or size > (128 << 20):
+            continue
+        data, _short = _read_region(mem, block.getStart(), size)
+        start = 0
+        while True:
+            at = data.find(pattern, start)
+            if at < 0:
+                break
+            start = at + 1
+            if at % 8:
+                continue  # vtables are pointer aligned
+            out.append(block.getStart().add(at))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def cmd_vtable(a: dict[str, Any]) -> dict[str, Any]:
+    """Dump a vtable's slots with class names, or find which tables hold a function."""
+    started = time.time()
+    entry = _entry(a["binary"])
+    program = entry["program"]
+    mem = program.getMemory()
+    limit = _num(a, "limit", 64)
+    matches = _num(a, "matches", 8)
+    mask = 0xFFFFFFFFFFFFFFFF
+
+    if a.get("func"):
+        fn = _function(entry, a["func"])
+        if fn is None:
+            raise KeyError(f"function {a['func']!r} not found")
+        value = int(fn.getEntryPoint().getOffset())
+        rows = []
+        for hit in _pointer_hits(program, value, matches * 8):
+            # Walk back over code pointers: the first qword of a vtable is a
+            # method, so the run start is the table start for every entry after it.
+            start = hit
+            for _ in range(400):
+                prev = start.subtract(8)
+                try:
+                    v = int(mem.getLong(prev)) & mask
+                except Exception:  # noqa: BLE001
+                    break
+                if _code_pointer(program, v) is None:
+                    break
+                start = prev
+            sym = program.getSymbolTable().getPrimarySymbol(start)
+            if sym is not None and "meta_ptr" in str(sym.getName()).lower():
+                continue
+            rows.append(
+                {
+                    "vtable": str(start),
+                    "symbol": str(sym.getName(True)) if sym else None,
+                    "rtti": _rtti_of_vtable(program, start),
+                    "slot": (int(hit.getOffset()) - int(start.getOffset())) // 8,
+                }
+            )
+            if len(rows) >= matches:
+                break
+        return {
+            "binary": a["binary"],
+            "mode": "reverse",
+            "function": {"addr": str(fn.getEntryPoint()), "name": str(fn.getName())},
+            "count": len(rows),
+            "tables": rows,
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    target = a.get("target") or a.get("addr")
+    if not target:
+        raise ValueError("give `target` (vtable address or class name) or `func`")
+    addresses = _vtable_addresses(entry, str(target))
+    if not addresses:
+        raise KeyError(f"no vtable for {target!r} (try `symbols -q vftable`)")
+    tables = []
+    for addr in addresses[:matches]:
+        sym = program.getSymbolTable().getPrimarySymbol(addr)
+        tables.append(
+            {
+                "vtable": str(addr),
+                "symbol": str(sym.getName(True)) if sym else None,
+                "rtti": _rtti_of_vtable(program, addr),
+                "slots": _vtable_slots(program, addr, limit),
+            }
+        )
+    return {
+        "binary": a["binary"],
+        "mode": "table",
+        "matched": len(addresses),
+        "count": len(tables),
+        "tables": tables,
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+_VTABLE_MIN_SLOTS = 3
+_VTABLE_MAX_SLOTS = 512
+_VTABLES_SCAN_CHUNK = 1 << 22
+
+
+def _vtables_file(binary: str) -> Path:
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(binary))
+    return _ghlab_dir() / "vtables" / f"{slug}.json"
+
+
+def _code_ranges(program) -> tuple[list[int], list[int]]:
+    """Sorted [start, end) of every executable block: a cheap "is this code?" test."""
+    pairs = []
+    for block in program.getMemory().getBlocks():
+        if block.isInitialized() and block.isExecute():
+            start = int(block.getStart().getOffset())
+            pairs.append((start, int(block.getEnd().getOffset()) + 1))
+    pairs.sort()
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _in_code(los: list[int], his: list[int], value: int) -> bool:
+    i = bisect.bisect_right(los, value) - 1
+    return i >= 0 and value < his[i]
+
+
+def _scan_pointer_runs(program, min_slots: int) -> list[tuple[int, int]]:
+    """Every maximal run of 8-aligned code pointers in non-executable memory.
+
+    A vtable is exactly such a run -- MSVC puts no gap between slots -- so one
+    pass over .rdata yields the whole class map, instead of one .rdata scan per
+    function for the reverse probe.
+    """
+    mem = program.getMemory()
+    los, his = _code_ranges(program)
+    runs: list[tuple[int, int]] = []
+    for block in mem.getBlocks():
+        if not block.isInitialized() or block.isExecute():
+            continue
+        base = int(block.getStart().getOffset())
+        size = int(block.getSize())
+        if size < min_slots * 8:
+            continue
+        run_start = -1
+        for off in range(0, size, _VTABLES_SCAN_CHUNK):
+            want = min(_VTABLES_SCAN_CHUNK, size - off)
+            want -= want % 8
+            if want <= 0:
+                break
+            data, _short = _read_region(mem, block.getStart().add(off), want)
+            count = len(data) // 8
+            # unpack is the fast path: one getBytes per 4 MB, no crossing per qword.
+            values = struct.unpack_from("<%dQ" % count, data)
+            for i in range(count):
+                va = base + off + i * 8
+                if _in_code(los, his, values[i]):
+                    if run_start < 0:
+                        run_start = va
+                    continue
+                if run_start >= 0:
+                    n = (va - run_start) // 8
+                    if n >= min_slots:
+                        runs.append((run_start, n))
+                    run_start = -1
+        if run_start >= 0:
+            n = (base + size - run_start) // 8
+            if n >= min_slots:
+                runs.append((run_start, n))
+    return runs
+
+
+def build_vtables(e, min_slots: int = _VTABLE_MIN_SLOTS) -> list[list[Any]]:
+    """`[vtable, rtti_class, symbol_name, [slot_value, ...]]` for every real table.
+
+    A run only counts when the qword in front of it is a usable MSVC
+    CompleteObjectLocator (or the table carries a `vftable` label): that throws
+    away the many read-only pointer arrays that are not class tables.  Slots are
+    then read past the scan's run end, because a table may contain a hole (a slot
+    Ghidra has no function for) in the middle and still go on for 20 more methods.
+    """
+    program = e["program"]
+    mem = program.getMemory()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    st = program.getSymbolTable()
+    los, his = _code_ranges(program)
+    rows: list[list[Any]] = []
+    for start, n in _scan_pointer_runs(program, min_slots):
+        addr = space.getAddress(start)
+        rtti = _rtti_of_vtable(program, addr)
+        sym = st.getPrimarySymbol(addr)
+        name = str(sym.getName(True)) if sym is not None else None
+        if rtti is None and not (name and _VTABLE_NAME.search(name)):
+            continue
+        raw, _short = _read_region(mem, addr, _VTABLE_MAX_SLOTS * 8)
+        count = len(raw) // 8
+        values = list(struct.unpack_from("<%dQ" % count, raw)) if count else []
+        slots: list[int] = []
+        miss = 0
+        for value in values:
+            if _in_code(los, his, value):
+                miss = 0
+                slots.append(value)
+                continue
+            miss += 1
+            if miss >= 2:
+                break
+            slots.append(value)  # one-hole tolerance, same rule as `vtable`
+        if len(slots) < max(n, min_slots):
+            continue
+        rows.append([start, (rtti or {}).get("class"), name, slots])
+    return rows
+
+
+def load_vtables(
+    e, refresh: bool = False, min_slots: int = _VTABLE_MIN_SLOTS
+) -> dict[str, Any]:
+    """The vtable index, cached on disk per `(md5, modification number, min_slots)`."""
+    started = time.time()
+    program = e["program"]
+    meta = _index_meta(program)
+    path = _vtables_file(str(e["binary"]))
+    if not refresh and path.exists():
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            cached_meta = raw.get("meta") or {}
+            same = (
+                cached_meta.get("md5") == meta["md5"]
+                and cached_meta.get("mods") == meta["mods"]
+                and int(cached_meta.get("min_slots", -1)) == min_slots
+            )
+        except (OSError, ValueError):
+            same = False
+        if same:
+            return {
+                "tables": raw.get("tables") or [],
+                "meta": cached_meta,
+                "cached": True,
+                "path": str(path),
+                "elapsed_ms": int((time.time() - started) * 1000),
+            }
+    tables = build_vtables(e, min_slots)
+    meta = dict(meta, min_slots=min_slots, built_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"meta": meta, "tables": tables}), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+    return {
+        "tables": tables,
+        "meta": meta,
+        "cached": False,
+        "path": str(path),
+        "elapsed_ms": int((time.time() - started) * 1000),
+    }
+
+
+def cmd_vtables(a: dict[str, Any]) -> dict[str, Any]:
+    """Every vtable in one pass: class (RTTI) -> slots, or slot -> classes."""
+    started = time.time()
+    entry = _entry(a["binary"])
+    program = entry["program"]
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    min_slots = _num(a, "min_slots", _VTABLE_MIN_SLOTS)
+    table = load_vtables(entry, refresh=bool(a.get("refresh")), min_slots=min_slots)
+    rows = table["tables"]
+    limit = _num(a, "limit", 50)
+
+    def tail(mode: str) -> dict[str, Any]:
+        return {
+            "binary": a["binary"],
+            "mode": mode,
+            "total": len(rows),
+            "classes": sum(1 for r in rows if r[1]),
+            "cached": table["cached"],
+            "built_at": (table["meta"] or {}).get("built_at"),
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
+
+    if a.get("func"):
+        fn = _function(entry, a["func"])
+        if fn is None:
+            raise KeyError(f"function {a['func']!r} not found")
+        # A thunk forwards to its target: accept either identity as the slot value.
+        values = {int(fn.getEntryPoint().getOffset())}
+        if fn.isThunk() and fn.getThunkedFunction(False) is not None:
+            values.add(int(fn.getThunkedFunction(False).getEntryPoint().getOffset()))
+        hits = []
+        for vt, cls, name, slots in rows:
+            for i, value in enumerate(slots):
+                if value not in values:
+                    continue
+                hits.append(
+                    {
+                        "vtable": str(space.getAddress(vt)),
+                        "class": cls,
+                        "symbol": name,
+                        "slot": i,
+                        "offset": f"0x{i * 8:x}",
+                    }
+                )
+                break
+            if len(hits) >= limit:
+                break
+        out = tail("func")
+        out.update(
+            {
+                "function": {"addr": str(fn.getEntryPoint()), "name": str(fn.getName())},
+                "count": len(hits),
+                "tables": hits,
+            }
+        )
+        return out
+
+    rx = re.compile(str(a["class"]), re.I) if a.get("class") else None
+    slot_cap = _num(a, "slots", 64 if rx else 0)
+    matched = [
+        r
+        for r in rows
+        if rx is None or (r[1] and rx.search(r[1])) or (r[2] and rx.search(r[2]))
+    ]
+    tables = []
+    for vt, cls, name, slots in matched[:limit]:
+        addr = space.getAddress(vt)
+        row: dict[str, Any] = {
+            "vtable": str(addr),
+            "class": cls,
+            "symbol": name,
+            "size": len(slots),
+            "rtti": _rtti_of_vtable(program, addr),
+        }
+        if slot_cap:
+            row["slots"] = _vtable_slots(program, addr, slot_cap)
+        tables.append(row)
+    out = tail("class" if rx else "index")
+    out.update({"matched": len(matched), "count": len(tables), "tables": tables})
+    return out
 
 
 def _split_operands(text: str) -> list[str]:
@@ -6670,6 +7286,9 @@ HANDLERS = {
     "struct": cmd_struct,
     "imports": cmd_imports,
     "exports": cmd_exports,
+    "symbols": cmd_symbols,
+    "vtable": cmd_vtable,
+    "vtables": cmd_vtables,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,
     "rename": cmd_rename,

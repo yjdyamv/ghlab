@@ -79,6 +79,83 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "ghlab_symbols",
+        "description": (
+            "Search the symbol table by regex: class namespaces, vtable labels, RTTI type "
+            "descriptors, globals. On a stripped MSVC DLL this is where the class names live; "
+            "indexed on disk, so repeats are cheap."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "query": {"type": "string", "description": "regex over name or class namespace"},
+                "kind": {
+                    "type": "string",
+                    "description": "regex over the kind: Function, Label, Class, Namespace, Global",
+                },
+                "limit": _LIMIT,
+                "offset": {"type": "integer", "minimum": 0, "description": "skip N matches"},
+                "refresh": {"type": "boolean", "description": "rebuild the cached table"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_vtable",
+        "description": (
+            "Virtual dispatch table: dump every slot (resolved to a function, with pure/stub "
+            "flags) and the class name from the MSVC RTTI CompleteObjectLocator in front of it. "
+            "`func` runs it backwards: which vtables hold this function, and in which slot."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {
+                    "type": "string",
+                    "description": "vtable address (0x...) or a class-name regex",
+                },
+                "func": {
+                    "type": "string",
+                    "description": "instead: which vtables contain this function",
+                },
+                "limit": {"type": "integer", "minimum": 1, "description": "max slots per table"},
+                "matches": {"type": "integer", "minimum": 1, "description": "max tables"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
+        "name": "ghlab_vtables",
+        "description": (
+            "Whole-program vtable index: one scan of read-only memory finds every table, its "
+            "RTTI class name and its slots, then answers 'which class implements this' "
+            "instantly. `class` filters by class/symbol regex; `func` is the reverse lookup "
+            "(slot -> classes). Cached on disk; `refresh` rebuilds."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "class": {"type": "string", "description": "regex over the RTTI class name"},
+                "func": {
+                    "type": "string",
+                    "description": "instead: which tables hold this function, and in which slot",
+                },
+                "limit": {"type": "integer", "minimum": 1, "description": "max tables"},
+                "slots": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "max slots resolved per table (0 = listing only)",
+                },
+                "min_slots": {"type": "integer", "minimum": 1, "description": "min run length"},
+                "refresh": {"type": "boolean", "description": "rebuild the cached index"},
+            },
+            "required": ["binary"],
+        },
+    },
+    {
         "name": "ghlab_imports",
         "description": (
             "Drill into imports: for each API, how many distinct functions call it, the biggest "
@@ -679,6 +756,9 @@ _COMMANDS = {
     "ghlab_names": "names",
     "ghlab_imports": "imports",
     "ghlab_exports": "exports",
+    "ghlab_symbols": "symbols",
+    "ghlab_vtable": "vtable",
+    "ghlab_vtables": "vtables",
     "ghlab_scan": "scan",
     "ghlab_offsets": "offsets",
     "ghlab_struct": "struct",

@@ -183,6 +183,75 @@ def fmt_exports(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_symbols(r: dict[str, Any]) -> str:
+    out = [f"# {r['matched']} of {r['total']} symbol(s) matched  ({r['elapsed_ms']}ms)"]
+    if not r.get("symbols"):
+        out.append("  (nothing matched; try `-q vftable` or a wider regex)")
+    for row in r.get("symbols") or []:
+        label = row.get("full") or row["name"]
+        out.append(f"  {row['addr']:<12} {row['kind']:<12} {label}")
+        if row.get("demangled"):
+            out.append(f"  {'':<12} {'':<12} {row['demangled']}")
+    return chr(10).join(out)
+
+
+def fmt_vtable(r: dict[str, Any]) -> str:
+    if r.get("mode") == "reverse":
+        fn = r.get("function") or {}
+        out = [f"# {r['count']} table(s) hold {fn.get('name')} ({fn.get('addr')})"]
+        for t in r.get("tables") or []:
+            cls = (t.get("rtti") or {}).get("class")
+            tail = f"  [{cls}]" if cls else ""
+            out.append(f"  {t['vtable']:<12} slot {t['slot']:<3} {t['symbol'] or '-'}{tail}")
+        return chr(10).join(out)
+    out = [f"# {r['count']} of {r['matched']} vtable(s)  ({r['elapsed_ms']}ms)"]
+    if not r.get("tables"):
+        out.append("  (nothing matched; `symbols -q vftable` lists what is named)")
+    for t in r.get("tables") or []:
+        rtti = t.get("rtti") or {}
+        head = f"  {t['vtable']}  {t['symbol'] or '-'}"
+        if rtti.get("class"):
+            head += f"  [{rtti['class']}]"
+        out.append(head)
+        if rtti.get("raw"):
+            out.append(f"    rtti {rtti['raw']}")
+        for s in t.get("slots") or []:
+            mark = "pure" if s.get("pure") else ("stub" if s.get("stub") else "")
+            name = s.get("name") or (s.get("addr") or "-")
+            out.append(f"    {s['offset']:>5} {str(s.get('addr') or '-'):<12} {name} {mark}".rstrip())
+    return chr(10).join(out)
+
+
+def fmt_vtables(r: dict[str, Any]) -> str:
+    if r.get("mode") == "func":
+        fn = r.get("function") or {}
+        out = [f"# {r['count']} table(s) hold {fn.get('name')} ({fn.get('addr')})"]
+        if not r.get("tables"):
+            out.append("  (no vtable slot holds it: a free function, or the index is stale)")
+        for t in r.get("tables") or []:
+            tail = f"  [{t['class']}]" if t.get("class") else ""
+            out.append(f"  {t['vtable']:<12} slot {t['slot']:<3} {t['symbol'] or '-'}{tail}")
+        return chr(10).join(out)
+    state = "cached" if r.get("cached") else "built"
+    out = [
+        f"# {r.get('matched', r['total'])} of {r['total']} vtable(s), "
+        f"{r['classes']} with RTTI ({state}, {r['elapsed_ms']}ms)"
+    ]
+    if not r.get("tables"):
+        out.append("  (no table matched; `vtables -c TypoLib` narrows by class)")
+    for t in r.get("tables") or []:
+        out.append(
+            f"  {t['vtable']}  {str(t.get('size', 0)):>3} slots  {t['class'] or t['symbol'] or '-'}"
+        )
+        for s in t.get("slots") or []:
+            mark = "pure" if s.get("pure") else ("stub" if s.get("stub") else "")
+            name = s.get("name") or (s.get("addr") or "-")
+            out.append(
+                f"    {s['offset']:>5} {str(s.get('addr') or '-'):<12} {name} {mark}".rstrip()
+            )
+    return chr(10).join(out)
+
+
 def fmt_names(r: dict[str, Any]) -> str:
     state = "cached" if r.get("cached") else "built"
     out = [
@@ -1030,6 +1099,9 @@ FORMATTERS = {
     "import": fmt_import,
     "imports": fmt_imports,
     "exports": fmt_exports,
+    "symbols": fmt_symbols,
+    "vtable": fmt_vtable,
+    "vtables": fmt_vtables,
     "names": fmt_names,
     "xrefs": fmt_xrefs,
     "graph": fmt_graph,
@@ -2305,6 +2377,9 @@ _HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "imports",
             "exports",
             "names",
+            "symbols",
+            "vtable",
+            "vtables",
             "xrefs",
             "bytes",
             "scan",
@@ -2695,6 +2770,82 @@ def build_parser() -> argparse.ArgumentParser:
                 "query": a.query,
                 "limit": a.limit,
                 "min_len": a.min_len,
+                "refresh": a.refresh,
+            },
+        )
+    )
+
+    p = sub.add_parser("symbols", parents=[common], help="search the symbol table")
+    p.add_argument("binary")
+    p.add_argument("-q", "--query", help="regex over the name or its class namespace")
+    p.add_argument("-k", "--kind", help="regex over the kind (Function, Label, Class, ...)")
+    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
+    p.add_argument("--offset", type=int, default=0, help="skip this many matches")
+    p.add_argument("--refresh", action="store_true", help="rebuild the cached symbol table")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "symbols",
+            {
+                "binary": a.binary,
+                "query": a.query,
+                "kind": a.kind,
+                "limit": a.limit,
+                "offset": a.offset,
+                "refresh": a.refresh,
+            },
+        )
+    )
+
+    p = sub.add_parser(
+        "vtable",
+        parents=[common],
+        help="dump a vtable's slots with its RTTI class, or find who holds a function",
+    )
+    p.add_argument("binary")
+    p.add_argument("target", nargs="?", help="vtable address, or a class-name regex")
+    p.add_argument(
+        "-f", "--func", dest="vfunc", help="instead: which vtables contain this function"
+    )
+    p.add_argument("-n", "--limit", type=int, default=64, help="max slots per table")
+    p.add_argument("--matches", type=int, default=8, help="max tables to dump")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "vtable",
+            {
+                "binary": a.binary,
+                "target": a.target,
+                "func": a.vfunc,
+                "limit": a.limit,
+                "matches": a.matches,
+            },
+        )
+    )
+
+    p = sub.add_parser(
+        "vtables",
+        parents=[common],
+        help="index every vtable in one scan: class -> slots, or slot -> classes",
+    )
+    p.add_argument("binary")
+    p.add_argument("-c", "--class", dest="vclass", help="regex over the RTTI class name")
+    p.add_argument("-f", "--func", dest="vfunc", help="instead: which tables hold this function")
+    p.add_argument("-n", "--limit", type=int, default=50, help="max tables")
+    p.add_argument("--slots", type=int, help="max slots per table (default: all with -c)")
+    p.add_argument("--min-slots", dest="min_slots", type=int, help="ignore shorter runs")
+    p.add_argument("--refresh", action="store_true", help="rebuild the cached index")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "vtables",
+            {
+                "binary": a.binary,
+                "class": a.vclass,
+                "func": a.vfunc,
+                "limit": a.limit,
+                "slots": a.slots,
+                "min_slots": a.min_slots,
                 "refresh": a.refresh,
             },
         )

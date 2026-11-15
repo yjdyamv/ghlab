@@ -126,10 +126,28 @@ _SPECS = [
         "search string data (refs: which functions use it)",
     ),
     Spec(
+        "symbols",
+        ("binary",),
+        ("query", "kind", "limit", "offset", "refresh"),
+        "search the symbol table (class names, vtable labels, RTTI descriptors, globals)",
+    ),
+    Spec(
+        "vtable",
+        ("binary",),
+        ("target", "addr", "func", "limit", "matches", "refresh"),
+        "dump a vtable's slots with class names (RTTI), or find which tables hold a function",
+    ),
+    Spec(
         "names",
         ("binary",),
         ("query", "limit", "min_len", "refresh"),
         "method names recovered from assertion strings (Class::Method : failure)",
+    ),
+    Spec(
+        "vtables",
+        ("binary",),
+        ("class", "func", "limit", "slots", "min_slots", "refresh"),
+        "whole-program vtable index in one scan: RTTI class -> slots, or slot -> classes",
     ),
     Spec(
         "offsets",

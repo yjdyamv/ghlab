@@ -192,5 +192,161 @@ class SmallFormatterTest(unittest.TestCase):
         )
 
 
+class SymbolAndVtableFormatterTest(unittest.TestCase):
+    """`symbols`/`vtable` answer "which class is this", so the class name must survive.
+
+    MSVC encodes a nested name inside-out: `.?AVTableLine@TypoLib@@` is
+    `TypoLib::TableLine`.  The vtable dump is only worth anything if that name is
+    printed next to the slots, because the slots themselves are anonymous.
+    """
+
+    def test_rtti_name_is_reversed_into_a_qualified_class(self):
+        self.assertEqual(session._rtti_class_name(".?AVTableLine@TypoLib@@"), "TypoLib::TableLine")
+        self.assertEqual(session._rtti_class_name(".?AUAbsObject@@"), "AbsObject")
+        # Template instantiations keep the `?$` marker, the way Ghidra labels them.
+        self.assertEqual(
+            session._rtti_class_name(".?AV?$DlAtomDataImpl@UIKAtomData@@@@"),
+            "UIKAtomData::?$DlAtomDataImpl",
+        )
+        self.assertIsNone(session._rtti_class_name("not rtti"))
+
+    def test_symbols_shows_the_qualified_name_and_the_demangled_form(self):
+        text = cli.fmt_symbols(
+            {
+                "matched": 1,
+                "total": 785252,
+                "elapsed_ms": 328,
+                "symbols": [
+                    {
+                        "addr": "1818d7300",
+                        "name": "??_7AbsObject@@6B@",
+                        "kind": "Label",
+                        "full": "AbsObject::vftable",
+                        "demangled": "const AbsObject::`vftable'",
+                    }
+                ],
+            }
+        )
+        self.assertIn("# 1 of 785252 symbol(s) matched", text)
+        self.assertIn("AbsObject::vftable", text)
+        self.assertIn("`vftable'", text)
+
+    def test_vtable_prints_the_class_from_rtti_beside_the_slots(self):
+        text = cli.fmt_vtable(
+            {
+                "mode": "table",
+                "count": 1,
+                "matched": 1,
+                "elapsed_ms": 667,
+                "tables": [
+                    {
+                        "vtable": "181ad7e90",
+                        "symbol": "TypoLib::TableLine::vftable",
+                        "rtti": {"class": "TypoLib::TableLine", "raw": ".?AVTableLine@TypoLib@@"},
+                        "slots": [
+                            {"slot": 0, "offset": "0x0", "addr": "1811b5120", "name": "FUN_1811b5120"},
+                            {
+                                "slot": 1,
+                                "offset": "0x8",
+                                "addr": "1800086c0",
+                                "name": "FUN_1800086c0",
+                                "stub": True,
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+        self.assertIn("[TypoLib::TableLine]", text)
+        self.assertIn(".?AVTableLine@TypoLib@@", text)
+        self.assertIn("FUN_1811b5120", text)
+        self.assertIn("FUN_1800086c0 stub", text)
+
+    def test_reverse_vtable_lookup_names_the_slot(self):
+        text = cli.fmt_vtable(
+            {
+                "mode": "reverse",
+                "count": 1,
+                "function": {"addr": "1800047d0", "name": "FUN_1800047d0"},
+                "tables": [
+                    {
+                        "vtable": "1818d7300",
+                        "slot": 3,
+                        "symbol": "AbsObject::vftable",
+                        "rtti": {"class": "AbsObject"},
+                    }
+                ],
+            }
+        )
+        self.assertIn("1 table(s) hold FUN_1800047d0", text)
+        self.assertIn("slot 3", text)
+        self.assertIn("[AbsObject]", text)
+
+
+class VtablesIndexFormatterTest(unittest.TestCase):
+    """The whole-program index answers "which class implements this slot".
+
+    Its value is the class name on every row: a listing of 14009 anonymous tables
+    would be no better than the per-function probe it replaces.
+    """
+
+    def test_listing_puts_the_class_and_the_slot_count_on_one_line(self):
+        text = cli.fmt_vtables(
+            {
+                "mode": "class",
+                "total": 14009,
+                "classes": 14009,
+                "matched": 2,
+                "count": 2,
+                "cached": True,
+                "elapsed_ms": 240,
+                "tables": [
+                    {
+                        "vtable": "181ad7e90",
+                        "class": "TypoLib::TableLine",
+                        "symbol": "TypoLib::TableLine::vftable",
+                        "size": 23,
+                        "slots": [
+                            {"slot": 0, "offset": "0x0", "addr": "1811b5120", "name": "FUN_1811b5120"}
+                        ],
+                    },
+                    {"vtable": "181ad7f10", "class": None, "symbol": None, "size": 4},
+                ],
+            }
+        )
+        self.assertIn("2 of 14009 vtable(s), 14009 with RTTI (cached, 240ms)", text)
+        self.assertIn("181ad7e90   23 slots  TypoLib::TableLine", text)
+        self.assertIn("FUN_1811b5120", text)
+        self.assertIn("   4 slots  -", text)
+
+    def test_reverse_mode_names_the_slot_and_the_class(self):
+        text = cli.fmt_vtables(
+            {
+                "mode": "func",
+                "total": 14009,
+                "classes": 14009,
+                "count": 1,
+                "function": {"addr": "181353b00", "name": "FUN_181353b00"},
+                "tables": [
+                    {
+                        "vtable": "181ae76e0",
+                        "class": "TypoLib::TextFramePageRenderContext",
+                        "symbol": "TypoLib::TextFramePageRenderContext::vftable",
+                        "slot": 16,
+                    }
+                ],
+            }
+        )
+        self.assertIn("1 table(s) hold FUN_181353b00", text)
+        self.assertIn("slot 16", text)
+        self.assertIn("[TypoLib::TextFramePageRenderContext]", text)
+
+    def test_a_free_function_says_so_instead_of_printing_an_empty_list(self):
+        text = cli.fmt_vtables(
+            {"mode": "func", "total": 1, "classes": 1, "count": 0, "tables": []}
+        )
+        self.assertIn("no vtable slot holds it", text)
+
+
 if __name__ == "__main__":
     unittest.main()
