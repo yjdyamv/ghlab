@@ -3399,7 +3399,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="assert_",
         action="append",
         metavar="KIND=VALUE",
-        help="checkable claim, e.g. const=0x41 / string=Autosave / import=RegSetValueExW",
+        help=(
+            "checkable claim, e.g. const=0x41 / string=Autosave / import=RegSetValueExW / "
+            "decomp='TypoTextNotify<65537>' (regex on the decompiled C; any kind also "
+            "takes != for 'must not appear')"
+        ),
     )
     p.set_defaults(
         func=lambda a: _call(

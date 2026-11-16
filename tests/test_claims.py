@@ -244,3 +244,64 @@ class NoteTextTest(unittest.TestCase):
         spec = protocol.SPECS["note"]
         self.assertEqual(spec.required, ("binary",))
         self.assertIn("text", spec.optional)
+
+
+class NotEqualsTest(unittest.TestCase):
+    def test_parse_not_equals(self):
+        spec = session._parse_claim("decomp!=0x20100")
+        self.assertEqual((spec["kind"], spec["op"], spec["value"]), ("decomp", "!=", "0x20100"))
+
+    def test_compare_not_equals(self):
+        self.assertTrue(session._compare(5, "!=", 6))
+        self.assertFalse(session._compare(5, "!=", 5))
+
+    def test_decomp_is_a_known_kind(self):
+        self.assertIn("decomp", session._CLAIM_KINDS)
+
+
+class DecompClaimTest(unittest.TestCase):
+    """`decomp=` judges the note against decompiled C, not instruction immediates."""
+
+    def _entry(self, code):
+        res = mock.Mock()
+        res.decompileCompleted.return_value = True
+        res.getDecompiledFunction.return_value.getC.return_value = code
+        return {"decomp": mock.Mock(decompileFunction=mock.Mock(return_value=res))}
+
+    def test_regex_hit(self):
+        entry = self._entry("if (iVar8 == 0x20100) {")
+        ok, detail = session._claim_decomp(
+            entry, object(), session._parse_claim("decomp=0x2010[0]")
+        )
+        self.assertTrue(ok)
+        self.assertIn("1 line(s)", detail)
+
+    def test_miss_reports_scanned_lines(self):
+        entry = self._entry("int x = 0;\nint y = 1;")
+        ok, detail = session._claim_decomp(entry, object(), session._parse_claim("decomp=0xdead"))
+        self.assertFalse(ok)
+        self.assertIn("2 line(s) scanned", detail)
+
+    def test_not_equals_passes_only_when_absent(self):
+        entry = self._entry("kind = 0x30010;")
+        ok, _ = session._claim_decomp(entry, object(), session._parse_claim("decomp!=0xdead"))
+        self.assertTrue(ok)
+        ok, detail = session._claim_decomp(entry, object(), session._parse_claim("decomp!=0x30010"))
+        self.assertFalse(ok)
+        self.assertIn("still present", detail)
+
+    def test_unfinished_decompile_is_unjudged(self):
+        res = mock.Mock()
+        res.decompileCompleted.return_value = False
+        entry = {"decomp": mock.Mock(decompileFunction=mock.Mock(return_value=res))}
+        ok, detail = session._claim_decomp(entry, object(), session._parse_claim("decomp=x"))
+        self.assertIsNone(ok)
+        self.assertIn("decompile failed", detail)
+
+    def test_bad_regex_is_a_value_error(self):
+        with self.assertRaises(ValueError):
+            session._claim_decomp(
+                self._entry(""),
+                object(),
+                session._parse_claim("decomp=("),  # unbalanced
+            )

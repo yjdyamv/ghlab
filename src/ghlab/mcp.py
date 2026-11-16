@@ -427,7 +427,9 @@ TOOLS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": (
                         "checkable claims about that function, e.g. const=0x41, string=Autosave, "
-                        "import=RegSetValueExW, calls=FUN_140010350, size>=200"
+                        "import=RegSetValueExW, calls=FUN_140010350, size>=200, "
+                        "decomp='TypoTextNotify<65537>' (regex on the decompiled C). Any kind "
+                        "also takes != for 'must not appear'."
                     ),
                 },
             },

@@ -6356,7 +6356,17 @@ def cmd_bookmark(a: dict[str, Any]) -> dict[str, Any]:
 # ------------------------------------------------------------------- evidence
 
 
-_CLAIM_KINDS = ("const", "string", "import", "calls", "size", "bytes", "symbol", "name")
+_CLAIM_KINDS = (
+    "const",
+    "string",
+    "import",
+    "calls",
+    "size",
+    "bytes",
+    "symbol",
+    "name",
+    "decomp",
+)
 
 
 def _parse_claim(text: Any) -> dict[str, str]:
@@ -6364,7 +6374,7 @@ def _parse_claim(text: Any) -> dict[str, str]:
     raw = str(text).strip()
     if not raw:
         raise ValueError("empty claim")
-    for op in (">=", "<=", ">", "<"):
+    for op in ("!=", ">=", "<=", ">", "<"):
         head, found, value = raw.partition(op)
         if found and value.strip():
             return {"kind": head.strip().lower(), "op": op, "value": value.strip(), "raw": raw}
@@ -6440,6 +6450,8 @@ def _claim_int_or(text: Any, default: int = 1 << 30) -> int:
 def _compare(value: int, op: str, want: int) -> bool:
     if op == "=":
         return value == want
+    if op == "!=":
+        return value != want
     if op == ">=":
         return value >= want
     if op == "<=":
@@ -6474,6 +6486,34 @@ def _claim_symbol(entry, spec: dict[str, str]) -> tuple[bool | None, str]:
     return False, "no symbol matches"
 
 
+def _claim_decomp(entry, fn, spec: dict[str, str]) -> tuple[bool | None, str]:
+    """Judge a claim against the decompiled C of the function the note sits on.
+
+    Instruction immediates are not the whole truth: a constant the decompiler
+    prints can come from an arithmetic fold (`0x20080 + 0x80` shows up as
+    `0x20100` in the C but never as a scalar operand), so `const=` reports
+    "no constant matches" for a value that is plainly there. This kind checks
+    what the analyst actually reads.
+    """
+    try:
+        pat = re.compile(spec["value"], re.I)
+    except re.error as ex:
+        raise ValueError(f"decomp claim is not a valid regex: {ex}") from ex
+    res = entry["decomp"].decompileFunction(fn, 60, MONITOR)
+    if not res.decompileCompleted():
+        return None, f"decompile failed: {_decomp_failure(res)}"
+    code = str(res.getDecompiledFunction().getC()).replace("\r\n", "\n")
+    lines = code.splitlines()
+    hits = [ln.strip() for ln in lines if pat.search(ln)]
+    absent = spec["op"] == "!="
+    if hits and not absent:
+        return True, f"{len(hits)} line(s): {hits[0][:80]}"
+    if not hits:
+        detail = f"no line matches ({len(lines)} line(s) scanned)"
+        return (True, detail) if absent else (False, detail)
+    return False, f"still present: {hits[0][:80]}"
+
+
 def _check_claim(
     entry, fn, facts: dict[str, Any] | None, addr_text: str | None, claim: str
 ) -> tuple[bool | None, str]:
@@ -6488,6 +6528,8 @@ def _check_claim(
         return _claim_symbol(entry, spec)
     if fn is None or facts is None:
         return None, "note is not attached to a function; point --at at one"
+    if kind == "decomp":
+        return _claim_decomp(entry, fn, spec)
     if kind == "size":
         want = _claim_int(value)
         return _compare(facts["size"], op, want), f"{facts['size']} bytes"
@@ -6507,9 +6549,12 @@ def _check_claim(
         pool = sorted(facts["imports"])
     hits = [x for x in pool if pat.search(x)]
     label = {"string": "strings", "calls": "callees", "import": "imports"}[kind]
-    if hits:
+    if hits and op != "!=":
         return True, f"{label}: {hits[0][:60]}"
-    return False, f"no {label} match ({len(pool)} scanned)"
+    if not hits:
+        detail = f"no {label} match ({len(pool)} scanned)"
+        return (True, detail) if op == "!=" else (False, detail)
+    return False, f"{label} still match: {hits[0][:60]}"
 
 
 def _check_claims(entry, fn, addr_text: str | None, claims: list[str]) -> list[dict[str, Any]]:
