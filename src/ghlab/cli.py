@@ -216,7 +216,7 @@ def fmt_vtable(r: dict[str, Any]) -> str:
         if rtti.get("raw"):
             out.append(f"    rtti {rtti['raw']}")
         for s in t.get("slots") or []:
-            mark = "pure" if s.get("pure") else ("stub" if s.get("stub") else "")
+            mark = "unmapped" if s.get("unmapped") else ("pure" if s.get("pure") else ("stub" if s.get("stub") else ""))
             name = s.get("name") or (s.get("addr") or "-")
             out.append(f"    {s['offset']:>5} {str(s.get('addr') or '-'):<12} {name} {mark}".rstrip())
     return chr(10).join(out)

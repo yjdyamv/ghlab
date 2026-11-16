@@ -171,7 +171,7 @@ class SlotRunTest(unittest.TestCase):
     `TextboxPageRenderContext` came out with 167 slots because the walk tolerated
     two misses and the next class's table starts one column-pointer away: the
     two tables fused into one, and every slot index after that belonged to the
-    neighbouring class.  Only a lone zero (pure-virtual placeholder) is skippable.
+    neighbouring class.  A zero is a placeholder only when a real slot follows it.
     """
 
     def test_stops_at_the_separator_between_two_tables(self) -> None:
@@ -181,9 +181,14 @@ class SlotRunTest(unittest.TestCase):
     def test_keeps_a_single_pure_virtual_zero(self) -> None:
         self.assertEqual(_slot_run([10, 0, 12], lambda v: v != 0), [10, 0, 12])
 
-    def test_two_zeroes_in_a_row_end_the_table(self) -> None:
-        self.assertEqual(_slot_run([10, 0, 0, 12], lambda v: v != 0), [10, 0])
+    def test_keeps_a_run_of_pure_virtual_zeroes(self) -> None:
+        # clang leaves unoverridden virtuels null instead of filling in _purecall
+        self.assertEqual(_slot_run([10, 0, 0, 0, 12], lambda v: v != 0), [10, 0, 0, 0, 12])
+
+    def test_trailing_zeroes_belong_to_the_next_table(self) -> None:
+        # Itanium puts offset-to-top (0) before &typeinfo of the *next* table
+        self.assertEqual(_slot_run([10, 11, 0, 0x181ad2b48], lambda v: 0 < v < 0x1000), [10, 11])
 
     def test_empty_and_zero_starts_are_safe(self) -> None:
         self.assertEqual(_slot_run([], lambda v: True), [])
-        self.assertEqual(_slot_run([0], lambda v: v != 0), [0])
+        self.assertEqual(_slot_run([0], lambda v: v != 0), [])

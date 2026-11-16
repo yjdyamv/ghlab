@@ -1397,36 +1397,71 @@ def _code_pointer(program, value: int) -> Any | None:
     return addr
 
 
-def _vtable_slots(program, vtable: Any, limit: int) -> list[dict[str, Any]]:
-    """Read the pointer array of one vtable until it stops looking like code.
+def _vtable_walk(program, vtable: Any, limit: int) -> tuple[list[int], str]:
+    """Raw slot words of one table, and why the walk stopped.
 
-    A table may end inside a block whose tail is uninitialised (Ghidra leaves the
-    padding after .rdata allocated but blank), so a readable address is not enough:
-    `getLong` there throws, and one such tail must not fail the whole dump.
+    The reason is what makes a slot count honest:
+
+    * ``separator`` - the next word is neither code nor zero, so the table ends
+      there and the word count is the slot count;
+    * ``unreadable`` - the word could not be read at all (a link-time addend Ghidra
+      never applied, a blank block tail).  The true length is then unknown, and the
+      index's head-to-head distance is the better estimate;
+    * ``limit`` - the caller's cap was hit.
     """
     mem = program.getMemory()
-    fm = program.getFunctionManager()
-    st = program.getSymbolTable()
-    block = mem.getBlock(vtable)
-    slots: list[dict[str, Any]] = []
-    nulls = 0
+    space = program.getAddressFactory().getDefaultAddressSpace()
     mask = 0xFFFFFFFFFFFFFFFF
+    extents = [
+        (int(b.getStart().getOffset()), int(b.getEnd().getOffset()))
+        for b in mem.getBlocks()
+        if b.isInitialized()
+    ]
+    low = min(e[0] for e in extents) if extents else 0
+    high = max(e[1] for e in extents) if extents else 0
+    values: list[int] = []
     for i in range(limit):
         at = vtable.add(i * 8)
-        if block is None or not block.contains(at):
-            break
         try:
             value = int(mem.getLong(at)) & mask
-        except Exception:  # noqa: BLE001 - uninitialised tail: the table ends here
-            break
+        except Exception:  # noqa: BLE001 - uninitialised tail or unmapped addend
+            return values, "unreadable"
+        values.append(value)
+        if value and _code_pointer(program, value) is None:
+            # A separator is a *pointer* to data (MSVC's locator, Itanium's
+            # &typeinfo).  Two things are not: string data, which reads as a huge
+            # "address", and a link-time addend Ghidra never applied, which lands
+            # just past the end of the last block.
+            if value < low or value > high + (1 << 20):
+                return values, "separator"
+            readable = False
+            target_addr = space.getAddress(value)
+            block = mem.getBlock(target_addr)
+            if block is not None and block.isInitialized():
+                try:
+                    _read_region(mem, target_addr, 8)  # a block tail may be blank
+                    readable = True
+                except ValueError:
+                    readable = False
+            return values, ("separator" if readable else "dangling")
+    return values, "limit"
+
+
+def _slot_rows(program, vtable: Any, values: list[int]) -> list[dict[str, Any]]:
+    """Slot dictionaries for one table's words, stopping at the separator."""
+    fm = program.getFunctionManager()
+    st = program.getSymbolTable()
+    slots: list[dict[str, Any]] = []
+    pending: list[dict[str, Any]] = []  # zeros that only count if a slot follows
+    for i, value in enumerate(values):
         target = _code_pointer(program, value)
         if target is None:
-            if value != 0 or nulls >= 1:  # only a lone pure-virtual 0 may be skipped
-                break
-            nulls += 1
-            slots.append({"slot": i, "offset": f"0x{i * 8:x}", "addr": None})
+            if value != 0:
+                break  # separator word: the next table starts here
+            pending.append({"slot": i, "offset": f"0x{i * 8:x}", "addr": None})
             continue
-        nulls = 0
+        slots.extend(pending)
+        pending = []
         fn = fm.getFunctionAt(target)
         sym = st.getPrimarySymbol(target)
         row: dict[str, Any] = {
@@ -1448,6 +1483,12 @@ def _vtable_slots(program, vtable: Any, limit: int) -> list[dict[str, Any]]:
                 pass
         slots.append(row)
     return slots
+
+
+def _vtable_slots(program, vtable: Any, limit: int) -> list[dict[str, Any]]:
+    """Read the pointer array of one vtable until it stops looking like code."""
+    values, _reason = _vtable_walk(program, vtable, limit)
+    return _slot_rows(program, vtable, values)
 
 
 def _vtable_addresses(entry, target: str) -> list[Any]:
@@ -1583,33 +1624,78 @@ def cmd_vtable(a: dict[str, Any]) -> dict[str, Any]:
 
 
 _VTABLE_MIN_SLOTS = 3
-_VTABLE_MAX_SLOTS = 512
-_VTABLE_RULE = 2  # bumped when the slot-boundary rule changes, to drop stale caches
+_VTABLE_MAX_SLOTS = 512  # longest table we will read
+_VTABLE_SPAN_CAP = 256  # longest table the head-to-head distance is trusted for
+_VTABLE_RULE = 5  # bumped when the slot-boundary rule changes, to drop stale caches
 
 
-def _slot_run(values, is_code, max_nulls: int = 1) -> list[int]:
-    """Slot values up to the first separator; a lone 0 is a pure-virtual placeholder.
+def _slot_run(values, is_code) -> list[int]:
+    """Slot values of one table, up to the word that separates it from the next.
 
-    The two ABIs separate neighbouring tables with a single non-code qword (MSVC:
-    the CompleteObjectLocator pointer at -8; Itanium: offset-to-top then &typeinfo),
-    so tolerating *two* misses happily walked from one class into the next and
-    reported a 167-slot `TextboxPageRenderContext`.  Only a zero may be skipped, and
-    only once: real slots always point into an executable block, because the test
-    is on the block, not on whether Ghidra happened to create a function there.
+    A slot either points into an executable block — every virtual function does,
+    whatever the compiler — or is 0, a virtual the class leaves to its subclasses:
+    MSVC sometimes fills those with `_purecall`, clang leaves them null.  A table
+    ends at the first non-zero value that is not executable: MSVC puts the
+    CompleteObjectLocator pointer of the next table at -8, Itanium puts
+    offset-to-top (usually 0) and then &typeinfo.
+
+    So zeros are held back instead of appended: they are slots only if a real slot
+    follows.  A trailing zero is the next table's offset-to-top, and counting it
+    made every ELF table look one slot longer than its MSVC twin.
     """
     out: list[int] = []
-    nulls = 0
+    pending = 0
     for value in values:
         if is_code(value):
+            out.extend([0] * pending)
+            pending = 0
             out.append(value)
-            nulls = 0
             continue
-        if value == 0 and nulls < max_nulls:
-            out.append(value)
-            nulls += 1
+        if value == 0:
+            pending += 1
             continue
         break
     return out
+
+
+def _looks_like_itanium_head(program, addr) -> bool:
+    """Is `addr` the `&typeinfo` word of an Itanium vtable head?
+
+    A typeinfo is an object whose first word points at the typeinfo vtable and
+    whose second word points at the type-name string; both live in the data
+    sections, never in code.  Testing that is what lets the walk keep a trailing
+    pure-virtual zero that belongs to the class while dropping the one before it,
+    which is the next table's offset-to-top.
+    """
+    ti = _read_qword(program, addr)
+    if ti is None:
+        return False
+    vt = _read_qword(program, ti)
+    name = _read_qword(program, ti + 8)
+    if not vt or not name:
+        return False
+    mem = program.getMemory()
+    space = program.getAddressFactory().getDefaultAddressSpace()
+    for value in (vt, name):
+        block = mem.getBlock(space.getAddress(value))
+        if block is None or block.isExecute():
+            return False
+    return True
+
+
+def _trim_head_zero(program, start: int, run: list[int]) -> list[int]:
+    """Drop the offset-to-top that belongs to the *next* table's head.
+
+    Itanium separates two tables with `[offset-to-top][&typeinfo]`: that zero is
+    read as if it were a slot of the table before it.  One zero per head, and only
+    when what follows really is a typeinfo - an MSVC separator (a
+    CompleteObjectLocator pointer) must not lose anything.
+    """
+    if not run or run[-1] != 0:
+        return run
+    if _looks_like_itanium_head(program, start + len(run) * 8):
+        return run[:-1]
+    return run
 _VTABLES_SCAN_CHUNK = 1 << 22
 
 
@@ -1679,33 +1765,176 @@ def _scan_pointer_runs(program, min_slots: int) -> list[tuple[int, int]]:
     return runs
 
 
+_IMAGE_LIMIT = 96 << 20  # bytes of read-only data held in memory for the head scan
+_MANGLED_FIRST = frozenset(b"0123456789NSTKV")  # how an Itanium type name may start
+
+
+def _image_reader(program):
+    """`(qword, dword, string, blocks)` over the initialised non-executable blocks.
+
+    The dense head scan walks every aligned word of .rdata / .data.rel.ro, which is
+    affordable only if a block is fetched once: one `getBytes` per block instead of
+    one JPype call per probe.
+    """
+    mem = program.getMemory()
+    blocks: list[tuple[int, bytes]] = []
+    budget = _IMAGE_LIMIT
+    for block in mem.getBlocks():
+        if not block.isInitialized() or block.isExecute() or budget <= 0:
+            continue
+        size = int(block.getSize())
+        if size < 8:
+            continue
+        data, _short = _read_region(mem, block.getStart(), min(size, budget))
+        data = data[: len(data) - len(data) % 8]
+        if len(data) < 8:
+            continue
+        blocks.append((int(block.getStart().getOffset()), data))
+        budget -= len(data)
+    blocks.sort()
+    bases = [b[0] for b in blocks]
+
+    def locate(addr: int, width: int = 8):
+        i = bisect.bisect_right(bases, addr) - 1
+        if i < 0:
+            return None, 0
+        base, data = blocks[i]
+        off = addr - base
+        if off < 0 or off + width > len(data):
+            return None, 0
+        return data, off
+
+    def qword(addr: int):
+        data, off = locate(addr)
+        return None if data is None else struct.unpack_from("<Q", data, off)[0]
+
+    def dword(addr: int):
+        data, off = locate(addr, 4)
+        return None if data is None else struct.unpack_from("<I", data, off)[0]
+
+    def string(addr: int, limit: int = 512):
+        data, off = locate(addr, 1)
+        if data is None:
+            return None
+        end = data.find(b"\x00", off, min(off + limit, len(data)))
+        return None if end < 0 else data[off:end]
+
+    return qword, dword, string, blocks
+
+
+def _msvc_col_ok(qword, dword, string, image_base: int, col: int, cache: dict) -> bool:
+    """Is `col` a CompleteObjectLocator whose type descriptor names a class?"""
+    if cache.get(col, True) is False:
+        return False
+    ok = dword(col) == 1
+    if ok:
+        rva = dword(col + 12)
+        # a TypeDescriptor keeps the class name inline at +0x10, no pointer indirection
+        raw = string(image_base + rva + 0x10, 512) if rva is not None else None
+        ok = bool(raw) and raw[:3] == b".?A"
+    cache[col] = ok
+    return ok
+
+
+def _dense_heads(program, abi: str, is_code) -> list[int]:
+    """Every vtable start in the data blocks, found from the RTTI head in front.
+
+    A *slot* is not a reliable slot marker: on the ELF build some slots hold
+    link-time addends Ghidra leaves unmapped, so a walk of code pointers stops
+    early and the table looks shorter than it is.  The word in *front* of a table
+    always is a marker - MSVC keeps a CompleteObjectLocator pointer there, Itanium
+    offset-to-top and &typeinfo - so indexing those finds every table, and the
+    distance to the next head gives the slot count without sniffing a slot.
+    """
+    qword, dword, string, blocks = _image_reader(program)
+    image_base = int(program.getImageBase().getOffset())
+    marks: set[int] = set()
+    if abi == "msvc":
+        cache: dict[int, bool] = {}
+        for base, data in blocks:
+            for i in range(len(data) // 8):
+                pos = base + i * 8
+                if dword(pos) != 1:
+                    continue
+                if _msvc_col_ok(qword, dword, string, image_base, pos, cache):
+                    marks.add(pos)
+    else:
+        for base, data in blocks:
+            for i in range(len(data) // 8):
+                value = struct.unpack_from("<Q", data, i * 8)[0]
+                if not value:
+                    continue
+                name = qword(value + 8)
+                raw = string(name, 512) if name else None
+                if raw and len(raw) <= 400 and raw[0] in _MANGLED_FIRST:
+                    marks.add(value)
+    heads: list[int] = []
+    if not marks:
+        return heads
+    for base, data in blocks:
+        for i in range(len(data) // 8):
+            if struct.unpack_from("<Q", data, i * 8)[0] not in marks:
+                continue
+            start = base + i * 8 + 8
+            first = qword(start)
+            # A *reference* to a typeinfo (a dynamic_cast target, a catch clause) has
+            # the same shape as a head; a real head is followed by a code slot.
+            if first == 0 or is_code(first):
+                heads.append(start)
+    return sorted(set(heads))
+
+
+def _head_size(abi: str) -> int:
+    """Bytes between the last slot of one table and the first slot of the next."""
+    return 16 if abi == "itanium" else 8
+
+
 def build_vtables(e, min_slots: int = _VTABLE_MIN_SLOTS) -> list[list[Any]]:
     """`[vtable, rtti_class, symbol_name, [slot_value, ...]]` for every real table.
 
-    A run only counts when the qword in front of it is a usable MSVC
-    CompleteObjectLocator (or the table carries a `vftable` label): that throws
-    away the many read-only pointer arrays that are not class tables.  Slots are
-    then read past the scan's run end, because a table may contain a hole (a slot
-    Ghidra has no function for) in the middle and still go on for 20 more methods.
+    Table *starts* come from the dense RTTI-head scan (see `_dense_heads`) and the
+    slot *values* from a code-pointer walk.  The walk is authoritative when it hit a
+    separator; when it ran into unreadable memory the distance to the next head is
+    used instead, and the unread slots are padded with None so the count stays
+    honest.  A table is kept when it has RTTI or a `vftable` label, which throws
+    away the many read-only pointer arrays that are not class tables.
     """
     program = e["program"]
-    mem = program.getMemory()
     space = program.getAddressFactory().getDefaultAddressSpace()
     st = program.getSymbolTable()
     los, his = _code_ranges(program)
+
+    is_code = lambda v: _in_code(los, his, v)  # noqa: E731
+    heads = _dense_heads(program, "msvc", is_code)
+    abi = "msvc"
+    if not heads:
+        heads = _dense_heads(program, "itanium", is_code)
+        abi = "itanium"
     rows: list[list[Any]] = []
-    for start, n in _scan_pointer_runs(program, min_slots):
+    head = _head_size(abi)
+    for idx, start in enumerate(heads):
+        gap = heads[idx + 1] - start if idx + 1 < len(heads) else 0
+        span = (gap - head) // 8 if gap and gap % 8 == 0 and gap > head else 0
         addr = space.getAddress(start)
         rtti = _rtti_of_vtable(program, addr)
         sym = st.getPrimarySymbol(addr)
         name = str(sym.getName(True)) if sym is not None else None
         if rtti is None and not (name and _VTABLE_NAME.search(name)):
             continue
-        raw, _short = _read_region(mem, addr, _VTABLE_MAX_SLOTS * 8)
-        count = len(raw) // 8
-        values = list(struct.unpack_from("<%dQ" % count, raw)) if count else []
-        slots = _slot_run(values, lambda v: _in_code(los, his, v))
-        if len(slots) < max(n, min_slots):
+        values, reason = _vtable_walk(program, addr, _VTABLE_MAX_SLOTS)
+        slots = _trim_head_zero(
+            program, start, _slot_run(values, lambda v: _in_code(los, his, v))
+        )
+        if span > _VTABLE_SPAN_CAP:
+            span = 0  # a gap that large means a head we failed to see, not one long table
+        if span and reason not in ("unreadable", "dangling"):
+            span = 0  # the walk found the end itself; the distance only covers gaps
+        if span and span >= min_slots:
+            # the span is the truth; a short walk only means some slots are unreadable
+            if len(slots) > span:
+                slots = slots[:span]
+            slots = slots + [None] * (span - len(slots))
+        if len(slots) < min_slots:
             continue
         rows.append([start, (rtti or {}).get("class"), name, slots])
     return rows
@@ -1832,7 +2061,15 @@ def cmd_vtables(a: dict[str, Any]) -> dict[str, Any]:
             "rtti": _rtti_of_vtable(program, addr),
         }
         if slot_cap:
-            row["slots"] = _vtable_slots(program, addr, slot_cap)
+            read = _vtable_slots(program, addr, slot_cap)
+            if len(read) < len(slots) and slot_cap >= len(slots):
+                # the index knows better: some slots hold addends Ghidra cannot read
+                read += [
+                    {"slot": i, "offset": f"0x{i * 8:x}", "addr": None, "name": None,
+                     "unmapped": True}
+                    for i in range(len(read), len(slots))
+                ]
+            row["slots"] = read
         tables.append(row)
     out = tail("class" if rx else "index")
     out.update({"matched": len(matched), "count": len(tables), "tables": tables})
