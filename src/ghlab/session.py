@@ -112,6 +112,18 @@ def _num(a: dict[str, Any], key: str, default: int, *, minimum: int | None = Non
     value = a.get(key, default)
     if isinstance(value, bool):
         raise ValueError(f"{key} must be a number, got {value!r}")
+    if isinstance(value, str):
+        # `size="0x120"` is what an agent writes after reading hex addresses all day:
+        # accept it instead of answering "must be a number, got '0x120'".
+        raw = value.strip().replace("_", "")
+        for base in (0, 10):
+            try:
+                value = int(raw, base)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError(f"{key} must be a number, got {a.get(key)!r}")
     try:
         out = int(value)
     except (TypeError, ValueError):
@@ -240,6 +252,21 @@ def _addr(entry: dict[str, Any], text: str):
     return addr
 
 
+def _name_variants(text: str) -> list[str]:
+    """Other spellings of `text` worth trying on a case-sensitive symbol index.
+
+    Ghidra's default spellings are lowercase hex (`FUN_181323f10`) while listings
+    and notes are often copied in uppercase; the symbol index is case-sensitive,
+    so `FUN_181323F10` used to answer "function not found" with no way forward.
+    """
+    head, sep, tail = text.rpartition("_")
+    is_hex_tail = bool(sep) and bool(tail) and all(c in "0123456789abcdefABCDEF" for c in tail)
+    seen = [text.lower(), text.upper()]
+    if is_hex_tail:
+        seen += [head + sep + tail.upper(), head + sep + tail.lower()]
+    return [v for v in dict.fromkeys(seen) if v != text]
+
+
 def _symbols_named(program, name: str, limit: int = 8) -> list[Any]:
     """Exact symbol lookup through the indexed tables (never a full scan).
 
@@ -249,21 +276,31 @@ def _symbols_named(program, name: str, limit: int = 8) -> list[Any]:
     """
     text = str(name)
     table = program.getSymbolTable()
-    out: list[Any] = []
-    for getter in ("getGlobalSymbols", "getSymbols"):
-        fn = getattr(table, getter, None)
-        if fn is None:
-            continue
-        try:
-            hits = fn(text)
-        except Exception:  # noqa: BLE001 - jpype raises for odd overloads
-            continue
-        for sym in hits or []:
-            out.append(sym)
-            if len(out) >= limit:
-                return out
+
+    def indexed(spelling: str) -> list[Any]:
+        """Name-index lookups only: these never walk the whole symbol table."""
+        found: list[Any] = []
+        for getter in ("getGlobalSymbols", "getSymbols"):
+            fn = getattr(table, getter, None)
+            if fn is None:
+                continue
+            try:
+                hits = fn(spelling)
+            except Exception:  # noqa: BLE001 - jpype raises for odd overloads
+                continue
+            for sym in hits or []:
+                found.append(sym)
+                if len(found) >= limit:
+                    return found
+        return found
+
+    out = indexed(text)
     if out:
         return out
+    for spelling in _name_variants(text):
+        out.extend(indexed(spelling))
+        if out:
+            return out[:limit]
     # Namespaced spellings (`USER32.DLL::GetWindowLongW`) are not in the index.
     for sym in table.getAllSymbols(True):
         if str(sym.getName()) == text or str(sym.getName(True)) == text:

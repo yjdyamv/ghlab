@@ -48,6 +48,23 @@ def _print_json(obj: Any) -> None:
     print(json.dumps(obj, indent=2, ensure_ascii=False))
 
 
+def _int_arg(text: str) -> int:
+    """Count/size arguments accept the spellings agents actually type (`0x120`, `1_024`).
+
+    Every address in this tool is hex, so `--size 0x120` was the obvious next
+    keystroke and `argparse` rejected it with "invalid int value".
+    """
+    raw = str(text).strip().replace("_", "")
+    try:
+        return int(raw, 0)
+    except ValueError:
+        pass
+    try:
+        return int(raw, 10)
+    except ValueError as ex:
+        raise argparse.ArgumentTypeError(f"invalid int value: {text!r}") from ex
+
+
 # ------------------------------------------------------------------ formatting
 
 
@@ -2528,7 +2545,7 @@ def build_parser() -> argparse.ArgumentParser:
     home = _default_target(cfg)
     home_url = urllib.parse.urlsplit(home.url)
     daemon.add_argument("--host", default=home_url.hostname or cfg.get("host") or DEFAULT_HOST)
-    daemon.add_argument("--port", type=int, default=home_url.port or default_port())
+    daemon.add_argument("--port", type=_int_arg, default=home_url.port or default_port())
     daemon.add_argument("--project-dir", default=home.project_dir or default_project_dir())
     daemon.add_argument(
         "--project-name", default=home.project_name or home.name or default_project_name()
@@ -2546,7 +2563,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("start", parents=[daemon], help="start the daemon detached")
-    p.add_argument("--wait", type=int, default=120)
+    p.add_argument("--wait", type=_int_arg, default=120)
     p.set_defaults(func=cmd_start)
 
     # `stop` declares its own copies of these three options instead of taking the
@@ -2558,7 +2575,7 @@ def build_parser() -> argparse.ArgumentParser:
     # bug killed a WPS daemon once).
     p = sub.add_parser("stop", help="stop a detached daemon")
     p.add_argument("--host", default=cfg.get("host") or DEFAULT_HOST)
-    p.add_argument("--port", type=int, default=default_port())
+    p.add_argument("--port", type=_int_arg, default=default_port())
     p.add_argument("--project-dir", help="stop this project's daemon (default: by --port)")
     p.add_argument(
         "--all",
@@ -2574,9 +2591,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ghidra", help="Ghidra install folder (contains support/analyzeHeadless)")
     p.add_argument("--project-dir", dest="cfg_project_dir", help="where the Ghidra project lives")
     p.add_argument("--project-name", dest="cfg_project_name", help="Ghidra project name")
-    p.add_argument("--port", type=int, dest="cfg_port", help="daemon port")
+    p.add_argument("--port", type=_int_arg, dest="cfg_port", help="daemon port")
     p.add_argument("--add-project", metavar="NAME", help="register another project (needs --port)")
-    p.add_argument("--add-port", type=int, help="port of the project being added")
+    p.add_argument("--add-port", type=_int_arg, help="port of the project being added")
     p.add_argument("--remove-project", metavar="NAME", help="forget a registered project")
     p.add_argument("--default-project", metavar="NAME", help="which project bare commands use")
     p.add_argument(
@@ -2690,7 +2707,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-m", "-q", "--match", "--query", dest="match", default=None, help="regex on function name"
     )
-    p.add_argument("-n", "--limit", type=int, default=60)
+    p.add_argument("-n", "--limit", type=_int_arg, default=60)
     p.set_defaults(
         func=lambda a: _call(
             a, "functions", {"binary": a.binary, "match": a.match, "limit": a.limit}
@@ -2702,8 +2719,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-t", "--target", action="append", default=[], help="symbol or 0xaddr")
     p.add_argument("-m", "--match", default=None, help="regex: decompile every matching function")
     p.add_argument("-g", "--grep", default=None, help="keep only lines matching this regex")
-    p.add_argument("-n", "--limit", type=int, default=25, help="max functions")
-    p.add_argument("--max-lines", type=int, default=0)
+    p.add_argument("-n", "--limit", type=_int_arg, default=25, help="max functions")
+    p.add_argument("--max-lines", type=_int_arg, default=0)
     p.add_argument("--refresh", action="store_true", help="ignore the decompiler cache")
     p.add_argument("--sig", action="store_true", help="signatures only (no decompiler)")
     p.add_argument("--code", action="store_true", help="include full source even when grepping")
@@ -2733,7 +2750,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-m", "--match", help="regex on import or library name")
     p.add_argument("-q", "--query", help="alias for --match")
     p.add_argument("--group", help="only this risk group (inject, network, file, ...)")
-    p.add_argument("-n", "--limit", type=int, default=0, help="max rows (0 = all)")
+    p.add_argument("-n", "--limit", type=_int_arg, default=0, help="max rows (0 = all)")
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -2752,7 +2769,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("-m", "--match", help="regex on the mangled or demangled name")
     p.add_argument("-q", "--query", help="alias for --match")
-    p.add_argument("-n", "--limit", type=int, default=0, help="max rows (0 = all)")
+    p.add_argument("-n", "--limit", type=_int_arg, default=0, help="max rows (0 = all)")
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -2769,8 +2786,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("names", parents=[common], help="method names from assertion strings")
     p.add_argument("binary")
     p.add_argument("-q", "--query", help="regex on the recovered name")
-    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
-    p.add_argument("--min-len", type=int, default=12, help="shortest printable run to consider")
+    p.add_argument("-n", "--limit", type=_int_arg, default=200, help="max rows")
+    p.add_argument("--min-len", type=_int_arg, default=12, help="shortest printable run to consider")
     p.add_argument("--refresh", action="store_true", help="rebuild the cached table")
     p.set_defaults(
         func=lambda a: _call(
@@ -2790,8 +2807,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("-q", "--query", help="regex over the name or its class namespace")
     p.add_argument("-k", "--kind", help="regex over the kind (Function, Label, Class, ...)")
-    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
-    p.add_argument("--offset", type=int, default=0, help="skip this many matches")
+    p.add_argument("-n", "--limit", type=_int_arg, default=200, help="max rows")
+    p.add_argument("--offset", type=_int_arg, default=0, help="skip this many matches")
     p.add_argument("--refresh", action="store_true", help="rebuild the cached symbol table")
     p.set_defaults(
         func=lambda a: _call(
@@ -2818,8 +2835,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-f", "--func", dest="vfunc", help="instead: which vtables contain this function"
     )
-    p.add_argument("-n", "--limit", type=int, default=64, help="max slots per table")
-    p.add_argument("--matches", type=int, default=8, help="max tables to dump")
+    p.add_argument("-n", "--limit", type=_int_arg, default=64, help="max slots per table")
+    p.add_argument("--matches", type=_int_arg, default=8, help="max tables to dump")
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -2842,9 +2859,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("-c", "--class", dest="vclass", help="regex over the RTTI class name")
     p.add_argument("-f", "--func", dest="vfunc", help="instead: which tables hold this function")
-    p.add_argument("-n", "--limit", type=int, default=50, help="max tables")
-    p.add_argument("--slots", type=int, help="max slots per table (default: all with -c)")
-    p.add_argument("--min-slots", dest="min_slots", type=int, help="ignore shorter runs")
+    p.add_argument("-n", "--limit", type=_int_arg, default=50, help="max tables")
+    p.add_argument("--slots", type=_int_arg, help="max slots per table (default: all with -c)")
+    p.add_argument("--min-slots", dest="min_slots", type=_int_arg, help="ignore shorter runs")
     p.add_argument("--refresh", action="store_true", help="rebuild the cached index")
     p.set_defaults(
         func=lambda a: _call(
@@ -2872,7 +2889,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("target", help="function name or address")
     p.add_argument("--offset", default=None, help="only this offset, e.g. 0x178")
-    p.add_argument("-n", "--limit", type=int, default=120)
+    p.add_argument("-n", "--limit", type=_int_arg, default=120)
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -2888,7 +2905,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("binary", nargs="?", default=None)
     p.add_argument("--list", action="store_true", help="show the .fidb libraries Ghidra would use")
-    p.add_argument("-n", "--limit", type=int, default=200, help="renames to print")
+    p.add_argument("-n", "--limit", type=_int_arg, default=200, help="renames to print")
     p.set_defaults(
         func=lambda a: _call(a, "fid", {"binary": a.binary, "list": a.list, "limit": a.limit}),
     )
@@ -2906,7 +2923,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--types", default=None, help="override widths, e.g. 0x18=float,0x20=void *")
     p.add_argument("--pointer", default=None, help="offsets that are pointers, e.g. 0x20,0x28")
     p.add_argument("--create", action="store_true", help="install the type in the program")
-    p.add_argument("-n", "--limit", type=int, default=200)
+    p.add_argument("-n", "--limit", type=_int_arg, default=200)
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -2937,7 +2954,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--range", default=None, help="0xSTART-0xEND to limit the sweep")
     p.add_argument("--func", dest="in_func", default=None, help="limit to one function")
-    p.add_argument("-n", "--limit", type=int, default=60)
+    p.add_argument("-n", "--limit", type=_int_arg, default=60)
     p.add_argument("--op", default=None, help="regex on the mnemonic, e.g. ^MOV")
     p.add_argument("--stack", action="store_true", help="also match [RSP]/[RBP] locals")
     p.add_argument(
@@ -2957,7 +2974,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--window",
-        type=int,
+        type=_int_arg,
         default=32,
         help="instructions allowed between the offsets (default 32)",
     )
@@ -2990,7 +3007,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("strings", parents=[common], help="string data, and who reads it")
     p.add_argument("binary")
     p.add_argument("-q", "--query", help="substring to look for")
-    p.add_argument("-n", "--limit", type=int, default=200, help="max rows")
+    p.add_argument("-n", "--limit", type=_int_arg, default=200, help="max rows")
     p.add_argument("--offset", help="start of the range to scan")
     p.add_argument("--refs", action="store_true", help="also report which functions read each one")
     p.add_argument("--refresh", action="store_true", help="rebuild the cached table")
@@ -3012,7 +3029,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("bytes", parents=[common], help="raw memory")
     p.add_argument("binary")
     p.add_argument("addr")
-    p.add_argument("--size", type=int, default=64, help="bytes to read (capped at 65536)")
+    p.add_argument("--size", type=_int_arg, default=64, help="bytes to read (capped at 65536)")
     p.set_defaults(
         func=lambda a: _call(a, "bytes", {"binary": a.binary, "addr": a.addr, "size": a.size})
     )
@@ -3021,7 +3038,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("-t", "--target", help="function name or 0xaddr to start at")
     p.add_argument("-a", "--addr", help="start address (when there is no target)")
-    p.add_argument("-n", "--count", type=int, default=48, help="instructions (capped at 4096)")
+    p.add_argument("-n", "--count", type=_int_arg, default=48, help="instructions (capped at 4096)")
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -3056,7 +3073,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="write the rendered graph here (svg/dot/mermaid)")
     p.add_argument("binary")
     p.add_argument("target")
-    p.add_argument("-d", "--depth", type=int, default=2)
+    p.add_argument("-d", "--depth", type=_int_arg, default=2)
     p.add_argument("--direction", choices=("calling", "called"), default="calling")
     p.set_defaults(
         func=lambda a: _call(
@@ -3078,7 +3095,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-m", "--match", default=None, help="regex over function names (applied to both)"
     )
-    p.add_argument("-n", "--limit", type=int, default=25)
+    p.add_argument("-n", "--limit", type=_int_arg, default=25)
     p.add_argument(
         "--min-score",
         dest="min_score",
@@ -3088,7 +3105,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--detail",
-        type=int,
+        type=_int_arg,
         default=0,
         help="include an instruction-level diff for N changed functions",
     )
@@ -3124,11 +3141,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="V",
         help='repeatable: 123, 0x40, "text", L"wide text", null (string args are placed in memory)',
     )
-    p.add_argument("--max-insns", type=int, default=200000)
-    p.add_argument("--ms", type=int, default=5000, help="wall-clock budget")
+    p.add_argument("--max-insns", type=_int_arg, default=200000)
+    p.add_argument("--ms", type=_int_arg, default=5000, help="wall-clock budget")
     p.add_argument(
         "--buffer",
-        type=int,
+        type=_int_arg,
         default=0,
         metavar="SIZE",
         help="reserve a zeroed output buffer (read back after the run; pass its address as an arg)",
@@ -3181,7 +3198,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("decrypt", parents=[common], help="break a small blob of ciphertext")
     p.add_argument("binary", nargs="?", help="read the blob from this program's memory")
     p.add_argument("--addr", help="address of the blob (with a binary)")
-    p.add_argument("--len", type=int, default=64, help="bytes to read (default 64)")
+    p.add_argument("--len", type=_int_arg, default=64, help="bytes to read (default 64)")
     p.add_argument("--hex", help="ciphertext as hex, instead of reading memory")
     p.add_argument(
         "--ciphers",
@@ -3192,7 +3209,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeatable: xor, add, rot, utf16, base64 (default all)",
     )
     p.add_argument("--min-printable", dest="min_printable", type=float, default=0.85)
-    p.add_argument("-n", "--limit", type=int, default=5)
+    p.add_argument("-n", "--limit", type=_int_arg, default=5)
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -3211,8 +3228,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("digest", parents=[common], help="one-shot triage report")
     p.add_argument("binary")
-    p.add_argument("--top", type=int, default=8, help="how many call-graph hubs")
-    p.add_argument("--strings", type=int, default=3, help="samples per string kind")
+    p.add_argument("--top", type=_int_arg, default=8, help="how many call-graph hubs")
+    p.add_argument("--strings", type=_int_arg, default=3, help="samples per string kind")
     p.set_defaults(
         func=lambda a: _call(a, "digest", {"binary": a.binary, "top": a.top, "strings": a.strings})
     )
@@ -3238,7 +3255,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-c", "--calls", action="append", default=[], help="regex on callee names (repeatable)"
     )
-    p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("-n", "--limit", type=_int_arg, default=20)
     p.add_argument("--any", action="store_true", help="any filter instead of all")
     p.set_defaults(
         func=lambda a: _call(
@@ -3258,7 +3275,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("addr")
     p.add_argument("bytes", nargs="?", help="hex bytes, e.g. 9090 or '90 90'")
-    p.add_argument("--nop", type=int, help="write N 0x90 bytes instead")
+    p.add_argument("--nop", type=_int_arg, help="write N 0x90 bytes instead")
     p.add_argument("--expect", help="refuse unless the current bytes match this hex")
     p.set_defaults(
         func=lambda a: _call(
@@ -3321,7 +3338,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--type", default="Note", choices=list(session.BOOKMARK_TYPES))
     p.add_argument("--category")
     p.add_argument("--text", help="bookmark comment")
-    p.add_argument("-n", "--limit", type=int, default=100)
+    p.add_argument("-n", "--limit", type=_int_arg, default=100)
     p.set_defaults(
         action="add",
         func=lambda a: _call(
@@ -3346,7 +3363,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--at", help="function name or address")
     p.add_argument("--tag", default="note", help="group findings (auth, crypto, bug, ...)")
     p.add_argument(
-        "--delete", type=int, action="append", metavar="ID", help="retract findings by id"
+        "--delete", type=_int_arg, action="append", metavar="ID", help="retract findings by id"
     )
     p.add_argument(
         "-a",
@@ -3373,7 +3390,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("verify", parents=[common], help="re-check the claims of stored findings")
     p.add_argument("binary")
-    p.add_argument("--id", action="append", type=int, help="only these note ids")
+    p.add_argument("--id", action="append", type=_int_arg, help="only these note ids")
     p.set_defaults(func=lambda a: _call(a, "verify", {"binary": a.binary, "id": a.id}))
 
     p = sub.add_parser("map", parents=[common], help="run one op over many functions, keep hits")
@@ -3391,8 +3408,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="what to collect per function",
     )
     p.add_argument("-g", "--grep", help="regex: keep only matching lines/entries")
-    p.add_argument("-n", "--limit", type=int, default=200, help="max functions")
-    p.add_argument("--hits", type=int, default=5, help="max hits per function")
+    p.add_argument("-n", "--limit", type=_int_arg, default=200, help="max functions")
+    p.add_argument("--hits", type=_int_arg, default=5, help="max hits per function")
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -3413,7 +3430,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tag")
     p.add_argument("--at")
     p.add_argument("-q", "--query")
-    p.add_argument("-n", "--limit", type=int, default=200)
+    p.add_argument("-n", "--limit", type=_int_arg, default=200)
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -3466,7 +3483,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--binary")
     p.add_argument("--op", help="only this operation (rename, patch, note, ...)")
     p.add_argument("--since", help="ISO date prefix, e.g. 2026-11-08")
-    p.add_argument("-n", "--limit", type=int, default=50)
+    p.add_argument("-n", "--limit", type=_int_arg, default=50)
     p.set_defaults(
         func=lambda a: _call(
             a,
@@ -3477,7 +3494,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("report", parents=[common], help="markdown report (digest + findings)")
     p.add_argument("binary")
-    p.add_argument("--top", type=int, default=6, help="call-graph hubs to include")
+    p.add_argument("--top", type=_int_arg, default=6, help="call-graph hubs to include")
     p.set_defaults(func=lambda a: _call(a, "report", {"binary": a.binary, "top": a.top}))
 
     p = sub.add_parser("types", parents=[common], help="bulk-apply a signature/type map file")
@@ -3510,7 +3527,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("query", help="regex over string data")
     p.add_argument("--binary", help="restrict to one program")
-    p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("-n", "--limit", type=_int_arg, default=20)
     p.set_defaults(
         func=lambda a: _call(
             a, "cross_xref", {"query": a.query, "binary": a.binary, "limit": a.limit}
@@ -3523,8 +3540,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--from", help="stop at a caller matching this (default entry/main/WinMain/DllMain)"
     )
-    p.add_argument("-d", "--depth", type=int, default=12)
-    p.add_argument("-n", "--limit", type=int, default=4)
+    p.add_argument("-d", "--depth", type=_int_arg, default=12)
+    p.add_argument("-n", "--limit", type=_int_arg, default=4)
     p.add_argument("--code", action="store_true", help="include the caller's decompiled body")
     p.add_argument(
         "--forward",
@@ -3551,7 +3568,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("binary")
     p.add_argument("target")
     p.add_argument("--against", help="compare against one program instead of all others")
-    p.add_argument("-n", "--limit", type=int, default=10)
+    p.add_argument("-n", "--limit", type=_int_arg, default=10)
     p.add_argument("--min-score", type=float, default=0.4)
     p.set_defaults(
         func=lambda a: _call(
@@ -3581,7 +3598,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--binary", help="restrict the cluster set to one program")
     p.add_argument("--min-score", type=float, default=0.35)
-    p.add_argument("-n", "--limit", type=int, default=0, help="max clusters to show")
+    p.add_argument("-n", "--limit", type=_int_arg, default=0, help="max clusters to show")
     p.set_defaults(
         func=lambda a: _call(
             a, "campaign", {"binary": a.binary, "min_score": a.min_score, "limit": a.limit}
@@ -3593,7 +3610,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("binary", nargs="?", help="report the family this program belongs to")
     p.add_argument("--min-score", type=float, default=0.35)
-    p.add_argument("-n", "--limit", type=int, default=0, help="max families to show")
+    p.add_argument("-n", "--limit", type=_int_arg, default=0, help="max families to show")
     p.set_defaults(
         func=lambda a: _call(
             a, "family", {"binary": a.binary, "min_score": a.min_score, "limit": a.limit}
