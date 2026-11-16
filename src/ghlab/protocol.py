@@ -179,7 +179,12 @@ _SPECS = [
         ),
         "instructions that touch a struct field offset (displacement search), or a masked byte search (`hex` with `??`)",
     ),
-    Spec("xrefs", ("binary",), ("target", "targets", "limit"), "references to address/function"),
+    Spec(
+        "xrefs",
+        ("binary",),
+        ("target", "targets", "limit"),
+        "references to address/function (rows carry the source memory block)",
+    ),
     Spec("bytes", ("binary", "addr"), ("size",), "raw memory bytes as hex+ascii"),
     Spec("disasm", ("binary",), ("target", "addr", "count"), "instructions as the listing renders them"),
     Spec("rename", ("binary", "target", "new"), summary="rename a function"),

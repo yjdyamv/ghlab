@@ -440,7 +440,9 @@ def fmt_xrefs(r: dict[str, Any]) -> str:
     for item in r.get("results") or []:
         out.append(f"== {item['target']} @ {item['addr']}: {len(item['xrefs'])} xref(s)")
         for x in item["xrefs"]:
-            out.append(f"   {x['from']}  {x['type']:<16} {x['in_function'] or '-'}")
+            tag = x.get("block")
+            tail = f" [{tag}]" if tag and tag not in (".text",) else ""
+            out.append(f"   {x['from']}  {x['type']:<16} {x['in_function'] or '-'}{tail}")
     return "\n".join(out)
 
 

@@ -387,7 +387,7 @@ env 里的值全部是**写入那一刻、这台机器上**算出来的：`PYTHO
 | `functions` | `binary` / `match, limit, offset` | 按名过滤列函数 |
 | `decompile` | `binary` / `targets, target, match, grep, limit, max_lines, include_code, include_callees, include_callers, timeout, refresh` | 单个 / 批量 / 服务端 grep；结果按 `md5+地址+签名+注释` 缓存到 `<项目>/.ghlab/cache/<md5>/`，热查询 2.5s → 0.19s；`patch`/`set-type`/`types`/`pdb`/`analyze` 保存后自动清空该程序的缓存，`--refresh` 仍可手动强制重算 |
 | `strings` | `binary` / `query, limit, offset, refs` | 字符串数据搜索；`--refs` 顺带给出引用它的函数（含大小），并在头部汇总“哪个函数用的字符串最多”（实测 0.28s / 4 条） |
-| `xrefs` | `binary` / `target, targets` | 引用（谁引用了它） |
+| `xrefs` | `binary` / `target, targets` | 引用者：谁引用了这个地址/函数（每行带来源内存块，`.pdata`/`.reloc` 里的 `DATA` 是异常/重定位记录，不是函数指针表） |
 | `imports` | `binary` / `match, query, group, limit` | **导入下钻**：每个导入的 distinct 调用者数 + 最大的 3 个调用者 + 风险组（`digest` 只给计数，这个给名字）。`--group` 取值 anti/crypto/exec/file/inject/network/registry/ui，写错会报错并列出合法值 |
 | `exports` | `binary` / `match, query, limit` | **导出面**：这个二进制对外开放的入口（PE 导出表 / ELF `.dynsym`），每个都附还原后的 C++ 名字（`_Z`/`?` 开头的走 Ghidra 自带 demangler）。`imports` 问"我调用了谁"，这个问"别人能调用我什么"——拿到 DLL/SO 先看它，能直接看出 SDK 边界与插件入口 |
 | `symbols` | `binary` / `query, kind, limit, offset, refresh` | **符号表检索**：类命名空间、虚表标签（`vftable`/`??_7`）、RTTI 类型描述符、全局变量一次查全，`--query`/`--kind` 走正则。剥离的 MSVC 二进制里类名只活在这里（`full` 给出 `Class::member` 全名，`?` 开头的附 demangle）。表按 md5+修改号缓存，`--refresh` 重建 |

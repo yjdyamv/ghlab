@@ -671,7 +671,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Who references this address, function or symbol: call sites and data reads. The "
             "reverse edge of ghlab_graph — use it when you already know the target and want its "
-            "callers, instead of walking the call tree down from a guess."
+            "callers, instead of walking the call tree down from a guess. Each row names the "
+            "memory block the reference comes from when it is not .text: a DATA reference from "
+            ".pdata/.reloc is an exception or relocation record, not a function pointer table."
         ),
         "inputSchema": {
             "type": "object",

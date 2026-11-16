@@ -3458,13 +3458,20 @@ def cmd_xrefs(a: dict[str, Any]) -> dict[str, Any]:
             addr = fn.getEntryPoint() if fn else _addr(e, t)
         refs = []
         limit = _num(a, "limit", 400)
+        memory = p.getMemory()
         for r in p.getReferenceManager().getReferencesTo(addr):
             holder = p.getFunctionManager().getFunctionContaining(r.getFromAddress())
+            block = memory.getBlock(r.getFromAddress())
             refs.append(
                 {
                     "from": str(r.getFromAddress()),
                     "type": str(r.getReferenceType()),
                     "in_function": str(holder.getName()) if holder else None,
+                    # A `DATA` xref from .pdata/.reloc is an exception record or a
+                    # reloc entry, not a function pointer table: reading one as
+                    # "some table holds this function" is a wrong answer that the
+                    # address alone cannot disprove.
+                    "block": str(block.getName()) if block else None,
                 }
             )
             if len(refs) >= limit:

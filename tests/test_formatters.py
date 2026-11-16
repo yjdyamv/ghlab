@@ -362,6 +362,75 @@ class VtablesIndexFormatterTest(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class XrefsBlockTest(unittest.TestCase):
+    """A `DATA` xref whose source is `.pdata` is an exception record.
+
+    `ghlab xrefs wpscore.dll FUN_1814a2ef0` printed `1820c6668 DATA -`, and that
+    row was read as "a function pointer table holds this function". The address
+    is inside `.pdata` (a RUNTIME_FUNCTION record: begin/end/unwind RVAs), so the
+    reply has to say which block a reference comes from.
+    """
+
+    def test_a_reference_outside_text_names_its_block(self):
+        text = cli.fmt_xrefs(
+            {
+                "results": [
+                    {
+                        "target": "FUN_1814a2ef0",
+                        "addr": "1814a2ef0",
+                        "xrefs": [
+                            {
+                                "from": "1820c6668",
+                                "type": "DATA",
+                                "in_function": None,
+                                "block": ".pdata",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertIn(".pdata", text)
+        self.assertIn("1820c6668", text)
+
+    def test_a_text_reference_stays_quiet(self):
+        text = cli.fmt_xrefs(
+            {
+                "results": [
+                    {
+                        "target": "FUN_1",
+                        "addr": "140001000",
+                        "xrefs": [
+                            {
+                                "from": "140002000",
+                                "type": "UNCONDITIONAL_CALL",
+                                "in_function": "FUN_140002000",
+                                "block": ".text",
+                            }
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertNotIn(".text", text)
+
+    def test_an_older_reply_without_a_block_still_prints(self):
+        text = cli.fmt_xrefs(
+            {
+                "results": [
+                    {
+                        "target": "FUN_1",
+                        "addr": "140001000",
+                        "xrefs": [
+                            {"from": "140002000", "type": "DATA", "in_function": None}
+                        ],
+                    }
+                ]
+            }
+        )
+        self.assertIn("140002000", text)
+
+
 class DisasmFormatterTest(unittest.TestCase):
     def test_renders_each_instruction_with_its_bytes(self):
         text = cli.fmt_disasm(
