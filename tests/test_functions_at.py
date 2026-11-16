@@ -26,6 +26,9 @@ class _Addr:
     def subtract(self, other: _Addr) -> int:
         return self._value - other._value
 
+    def getOffset(self) -> int:
+        return self._value
+
     def __str__(self) -> str:
         return f"{self._value:x}"
 
