@@ -133,6 +133,19 @@ def _num(a: dict[str, Any], key: str, default: int, *, minimum: int | None = Non
     return out
 
 
+def _optional_num(a: dict[str, Any], key: str, *, minimum: int | None = None) -> int | None:
+    """An integer argument that is allowed to be absent.
+
+    `_num` demands a usable value, so `_num(a, "slot", None)` raises "must be a number,
+    got None" on every call that omits the flag -- which silently broke `vtables -c` and
+    `vtables -f` when the `--slot` mode was added. Absence and "an unparsable number"
+    are different answers, so they get different functions.
+    """
+    if a.get(key) is None:
+        return None
+    return _num(a, key, 0, minimum=minimum)
+
+
 def _binary_hint(binary: str, names: list[str]) -> str:
     """Why a name missed, in the terms the caller used: a path, a typo, an empty project."""
     if not names:
@@ -2088,7 +2101,7 @@ def cmd_vtables(a: dict[str, Any]) -> dict[str, Any]:
         if rx is None or (r[1] and rx.search(r[1])) or (r[2] and rx.search(r[2]))
     ]
 
-    slot_off = _num(a, "slot", None)
+    slot_off = _optional_num(a, "slot")
     if slot_off is not None:
         # One slot across every table: "who implements offset 0x110, in how many classes".
         # The index already stores each slot as a function entry offset, so this is a

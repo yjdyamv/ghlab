@@ -71,6 +71,17 @@ class SlotArgumentTest(unittest.TestCase):
         # the check lives in the handler, so pin its predicate instead of a program
         self.assertEqual(0x104 % 8, 4)
 
+    def test_absent_slot_is_none_not_an_error(self):
+        # regression: `_num(a, "slot", None)` raised "must be a number, got None",
+        # which broke every `vtables -c` / `vtables -f` call once --slot existed.
+        self.assertIsNone(session._optional_num({"class": "Typo"}, "slot"))
+        self.assertEqual(session._optional_num({"slot": "0x110"}, "slot"), 0x110)
+        self.assertEqual(session._optional_num({"slot": 4352}, "slot"), 4352)
+
+    def test_absent_flag_still_rejects_garbage(self):
+        with self.assertRaises(ValueError):
+            session._optional_num({"slot": "abc"}, "slot")
+
 
 if __name__ == "__main__":
     unittest.main()
