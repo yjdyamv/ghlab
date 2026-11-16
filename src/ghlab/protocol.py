@@ -146,7 +146,7 @@ _SPECS = [
     Spec(
         "vtables",
         ("binary",),
-        ("class", "func", "limit", "slots", "min_slots", "refresh"),
+        ("class", "func", "limit", "slot", "slots", "min_slots", "refresh"),
         "whole-program vtable index in one scan: RTTI class -> slots, or slot -> classes",
     ),
     Spec(

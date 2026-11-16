@@ -132,7 +132,8 @@ TOOLS: list[dict[str, Any]] = [
             "Whole-program vtable index: one scan of read-only memory finds every table, its "
             "RTTI class name and its slots, then answers 'which class implements this' "
             "instantly. `class` filters by class/symbol regex; `func` is the reverse lookup "
-            "(slot -> classes). Cached on disk; `refresh` rebuilds."
+            "(slot -> classes); `slot` is the grouped reverse lookup (one slot offset -> every "
+            "implementation with the classes that use it). Cached on disk; `refresh` rebuilds."
         ),
         "inputSchema": {
             "type": "object",
@@ -150,6 +151,14 @@ TOOLS: list[dict[str, Any]] = [
                     "description": "max slots resolved per table (0 = listing only)",
                 },
                 "min_slots": {"type": "integer", "minimum": 1, "description": "min run length"},
+                "slot": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "instead: one slot offset in bytes (e.g. 4352 = 0x110); returns every "
+                        "implementation of that slot, ranked by how many tables use it"
+                    ),
+                },
                 "refresh": {"type": "boolean", "description": "rebuild the cached index"},
             },
             "required": ["binary"],

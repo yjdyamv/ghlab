@@ -240,6 +240,20 @@ def fmt_vtable(r: dict[str, Any]) -> str:
 
 
 def fmt_vtables(r: dict[str, Any]) -> str:
+    if r.get("mode") == "slot":
+        out = [
+            f"# slot {r['slot']}: {r['implementations']} implementation(s) "
+            f"across {r['tables_scanned']} table(s)"
+        ]
+        if not r.get("impls"):
+            out.append("  (no table has a function in this slot: check the offset, or --min-slots)")
+        for i in r.get("impls") or []:
+            size = f"{i['size']}B" if i.get("size") else "-"
+            by = ", ".join((i.get("examples") or [])[:2]) or "-"
+            out.append(
+                f"  {i['addr']:<12} {size:>6}  x{i['tables']:<4} {i.get('name') or '-':<18} {by}"
+            )
+        return chr(10).join(out)
     if r.get("mode") == "func":
         fn = r.get("function") or {}
         out = [f"# {r['count']} table(s) hold {fn.get('name')} ({fn.get('addr')})"]
@@ -2865,6 +2879,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-f", "--func", dest="vfunc", help="instead: which tables hold this function")
     p.add_argument("-n", "--limit", type=_int_arg, default=50, help="max tables")
     p.add_argument("--slots", type=_int_arg, help="max slots per table (default: all with -c)")
+    p.add_argument(
+        "--slot",
+        dest="slot_off",
+        type=_int_arg,
+        help="one slot offset in bytes (e.g. 0x110): who implements it, ranked by table count",
+    )
     p.add_argument("--min-slots", dest="min_slots", type=_int_arg, help="ignore shorter runs")
     p.add_argument("--refresh", action="store_true", help="rebuild the cached index")
     p.set_defaults(
@@ -2877,6 +2897,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "func": a.vfunc,
                 "limit": a.limit,
                 "slots": a.slots,
+                "slot": a.slot_off,
                 "min_slots": a.min_slots,
                 "refresh": a.refresh,
             },

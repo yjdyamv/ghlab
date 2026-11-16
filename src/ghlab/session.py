@@ -2087,6 +2087,48 @@ def cmd_vtables(a: dict[str, Any]) -> dict[str, Any]:
         for r in rows
         if rx is None or (r[1] and rx.search(r[1])) or (r[2] and rx.search(r[2]))
     ]
+
+    slot_off = _num(a, "slot", None)
+    if slot_off is not None:
+        # One slot across every table: "who implements offset 0x110, in how many classes".
+        # The index already stores each slot as a function entry offset, so this is a
+        # pure grouping pass -- no disassembly and no per-table slot walk.
+        if slot_off < 0 or slot_off % 8:
+            raise ValueError(f"slot offset must be a non-negative multiple of 8, got {slot_off}")
+        index = slot_off // 8
+        groups: dict[int, list[tuple[int, str, str]]] = {}
+        for vt, cls, name, slots in matched:
+            if index >= len(slots):
+                continue
+            value = slots[index]
+            if value is None:
+                continue
+            groups.setdefault(value, []).append((vt, cls, name))
+        fm = program.getFunctionManager()
+        impls = []
+        for value, owners in sorted(groups.items(), key=lambda kv: (-len(kv[1]), kv[0]))[:limit]:
+            fn = fm.getFunctionAt(space.getAddress(value))
+            impls.append(
+                {
+                    "addr": str(space.getAddress(value)),
+                    "name": str(fn.getName()) if fn is not None else None,
+                    "size": int(fn.getBody().getNumAddresses()) if fn is not None else None,
+                    "tables": len(owners),
+                    "examples": [cls or name for _, cls, name in owners[:6]],
+                }
+            )
+        out = tail("slot")
+        out.pop("classes", None)
+        out.update(
+            {
+                "slot": f"0x{slot_off:x}",
+                "tables_scanned": len(matched),
+                "implementations": len(groups),
+                "count": len(impls),
+                "impls": impls,
+            }
+        )
+        return out
     tables = []
     for vt, cls, name, slots in matched[:limit]:
         addr = space.getAddress(vt)
