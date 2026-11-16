@@ -188,3 +188,22 @@ class FriendlyErrorTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TimeoutFlagTest(unittest.TestCase):
+    """A cold import of a 17 MB DLL outlives the 300s default; `--timeout` raises it."""
+
+    def test_timeout_is_accepted_on_every_command(self):
+        args = _parser().parse_args(["import", "big.dll", "--timeout", "1800"])
+        self.assertEqual(args.timeout, 1800.0)
+
+    def test_timeout_defaults_to_none_so_the_env_still_wins(self):
+        args = _parser().parse_args(["import", "big.dll"])
+        self.assertIsNone(args.timeout)
+
+    def test_timeout_is_documented(self):
+        for argv in (["import", "--help"], ["decompile", "--help"]):
+            buf = io.StringIO()
+            with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+                _parser().parse_args(argv)
+            self.assertIn("--timeout", buf.getvalue())

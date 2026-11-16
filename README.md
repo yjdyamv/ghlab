@@ -199,7 +199,7 @@ ghlab family notepad.exe                          # 这一族每个样本的规�
 ghlab similar notepad.exe FUN_140021ba8 --against other.exe
 ```
 
-任何命令加 `--json` 得到原始结构；`GHLAB_URL=http://host:port` 可指向远端 daemon。
+任何命令加 `--json` 得到原始结构；`GHLAB_URL=http://host:port` 可指向远端 daemon；`--timeout SECS` 单独抬高某一次调用的等待上限（默认 300s / `GHLAB_TIMEOUT`）——冷启动导入一个 17MB 的 DLL 要 8 分钟，客户端会先超时，daemon 却还在 `busy=import` 地干活，这时应该抬 `--timeout` 而不是重发命令。
 不带参数直接 `POST` 也行（`Content-Type` 必须是 `application/json`，否则 415 —— `text/plain` 的跨站请求不触发 CORS 预检，放开它等于让任意网页驱动 `patch`）：
 
 ```bash

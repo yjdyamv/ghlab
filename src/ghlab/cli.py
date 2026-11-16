@@ -2555,6 +2555,16 @@ def build_parser() -> argparse.ArgumentParser:
     common = _Parser(add_help=False)
     common.add_argument("--url", default=os.environ.get("GHLAB_URL"))
     common.add_argument("--json", action="store_true", help="emit raw JSON")
+    common.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        metavar="SECS",
+        help=(
+            "how long to wait for this one call (default: GHLAB_TIMEOUT, else 300); "
+            "raise it for a cold `import`/`analyze` of a big binary"
+        ),
+    )
 
     # Defaults come from `ghlab setup` so a fresh shell (or an agent) needs no flags;
     # anything typed on the command line still wins.
@@ -3678,7 +3688,7 @@ def _call(args, cmd: str, params: dict[str, Any] | None = None) -> int:
             print("ghlab: no focus binary; run `ghlab use <binary>` first", file=sys.stderr)
             return 2
         params["binary"] = focus
-    client = Client(args.url)
+    client = Client(args.url, timeout=getattr(args, "timeout", None))
     try:
         result = client.call(cmd, **params)
     except RemoteError as ex:

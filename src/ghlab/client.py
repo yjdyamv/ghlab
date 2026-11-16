@@ -41,7 +41,8 @@ class Client:
         except TimeoutError as ex:
             raise RemoteError(
                 f"the daemon did not answer within {self.timeout:g}s; a long analysis may "
-                f"still be running -- `ghlab job --list` or `ghlab ping` show what it is doing"
+                f"still be running -- `ghlab status` shows busy=..., and `--timeout SECS` "
+                f"(or GHLAB_TIMEOUT) raises this budget instead of abandoning the work"
             ) from ex
         except urllib.error.URLError as ex:
             # The OS message is localised (and mojibake in a non-UTF console), so name the
