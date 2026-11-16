@@ -747,6 +747,24 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["binary", "addr"],
         },
     },
+    {
+        "name": "ghlab_disasm",
+        "description": (
+            "Instructions exactly as the listing renders them (addr/bytes/text), so you can "
+            "answer \"which register does that store use\" without trusting the decompiler's "
+            "variable folding. Start at a function entry (`target`) or a bare `addr`."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "binary": _BIN,
+                "target": {"type": "string", "description": "function name or 0xaddr"},
+                "addr": {"type": "string", "description": "start address, when there is no target"},
+                "count": {"type": "integer", "description": "instructions (capped at 4096)"},
+            },
+            "required": ["binary"],
+        },
+    },
 ]
 
 # tool name -> daemon command
@@ -789,6 +807,7 @@ _COMMANDS = {
     "ghlab_journal": "journal",
     "ghlab_graph": "graph",
     "ghlab_bytes": "bytes",
+    "ghlab_disasm": "disasm",
 }
 
 _LIST_KEYS = {

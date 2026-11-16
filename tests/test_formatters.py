@@ -361,3 +361,20 @@ class VtablesIndexFormatterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DisasmFormatterTest(unittest.TestCase):
+    def test_renders_each_instruction_with_its_bytes(self):
+        text = cli.fmt_disasm(
+            {
+                "addr": "0x181354000",
+                "count": 2,
+                "instructions": [
+                    {"addr": "0x181354000", "bytes": "48ff25aa", "text": "MOV qword ptr [RSP + 8], RAX"},
+                    {"addr": "0x181354004", "bytes": "c3", "text": "RET"},
+                ],
+            }
+        )
+        self.assertIn("2 instruction(s)", text)
+        self.assertIn("48ff25aa", text)
+        self.assertIn("MOV qword ptr [RSP + 8], RAX", text)
+        self.assertIn("RET", text)

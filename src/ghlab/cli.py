@@ -632,6 +632,15 @@ def fmt_bytes(r: dict[str, Any]) -> str:
     return chr(10).join(out)
 
 
+def fmt_disasm(r: dict[str, Any]) -> str:
+    out = [f"== {r.get('addr')}  {r.get('count', 0)} instruction(s)"]
+    for ins in r.get("instructions") or []:
+        out.append(
+            f"  {ins.get('addr')}  {str(ins.get('bytes') or ''):<18s} {ins.get('text')}"
+        )
+    return chr(10).join(out)
+
+
 def fmt_rename(r: dict[str, Any]) -> str:
     was = r.get("was") or r.get("old")
     if was:
@@ -1084,6 +1093,7 @@ def fmt_campaign(r: dict[str, Any]) -> str:
 FORMATTERS = {
     "ping": fmt_ping,
     "bytes": fmt_bytes,
+    "disasm": fmt_disasm,
     "rename": fmt_rename,
     "comment": fmt_comment,
     "binaries": fmt_binaries,
@@ -2382,6 +2392,7 @@ _HELP_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "vtables",
             "xrefs",
             "bytes",
+            "disasm",
             "scan",
             "offsets",
             "struct",
@@ -3004,6 +3015,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--size", type=int, default=64, help="bytes to read (capped at 65536)")
     p.set_defaults(
         func=lambda a: _call(a, "bytes", {"binary": a.binary, "addr": a.addr, "size": a.size})
+    )
+
+    p = sub.add_parser("disasm", parents=[common], help="instructions (listing text)")
+    p.add_argument("binary")
+    p.add_argument("-t", "--target", help="function name or 0xaddr to start at")
+    p.add_argument("-a", "--addr", help="start address (when there is no target)")
+    p.add_argument("-n", "--count", type=int, default=48, help="instructions (capped at 4096)")
+    p.set_defaults(
+        func=lambda a: _call(
+            a,
+            "disasm",
+            {"binary": a.binary, "target": a.target, "addr": a.addr, "count": a.count},
+        )
     )
 
     p = sub.add_parser("rename", parents=[common], help="rename a function")

@@ -3296,7 +3296,7 @@ def _read_region(mem, addr, size: int) -> tuple[bytes, bool]:
     if block is None or not block.isInitialized():
         raise ValueError(f"{addr} is not in initialized memory")
     available = int(block.getEnd().subtract(addr)) + 1
-    want = min(size, available)
+    want = min(int(size), available)
     buf = _zero_bytes(want)
     got = int(mem.getBytes(addr, buf))
     data = bytes(buf[i] & 0xFF for i in range(got))
@@ -3321,6 +3321,51 @@ def cmd_bytes(a: dict[str, Any]) -> dict[str, Any]:
         # for the next chunk", and silently returning a short read hides that.
         "truncated": truncated or capped < size,
     }
+
+
+MAX_INSN = 4096
+
+
+def cmd_disasm(a: dict[str, Any]) -> dict[str, Any]:
+    """Instructions exactly as the listing renders them.
+
+    The decompiler renames and folds variables, so the one question it cannot
+    answer is "which register does that store really use" -- that is what this
+    is for. Pass `target` to start at a function's entry or `addr` for a bare
+    address; the walk follows the listing, so it crosses blocks and stops at
+    the end of the last block.
+    """
+    e = _entry(a["binary"])
+    p = e["program"]
+    listing = p.getListing()
+    mem = p.getMemory()
+    count = _num(a, "count", 48)
+    if count <= 0:
+        raise ValueError("count must be positive")
+    count = min(count, MAX_INSN)
+    if a.get("target"):
+        fn = _function(e, a["target"])
+        if fn is None:
+            raise KeyError(f"function {a['target']!r} not found")
+        start = fn.getEntryPoint()
+    elif a.get("addr"):
+        start = _addr(e, a["addr"])
+    else:
+        raise ValueError("give target (a function) or addr (a start address)")
+    out = []
+    it = listing.getInstructions(start, True)
+    while it.hasNext() and len(out) < count:
+        ins = it.next()
+        raw, _ = _read_region(mem, ins.getAddress(), int(ins.getLength()))
+        out.append(
+            {
+                "addr": str(ins.getAddress()),
+                "bytes": raw.hex(),
+                "text": str(ins),
+                "mnemonic": str(ins.getMnemonicString()),
+            }
+        )
+    return {"addr": str(start), "count": len(out), "instructions": out}
 
 
 def cmd_rename(a: dict[str, Any]) -> dict[str, Any]:
@@ -7647,6 +7692,7 @@ HANDLERS = {
     "vtables": cmd_vtables,
     "xrefs": cmd_xrefs,
     "bytes": cmd_bytes,
+    "disasm": cmd_disasm,
     "rename": cmd_rename,
     "comment": cmd_comment,
     "graph": cmd_graph,
