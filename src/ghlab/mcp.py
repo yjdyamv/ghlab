@@ -256,7 +256,10 @@ TOOLS: list[dict[str, Any]] = [
                 "binary": _BIN,
                 "offset": {
                     "type": "string",
-                    "description": "field offset, e.g. '0x54' (omit when using `hex`)",
+                    "description": (
+                        "field offset, e.g. '0x54' (omit when using `hex`, or when "
+                        "sweeping `imm` on its own)"
+                    ),
                 },
                 "hex": {
                     "type": "string",
@@ -268,7 +271,11 @@ TOOLS: list[dict[str, Any]] = [
                 "stack": {"type": "boolean", "description": "also report [RSP/RBP+..] locals"},
                 "imm": {
                     "type": "string",
-                    "description": "only instructions whose last operand is this immediate: '4', '0x4' or '0..5'",
+                    "description": (
+                        "immediate: '4', '0x4' or '0..5'. A filter when offset is given; "
+                        "a sweep of its own when it is not (find every user of a property "
+                        "id like 0xe0000041)"
+                    ),
                 },
                 "writes": {
                     "type": "boolean",

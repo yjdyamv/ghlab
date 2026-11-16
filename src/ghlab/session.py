@@ -2911,6 +2911,58 @@ def _parse_hex_pattern(text: str) -> tuple[bytes, bytes]:
     return bytes(values), bytes(masks)
 
 
+def _scan_imm(
+    binary: str,
+    p: Any,
+    spec: str,
+    start: Any | None,
+    end: Any | None,
+    limit: int,
+    op: re.Pattern[str] | None,
+    began: float,
+) -> dict[str, Any]:
+    """Instructions whose immediate matches `spec`, in `[start, end]`.
+
+    `scan <offset> --imm N` answers "who touches offset X with value N"; this
+    answers "who mentions N at all", which is the only way to find the users of
+    a property id like 0xe0000041 (page height) or of a sentinel like
+    0x3fffffff.
+    """
+    imm = _imm_spec(spec)
+    fm = p.getFunctionManager()
+    out: list[dict[str, Any]] = []
+    scanned = 0
+    for insn in _range_instructions(p, start, end):
+        scanned += 1
+        text = str(insn)
+        if op is not None and not op.search(text.split(" ", 1)[0]):
+            continue
+        value = _imm_of(text)
+        if value is None or not imm(value):
+            continue
+        fn = fm.getFunctionContaining(insn.getAddress())
+        out.append(
+            {
+                "addr": str(insn.getAddress()),
+                "function": fn.getName() if fn else "",
+                "text": text,
+            }
+        )
+        if len(out) >= limit:
+            break
+    return {
+        "binary": binary,
+        "offset": None,
+        "pattern": f"imm {spec}",
+        "imm": spec,
+        "writes_only": False,
+        "scanned": scanned,
+        "sites": out,
+        "truncated": len(out) >= limit,
+        "elapsed_ms": int((time.monotonic() - began) * 1000),
+    }
+
+
 def _check_in_memory(p, addr, label: str) -> None:
     """Reject an address that falls outside every memory block.
 
@@ -3032,15 +3084,22 @@ def cmd_scan(a: dict[str, Any]) -> dict[str, Any]:
     began = time.monotonic()
     if a.get("hex") not in (None, ""):
         return _scan_bytes(binary, p, str(a["hex"]), start, end, limit, began)
+    op = re.compile(str(a["op"]), re.I) if a.get("op") else None
+    if a.get("offset") in (None, "") and a.get("imm") not in (None, ""):
+        # `--imm` alone: sweep the immediates themselves. Property ids (0xe0000041
+        # and friends) only ever appear that way, and finding their users by hand
+        # used to mean grepping decompiled C.
+        return _scan_imm(binary, p, str(a["imm"]), start, end, limit, op, began)
     if a.get("offset") in (None, ""):
-        raise ValueError("scan needs offset=<n> (field displacement) or hex=<pattern>")
+        raise ValueError(
+            "scan needs offset=<n> (field displacement), hex=<pattern> or imm=<value>"
+        )
     offsets = [int(part, 0) for part in str(a["offset"]).split(",") if part.strip()]
     if not offsets:
         raise ValueError("offset must be >= 0")
     if any(value < 0 for value in offsets):
         raise ValueError("offset must be >= 0")
     offset = offsets[0]
-    op = re.compile(str(a["op"]), re.I) if a.get("op") else None
     pattern = re.compile(rf"[+-]\s*{offset:#x}\]", re.I)
     imm = _imm_spec(str(a["imm"])) if a.get("imm") not in (None, "") else None
     writes = bool(a.get("writes"))

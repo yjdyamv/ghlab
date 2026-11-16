@@ -382,7 +382,11 @@ def fmt_scan(r: dict[str, Any]) -> str:
     ]
     sites = r.get("sites") or []
     if not sites:
-        out.append("   (no instruction touches this offset)")
+        out.append(
+            "   (no instruction touches this offset)"
+            if r.get("offset")
+            else "   (no instruction has this immediate)"
+        )
         return chr(10).join(out)
     out.append(f"   {len(sites)} hit(s)" + ("  [truncated]" if r.get("truncated") else ""))
     filters = []
@@ -2960,7 +2964,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--imm",
         default=None,
-        help="only instructions whose last operand is this immediate (4, 0x4 or 0..5)",
+        help=(
+            "immediate to match: a filter when offset=<n> is given (4, 0x4 or 0..5), "
+            "or a sweep of its own when it is not (scan --imm 0xe0000041)"
+        ),
     )
     p.add_argument(
         "--writes",
