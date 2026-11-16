@@ -113,7 +113,13 @@ def fmt_info(r: dict[str, Any]) -> str:
 
 def fmt_functions(r: dict[str, Any]) -> str:
     rows = [f"{f['addr']}  {f['size']:>6}  {f['name']}" for f in r.get("functions") or []]
+    if r.get("addr"):
+        if not rows:
+            return f"# {r['addr']}: {r.get('note') or 'no function contains it'}"
+        return "\n".join([f"# {r['addr']} is inside {rows[0].split()[-1]}", *rows])
     head = f"# {r.get('matched')} matched, showing {len(rows)}"
+    if r.get("truncated"):
+        head += "  [truncated; raise -n]"
     return "\n".join([head, *rows])
 
 
@@ -2746,9 +2752,23 @@ def build_parser() -> argparse.ArgumentParser:
         "-m", "-q", "--match", "--query", dest="match", default=None, help="regex on function name"
     )
     p.add_argument("-n", "--limit", type=_int_arg, default=60)
+    # "which function owns this address" used to require `-n 200000` plus a bisect:
+    # the roster is paged at 60 by default, so a too-small -n silently answered
+    # with an unrelated early function. One address, one answer.
+    p.add_argument(
+        "-a",
+        "--at",
+        "--addr",
+        dest="at",
+        default=None,
+        metavar="ADDR",
+        help="the function whose body contains ADDR",
+    )
     p.set_defaults(
         func=lambda a: _call(
-            a, "functions", {"binary": a.binary, "match": a.match, "limit": a.limit}
+            a,
+            "functions",
+            {"binary": a.binary, "match": a.match, "limit": a.limit, "at": a.at},
         )
     )
 

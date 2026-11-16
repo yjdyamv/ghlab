@@ -95,6 +95,7 @@ ghlab binaries
 ghlab info notepad.exe
 
 ghlab functions notepad.exe -m 'WinMain|WndProc'
+ghlab functions notepad.exe -a 0x1400114c4     # 这个地址属于哪个函数（-n 分页，别看列表猜）
 ghlab decompile notepad.exe -t entry           # 单个，完整源码
 ghlab decompile notepad.exe -t FUN_140001008 --max-lines 30
 

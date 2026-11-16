@@ -772,8 +772,52 @@ def cmd_info(a: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _function_covering(program, addr) -> Any:
+    """The function whose body covers `addr`, or None.
+
+    `getFunctionContaining` already answers this exactly (including the tail end
+    of a body), but a program imported without analysis has `body == entry`, so
+    fall back to the sorted roster: the last function starting at or below the
+    address, provided the address is still inside the gap we accept (0x10000).
+    """
+    fm = program.getFunctionManager()
+    hit = fm.getFunctionContaining(addr)
+    if hit is not None:
+        return hit
+    best = None
+    for fn in fm.getFunctions(True):
+        if fn.getEntryPoint().compareTo(addr) > 0:
+            break
+        best = fn
+    if best is None or addr.subtract(best.getEntryPoint()) > 0x10000:
+        return None
+    return best
+
+
 def cmd_functions(a: dict[str, Any]) -> dict[str, Any]:
-    p = _entry(a["binary"])["program"]
+    entry = _entry(a["binary"])
+    p = entry["program"]
+    at = a.get("addr") or a.get("at")
+    if at:
+        addr = _addr(entry, str(at))
+        fn = _function_covering(p, addr)
+        # `str(addr)` is space-padded to the address width (`00900000`), which reads
+        # like a typo in the reply; report the offset as hex instead.
+        shown = f"{int(addr.getOffset()):x}"
+        if fn is None:
+            return {
+                "binary": a["binary"],
+                "matched": 0,
+                "addr": shown,
+                "functions": [],
+                "note": f"no function contains {shown}",
+            }
+        return {
+            "binary": a["binary"],
+            "matched": 1,
+            "addr": shown,
+            "functions": [brief(fn)],
+        }
     pat = re.compile(a.get("match") or ".*", re.I)
     limit = _num(a, "limit", 100)
     skip = _num(a, "offset", 0)
@@ -787,7 +831,12 @@ def cmd_functions(a: dict[str, Any]) -> dict[str, Any]:
             continue
         if len(out) < limit:
             out.append(brief(fn))
-    return {"binary": a["binary"], "matched": total, "functions": out}
+    return {
+        "binary": a["binary"],
+        "matched": total,
+        "functions": out,
+        "truncated": len(out) < total,
+    }
 
 
 def _grep_code(code: str, pattern: re.Pattern[str]) -> list[dict[str, Any]]:

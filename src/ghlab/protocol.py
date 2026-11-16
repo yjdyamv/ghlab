@@ -85,8 +85,8 @@ _SPECS = [
     Spec(
         "functions",
         ("binary",),
-        ("match", "limit", "offset"),
-        "list functions, optional regex on name",
+        ("match", "limit", "offset", "at", "addr"),
+        "list functions, optional regex on name, or the one containing --at ADDR",
     ),
     Spec(
         "decompile",

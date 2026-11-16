@@ -694,7 +694,9 @@ TOOLS: list[dict[str, Any]] = [
         "name": "ghlab_functions",
         "description": (
             "The function roster: address, size and prototype, filtered by a regex on the name. "
-            "Cheaper than ghlab_digest when you only need to know what exists before picking targets."
+            "Cheaper than ghlab_digest when you only need to know what exists before picking targets. "
+            "Pass `at` an address to get the single function whose body contains it - the roster "
+            "is paged by `limit`, so answering that question from a listing is unreliable."
         ),
         "inputSchema": {
             "type": "object",
@@ -703,6 +705,10 @@ TOOLS: list[dict[str, Any]] = [
                 "match": {"type": "string", "description": "regex over function names"},
                 "limit": _LIMIT,
                 "offset": {"type": "integer", "description": "skip this many functions"},
+                "at": {
+                    "type": "string",
+                    "description": "address to look up; returns the function containing it",
+                },
             },
             "required": ["binary"],
         },
