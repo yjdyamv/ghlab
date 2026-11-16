@@ -2193,6 +2193,41 @@ def _is_dest_operand(text: str, offset: int) -> bool:
     return offset in _displacements(_split_operands(text)[0])
 
 
+def _range_instructions(program: Any, lo: Any, hi: Any):
+    """Yield the instructions inside [lo, hi] and never anything outside it.
+
+    Two Ghidra quirks make this worth its own helper. `getInstructions(addr,
+    True)` stops at the first undefined byte, so a range that starts in padding
+    used to report "0 instruction(s) scanned" while the code sat right behind
+    the padding. And when `addr` is not inside a memory block at all, it
+    silently starts at the program's *first* instruction instead -- sweeping
+    unrelated code and (before the filter below) reporting hits from outside the
+    requested range. Filtering every address keeps the second case honest; the
+    address-set form hops the first.
+    """
+    listing = program.getListing()
+    lo = program.getMinAddress() if lo is None else lo
+    hi = program.getMaxAddress() if hi is None else hi
+    if lo.compareTo(hi) > 0:
+        return
+    try:
+        addr_set = program.getAddressFactory().getAddressSet(lo, hi)
+        for insn in listing.getInstructions(addr_set, True):
+            at = insn.getAddress()
+            if at.compareTo(lo) >= 0 and at.compareTo(hi) <= 0:
+                yield insn
+        return
+    except Exception:  # noqa: BLE001 - older API surface: fall through
+        pass
+    for insn in listing.getInstructions(lo, True):
+        at = insn.getAddress()
+        if at.compareTo(lo) < 0:
+            continue
+        if at.compareTo(hi) > 0:
+            break
+        yield insn
+
+
 def _insn_sites(
     program: Any,
     offset: int,
@@ -2205,7 +2240,6 @@ def _insn_sites(
     dest_only: bool = False,
 ) -> tuple[list[dict[str, Any]], int]:
     """Instructions whose rendering touches a given displacement, with owner function."""
-    listing = program.getListing()
     fm = program.getFunctionManager()
     out: list[dict[str, Any]] = []
     scanned = 0
@@ -2221,9 +2255,7 @@ def _insn_sites(
             lo = start
         if end is not None and hi.compareTo(end) > 0:
             hi = end
-        it = listing.getInstructions(lo, True)
-        while it.hasNext():
-            insn = it.next()
+        for insn in _range_instructions(program, lo, hi):
             if end is not None and insn.getAddress().compareTo(end) > 0:
                 break
             scanned += 1
@@ -2305,7 +2337,6 @@ def _scan_sequence(
 ) -> dict[str, Any]:
     """One pass, then ask for the ordered pattern -- not k separate sweeps."""
     wanted = set(offsets)
-    listing = p.getListing()
     fm = p.getFunctionManager()
     lo = start or p.getMinAddress()
     hi = end
@@ -2314,10 +2345,8 @@ def _scan_sequence(
     addrs: list[str] = []
     owners: list[str] = []
     scanned = 0
-    it = listing.getInstructions(lo, True)
     index = -1
-    while it.hasNext():
-        insn = it.next()
+    for insn in _range_instructions(p, lo, hi):
         if hi is not None and insn.getAddress().compareTo(hi) > 0:
             break
         scanned += 1
@@ -2882,6 +2911,26 @@ def _parse_hex_pattern(text: str) -> tuple[bytes, bytes]:
     return bytes(values), bytes(masks)
 
 
+def _check_in_memory(p, addr, label: str) -> None:
+    """Reject an address that falls outside every memory block.
+
+    Without this, a range like 0x18129000 (eight hex digits where the image
+    wants nine) looks like a successful scan: Ghidra's `getInstructionAfter`
+    degrades to the program's first instruction, so the sweep walks unrelated
+    code and reports "0 instruction(s) scanned" -- a confident, wrong answer.
+    """
+    if p.getMemory().getBlock(addr) is not None:
+        return
+    blocks = "; ".join(
+        f"{b.getName()} {b.getStart()}-{b.getEnd()}" for b in p.getMemory().getBlocks()
+    )
+    raise ValueError(
+        f"{label} {addr} is not inside any memory block"
+        f" (addresses here are {len(f'{int(addr.getOffset()):x}')}-digit hex, "
+        f"blocks: {blocks})"
+    )
+
+
 def _scan_bounds(p, a: dict[str, Any]):
     """[start, end] from `range` or `func`; (None, None) means the whole program."""
     start = end = None
@@ -2894,6 +2943,10 @@ def _scan_bounds(p, a: dict[str, Any]):
             raise ValueError(f"bad range {rng!r}; expected 0xSTART-0xEND")
         space = p.getAddressFactory().getDefaultAddressSpace()
         start, end = space.getAddress(lo), space.getAddress(hi)
+        if start.compareTo(end) > 0:
+            raise ValueError(f"bad range {rng!r}; start is past end")
+        _check_in_memory(p, start, "range start")
+        _check_in_memory(p, end, "range end")
     if a.get("func"):
         fn = _function(_entry(str(a["binary"])), str(a["func"]))
         if fn is None:
