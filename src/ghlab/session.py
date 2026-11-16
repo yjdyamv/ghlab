@@ -4733,14 +4733,20 @@ def _function_suggestions(program, target: str, limit: int = 5) -> str:
     return f" (did you mean {', '.join(close)}?)" if close else ""
 
 
-def _snapshot_writable(program, emu, budget: int = 2 << 20) -> list[tuple[int, bytes]]:
-    """Bytes of every writable initialized non-code block, for a pre/post diff."""
+def _snapshot_writable(program, emu, budget: int = 32 << 20) -> list[tuple[int, bytes]]:
+    """Bytes of every writable initialized non-code block, for a pre/post diff.
+
+    The per-block cap used to be 1 MB, which silently excluded the data block of a
+    real binary (wpscore.dll `.data` is 0x169000) — `emulate` then reported
+    `writes 0 byte(s)` no matter what the function wrote, because its scratch area
+    lived in the one block nobody had snapshotted.
+    """
     snap: list[tuple[int, bytes]] = []
     for blk in program.getMemory().getBlocks():
         if not (blk.isWrite() and blk.isInitialized()) or blk.isExecute():
             continue
         size = int(blk.getSize())
-        if size <= 0 or size > (1 << 20) or budget <= 0:
+        if size <= 0 or size > (64 << 20) or budget <= 0:
             continue
         start = int(blk.getStart().getOffset())
         snap.append((start, _emu_bytes(emu, start, size)))
@@ -5088,6 +5094,10 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
 
     Purely in-emulator: `EmulatorHelper` keeps its own memory state, so nothing is
     written back to the program and no save is needed.
+
+    `--break ADDR` (repeatable) stops before executing the instruction at ADDR and
+    reports every general register, which turns the emulator into a cheap debugger:
+    run a function, stop at the decision point, read the pointers it computed.
     """
 
     from ghidra.app.emulator import EmulatorHelper
@@ -5121,6 +5131,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
 
     emu = EmulatorHelper(program)
     baseline = _snapshot_writable(program, emu)
+    breaks = _emu_breaks(program, a.get("breaks"))
     emu.writeMemory(
         program.getAddressFactory().getDefaultAddressSpace().getAddress(sentinel),
         b"\xcc\xcc\xcc\xcc",
@@ -5216,6 +5227,9 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
             if pc.equals(sentinel_addr):
                 stop = "returned"
                 break
+            if breaks and int(pc.getOffset()) in breaks:
+                stop = "breakpoint"
+                break
             if program.getMemory().contains(pc):
                 last_valid_pc = pc
             if stubs_cfg:
@@ -5261,7 +5275,15 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
             "on_instruction": program.getListing().getInstructionAt(pc) is not None,
         }
 
-    seeded = [(base, base + size)]
+    # Skip only what the harness itself touches; skipping the whole scratch block
+    # hid every write a function made into it (records, ctx fields, out params).
+    seeded: list[tuple[int, int]] = [(sentinel, sentinel + 16), (max(0, sp - 0x200), stack_top)]
+    for item in seeded_memory:
+        lo = int(item["addr"], 16)
+        seeded.append((lo, lo + int(item["bytes"])))
+    seeded.extend(seeded_strings)
+    if buf_size:
+        seeded.append((buf_addr, buf_addr + buf_size))
     runs = _diff_runs(emu, baseline, seeded)
     writes = []
     for lo, data in runs:
@@ -5315,6 +5337,7 @@ def cmd_emulate(a: dict[str, Any]) -> dict[str, Any]:
         "args": arg_report,
         "stop": stop,
         "insns": insns,
+        "regs": _emu_regs(program, emu),
         "stubs": stubs,
         "skips": skips,
         "ret": {"rax": rax, "rax_hex": hex(rax), "rax_i32": rax_i32},
@@ -5491,6 +5514,46 @@ def cmd_decrypt(a: dict[str, Any]) -> dict[str, Any]:
 
 def _has_reg(program, name: str) -> bool:
     return program.getLanguage().getRegister(name) is not None
+
+
+# x86-64 general registers, in the order a human reads them.
+_EMU_REGS = (
+    "RAX", "RBX", "RCX", "RDX", "RSI", "RDI", "RBP", "RSP",
+    "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15", "RIP",
+)
+
+
+def _emu_regs(program, emu) -> dict[str, str]:
+    """Registers at the current emulator PC (hex strings; absent ones are skipped)."""
+    out: dict[str, str] = {}
+    for name in _EMU_REGS:
+        reg = program.getLanguage().getRegister(name)
+        if reg is None:
+            continue
+        try:
+            out[name] = hex(_u64(emu.readRegister(reg)))
+        except Exception:  # noqa: BLE001 - uninitialised register in this build
+            continue
+    return out
+
+
+def _emu_breaks(program, specs: list[Any]) -> set[int]:
+    """Parse ``emulate --break`` specifiers: a hex address or a symbol/function name."""
+    out: set[int] = set()
+    for spec in specs or []:
+        text = str(spec).strip()
+        offset = _hex_addr(text)
+        if offset is None:
+            addr = _symbol_addr(program, text)
+            if addr is None:
+                near = _suggest_symbols(program, text)
+                raise KeyError(
+                    f"break address {text!r} is not a hex address or known symbol"
+                    + (f" — did you mean {', '.join(near)}?" if near else "")
+                )
+            offset = addr
+        out.add(int(offset))
+    return out
 
 
 # ------------------------------------------------------------------ write ops

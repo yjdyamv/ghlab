@@ -584,7 +584,15 @@ def fmt_emulate(r: dict[str, Any]) -> str:
     ]
     if args:
         out.append(f"   args      {args}")
-    out.append(f"   return    {r['ret']['rax_hex']} ({r['ret']['rax']})")
+    if r.get("stop") == "breakpoint":
+        regs = r.get("regs") or {}
+        if regs:
+            pairs = [f"{k}={v}" for k, v in regs.items()]
+            for i in range(0, len(pairs), 6):
+                label = "regs     " if i == 0 else "         "
+                out.append(f"   {label}" + "  ".join(pairs[i : i + 6]))
+    else:
+        out.append(f"   return    {r['ret']['rax_hex']} ({r['ret']['rax']})")
     if r.get("stubs"):
         seen: dict[str, int] = {}
         for s in r["stubs"]:
@@ -3182,6 +3190,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-insns", type=_int_arg, default=200000)
     p.add_argument("--ms", type=_int_arg, default=5000, help="wall-clock budget")
     p.add_argument(
+        "--break",
+        dest="breaks",
+        action="append",
+        default=[],
+        metavar="ADDR",
+        help="stop before this instruction (hex address or symbol; repeatable) and report registers",
+    )
+    p.add_argument(
         "--buffer",
         type=_int_arg,
         default=0,
@@ -3225,6 +3241,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "args": a.args,
                 "max_insns": a.max_insns,
                 "ms": a.ms,
+                "breaks": a.breaks,
                 "dump": a.dump,
                 "buffer": a.buffer,
                 "seed": a.seed,

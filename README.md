@@ -130,6 +130,8 @@ ghlab emulate notepad.exe __security_check_cookie --arg 1
 ghlab emulate notepad.exe FUN_140007e1c --arg 1 --arg '"hello"' --buffer 64
 ghlab emulate notepad.exe decrypt_config --arg 0x140038600 --buffer 256 --ms 8000
 ghlab emulate notepad.exe check_license --seed '0x140039600=41424344' --dump '0x140039600:8'
+# 中途停住看寄存器（伪调试器）：在决策点之前停，读出它算出来的指针
+ghlab emulate wpscore.dll FUN_18108e690 --arg 0x0 --arg 1 --break 0x18108ef6e
 # stub a getter so the function can run without the object it reads:
 ghlab emulate notepad.exe line_height --arg 0   --stub 'FUN_1800058c0[arg2=0xe000000b]=120' --stub 'FUN_1800058c0[arg2=0xe000001b]=2'
 
@@ -409,7 +411,7 @@ env 里的值全部是**写入那一刻、这台机器上**算出来的：`PYTHO
 | `index` | `binary` / `refresh` | **持久索引**：一次全扫把每个函数的 strings/imports/callees/常量/大小写进 `<project>/.ghlab/index/<binary>.json`；`find`/`diff`/`similar`/`campaign` 都改读索引，`(md5, modification number)` 变了就自动重建 |
 | `find` | `binary` / `import, string, calls, limit, any` | **按结构定位候选**：谁调用了这些导入 / 引用了这些字符串 / 调用了这些函数（默认全部条件同时成立，`--any` 取或） |
 | `decrypt` | – / `binary, addr, len, hex, ciphers, min_printable, limit` | **破小块密文**：单字节 xor/add/sub、rol/ror、utf-16le、base64 全试一遍，只留"像字符串"的候选（要求至少一段 4 字母连写），按可打印度 + 字母数字占比 + 配置关键词打分排序。`--hex` 直接给密文，或给 `binary`+`--addr/--len` 从内存读 |
-| `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed, stub` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置），`--stub FN[ARGn=V]=RET` 可跳过某个调用并直接给返回值（按第 1–4 个整数参数匹配），用于"函数读配置再计算"的场景 |
+| `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed, stub, breaks` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置），`--stub FN[ARGn=V]=RET` 可跳过某个调用并直接给返回值（按第 1–4 个整数参数匹配），用于"函数读配置再计算"的场景；`--break ADDR`（可重复，十六进制或符号）在执行该指令**之前**停下并回传全部通用寄存器，用来读某个调用点算出来的指针/虚表 |
 | `diff` | `a, b` / `match, limit, min_score, detail, semantic` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`）；`--semantic` 换成整库视角：新增/移除的**导入（带 inject/exec/network… 风险分组）、字符串、常量**，`counts` 永远是真实总数（列表按 `-n` 截断并标 `truncated`） |
 | `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 || `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `revert` | `binary` / `addr, all, force` | **撤销补丁**：`patch` 会把被覆盖的原字节记到 `<项目>/.ghlab/patches/`，`revert BIN 0x401000` 还原那一处，`--all` 按从新到旧把整个补丁栈退回去（同一地址打了两次就退两次）。若当前字节已不是当初写入的（说明后来又被改过），默认拒绝并报出两边内容，`--force` 才强行覆盖——默认拒绝是刻意的：那已经是另一处编辑，不是 undo |

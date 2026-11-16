@@ -217,8 +217,9 @@ _SPECS = [
     Spec(
         "emulate",
         ("binary", "target"),
-        ("args", "max_insns", "ms", "dump", "buffer", "seed", "stub"),
-        "run one function on the P-code emulator: seeded args, tracked writes, return value",
+        ("args", "max_insns", "ms", "dump", "buffer", "seed", "stub", "breaks"),
+        "run one function on the P-code emulator: seeded args, tracked writes, return value; "
+        "`breaks` stops before an instruction and reports registers",
     ),
     Spec(
         "decrypt",

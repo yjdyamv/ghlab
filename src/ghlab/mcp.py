@@ -364,7 +364,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Run one function on the P-code emulator with seeded arguments (Win64 ABI) and report "
             "the return value, memory writes and a scratch buffer. Use for string decryption or "
-            "config parsing without a debugger; imported calls are stubbed."
+            "config parsing without a debugger; imported calls are stubbed. Pass `breaks` "
+            "(hex addresses or symbols) to stop before an instruction and get every general "
+            "register — a poor man's debugger for probing what a function computed."
         ),
         "inputSchema": {
             "type": "object",
@@ -375,6 +377,11 @@ TOOLS: list[dict[str, Any]] = [
                 "max_insns": {"type": "integer", "minimum": 1},
                 "buffer": {"type": "integer", "description": "scratch bytes to allocate and dump"},
                 "dump": {"type": "array", "items": {"type": "string"}},
+                "breaks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "stop before these addresses (hex or symbol) and report registers",
+                },
             },
             "required": ["binary", "target"],
         },
