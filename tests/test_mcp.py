@@ -230,6 +230,34 @@ class StdioTest(unittest.TestCase):
         self.assertEqual(replies[2]["error"]["code"], -32700)
 
 
+class StreamEncodingTest(unittest.TestCase):
+    """MCP is UTF-8 on the wire; a cp936 stdin used to turn CJK arguments into surrogates."""
+
+    def test_both_streams_are_reconfigured_to_utf8(self):
+        seen = {}
+
+        class Stream(io.StringIO):
+            def __init__(self, name, text=""):
+                super().__init__(text)
+                self._name = name
+
+            def reconfigure(self, **kwargs):
+                seen[self._name] = kwargs
+
+        stdin, stdout = Stream("stdin"), Stream("stdout")
+        mcp.serve(stdin, stdout, Fake())
+        self.assertEqual(seen["stdin"]["encoding"], "utf-8")
+        self.assertEqual(seen["stdin"]["errors"], "replace")
+        self.assertEqual(seen["stdout"]["encoding"], "utf-8")
+
+    def test_a_stream_without_reconfigure_still_serves(self):
+        out = io.StringIO()  # StringIO has no reconfigure
+        request = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        code = mcp.serve(io.StringIO(request + chr(10)), out, Fake())
+        self.assertEqual(code, 0)
+        self.assertIn("ghlab_decompile", out.getvalue())
+
+
 class PromptTest(unittest.TestCase):
     def test_prompts_list(self):
         reply = handle({"jsonrpc": "2.0", "id": 20, "method": "prompts/list"}, Fake())

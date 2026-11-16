@@ -1153,14 +1153,22 @@ def serve(
     """Newline-delimited JSON-RPC over stdio, until EOF."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    for stream in (stdout,):
-        # MCP is UTF-8 on the wire; a Windows console default (cp936) would raise
-        # UnicodeEncodeError the first time a binary contains a non-ASCII string.
+    # MCP is UTF-8 on the wire, in both directions. The stdout half was fixed first
+    # (a Windows console default of cp936 raised UnicodeEncodeError the moment a
+    # binary contained a non-ASCII string); stdin kept decoding with
+    # cp936 + surrogateescape, so a UTF-8 argument such as a CJK `grep` pattern
+    # arrived as lone surrogates and killed the reply:
+    #   UnicodeEncodeError: 'utf-8' codec can't encode character '\udca6'
+    # `errors="replace"` keeps one bad byte from taking the whole session down.
+    for stream, errors in ((stdin, "replace"), (stdout, None)):
         # Not every TextIO implements reconfigure (a StringIO in tests does not).
         reconfigure = getattr(stream, "reconfigure", None)
         with contextlib.suppress(Exception):
             if reconfigure is not None:
-                reconfigure(encoding="utf-8")
+                kwargs: dict[str, Any] = {"encoding": "utf-8"}
+                if errors is not None:
+                    kwargs["errors"] = errors
+                reconfigure(**kwargs)
     if call is None:
         # One MCP entry serves every configured project: the router picks the
         # daemon from the binary a tool already names, and starts it if it is down.
