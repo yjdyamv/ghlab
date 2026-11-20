@@ -398,7 +398,7 @@ env 里的值全部是**写入那一刻、这台机器上**算出来的：`PYTHO
 | `bytes` | `binary, addr` / `size` | 原始字节 hex+ascii。一次 `getBytes` 读完（不是逐字节），按“包含首地址的已初始化块”截断，上限 64 KiB；读短了或超上限返回 `size` 与 `truncated: true` |
 | `disasm` | `binary` / `target` 或 `addr`, `count` | 指令清单（`addr`/`bytes`/`text`），直接取 listing 的渲染文本。反编译器会重命名并合并变量，所以「这条 store 到底写的是哪个寄存器」只能看这个；`target` 从函数入口开始，否则从 `addr`；沿 listing 走，跨基本块，上限 4096 条 |
 | `scan` | `binary, offset`（或 `hex`）/ `range, func, limit, op, stack, imm, writes, sequence, window` | **位移搜索**：谁在读写结构体的 `+0xNN` 字段（指令级，不是反编译文本 grep）。`--op` 过滤助记符（如只看 `MOVSS`/`MULSS` 找 float 字段），`--func`/`--range` 限定范围，默认排除 `[RSP/RBP±]` 栈局部变量（`--stack` 放回）；`--writes` 只看写入（偏移在目的操作数），`--imm 4` / `--imm 0..5` 只看立即数匹配的指令（回答"谁把常量 4 存进 +0x44"）；**不给 `offset`/`hex` 时 `--imm` 自己就是一次扫描**，直接找某个立即数的所有出现（"谁提到属性 id `0xe0000041`"），这是查属性 id、哨兵常量唯一省事的办法。给 `--hex` 则改成**掩码字节搜索**（`48 8B ?? 05`），返回命中地址 + 所在段 + 所属函数。实测 650 万条指令 38s |
-| `offsets` | `binary` `target` | `offset` `limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
+| `offsets` | `binary, target` / `offset, limit` | 把函数里每个 `[base+disp]` 归属到具体形参/局部变量 |
 | `struct` | `binary, target` / `base, offset, name, types, pointer, create, limit` | **结构体推断**：把一个函数里同一 base 的字段访问按访问宽度投票成类型，缺口用 padding 补齐（偏移必须与代码一致），输出可直接编译的 C decl；`--types 0x18=float,0x20=void *` 人工纠正宽度，`--pointer 0x20` 标指针，`--create` 直接装进程序（之后 `set-type` 就能引用）；`offsets` 看归属，这个看布局 |
 | `rename` | `binary, target, new` | 重命名并保存 |
 | `comment` | `binary, target, text` / `type` | 写注释并保存（type: plate/pre/post/eol，默认 plate；`decompiler` → pre） |
@@ -414,7 +414,7 @@ env 里的值全部是**写入那一刻、这台机器上**算出来的：`PYTHO
 | `decrypt` | – / `binary, addr, len, hex, ciphers, min_printable, limit` | **破小块密文**：单字节 xor/add/sub、rol/ror、utf-16le、base64 全试一遍，只留"像字符串"的候选（要求至少一段 4 字母连写），按可打印度 + 字母数字占比 + 配置关键词打分排序。`--hex` 直接给密文，或给 `binary`+`--addr/--len` 从内存读 |
 | `emulate` | `binary, target` / `args, max_insns, ms, buffer, dump, seed, stub, breaks` | **P-code 模拟执行**：按 Win64 约定播种参数（`123`/`0x40`/`"str"`/`L"wide"`/`*symbol`），自动应答 memset/memcpy/strlen/strcpy 等 CRT 调用，未实现的导入返回 0，回传返回值、可写内存 diff、`--buffer` 内容、停止原因；`--seed ADDR=HEX` 可预置内存（喂密文/配置），`--stub FN[ARGn=V]=RET` 可跳过某个调用并直接给返回值（按第 1–4 个整数参数匹配），用于"函数读配置再计算"的场景；`--break ADDR`（可重复，十六进制或符号）在执行该指令**之前**停下并回传全部通用寄存器，用来读某个调用点算出来的指针/虚表 |
 | `diff` | `a, b` / `match, limit, min_score, detail, semantic` | **功能级差异**：每个函数提取（引用的字符串、外部导入、常量、指令/块/调用数），四轮匹配（签名唯一 → 同地址 → 同名 → 相似度贪心），输出 added/removed/changed + 段 hash 差异（实测 521 函数两边共 2–4s，命中缓存的重复查询 <0.1s）；`--detail N` 再给 N 个改动函数出指令级 unified diff（地址归一化成 `ADDR`）；`--semantic` 换成整库视角：新增/移除的**导入（带 inject/exec/network… 风险分组）、字符串、常量**，`counts` 永远是真实总数（列表按 `-n` 截断并标 `truncated`） |
-| `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 || `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
+| `patch` | `binary, addr` / `bytes, nop, expect` | **真打补丁**：先 `clearCodeUnits` 再写（否则 Ghidra 报 `Memory change conflicts with instruction`），随后重新反汇编并落盘；只读段会临时置写。`--expect` 长度必须与写入等长 |
 | `revert` | `binary` / `addr, all, force` | **撤销补丁**：`patch` 会把被覆盖的原字节记到 `<项目>/.ghlab/patches/`，`revert BIN 0x401000` 还原那一处，`--all` 按从新到旧把整个补丁栈退回去（同一地址打了两次就退两次）。若当前字节已不是当初写入的（说明后来又被改过），默认拒绝并报出两边内容，`--force` 才强行覆盖——默认拒绝是刻意的：那已经是另一处编辑，不是 undo |
 | `set_type` | `binary, target, decl` | **写类型**：`'int f(char *s, unsigned n)'` 走 `FunctionSignatureParser`（名字以声明为准），`'char[64]'`/`'void*'`/`'DWORD'` 走 `CreateDataCmd` |
 | `bookmark` | `binary` / `action, addr, target, type, category, comment, limit` | Ghidra 书签 add/list/remove（GUI 里能直接看到，类别当分组用） |
@@ -429,7 +429,6 @@ env 里的值全部是**写入那一刻、这台机器上**算出来的：`PYTHO
 | `slice` | `binary, to` / `from, depth, limit, code, direction` | **反向切片**：沿调用者 BFS 到 entry/main/WinMain/DllMain，给出"什么条件下这个 API 会被调用"的链；`--code` 附调用者反编译；`--forward` 反向问"这个函数能到达哪些导入、路径是什么" |
 | `similar` | `binary, target` / `against, limit, min_score` | **跨程序同构函数**：字符串/导入/常量/大小四路指纹打分；零特征的 thunk 一律压到 0.3 以下，避免 stub 互相当成 1.00 |
 | `report` | `binary` / `top` | Markdown 报告：digest 摘要 + 调用图枢纽 + 函数大小分布 + 按标签分组的结论，可直接贴进报告 |
-
 | `run` | `path` / `set, keep_going, dry_run` | 执行 `.gh` 脚本（`$VAR`、`>` 重定向、失败策略） |
 | `mcp` | – | 以 stdio MCP server 形式暴露 35 个工具 + `ghlab://` 资源 + 2 个 prompt 模板 |
 | `campaign` | – / `binary, min_score, limit` | **家族聚类**：把项目里所有程序按"共享导入 0.6 + 共享字符串 0.4"的相似度做单链聚类，输出每簇成员与共有特征（3 个 notepad 变体 → 1 簇 max 1.00，约 5s） |
@@ -487,34 +486,45 @@ ghlab scan sample.exe 0x44 --writes --imm 4
 
 找一串字节（特征码、字符串常量、立即数表）时把偏移换成 `--hex`：`ghlab scan BIN --hex '48 8B ?? 05'`。`??` 是按字节的通配符（半字节通配会直接报错拒绝），搜索走 `Memory.findBytes(addr, mask)`，每命中一次一次 JVM 调用；输出是命中地址、所在段、所属函数和实际字节（`??` 位置会填成真实值）。用 `-n` 限制条数，命中上限即标 `truncated`。
 
-## 开发
+**偏移不是事实**：同一个 `+0x178` 在 `ctx` 上是 dword 排版模式，在 `doc` 上是指针。
+`ghlab offsets BIN FUN_1813200F0` 直接给出归属：
 
-```bash
-# 单元测试（不需要 Ghidra / daemon）
-~/re/.venv/Scripts/python.exe -m unittest discover -s tests -v
-
-# 含 live 测试：daemon 起着且 notepad.exe 已导入时自动启用（否则 skip）
-GHIDRA_TEST_BIN=notepad.exe ~/re/.venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
+== wpscore.dll FUN_1813200f0 : undefined FUN_1813200f0() (14ms)
+   param_1 (param)
+         0x128  x1
+         0x12c  x1
+         0x130  x1
+   param_2 (param)
+          0x40  x1
+```
+
+写结论时把对象名带上（`doc+0x128` 而不是 `+0x128`），否则下一个人会拿它去错的结构体上验证。
+
+## 开发
 
 ```
 src/ghlab/
   protocol.py   命令表 + 参数校验 + 响应信封（纯 stdlib）
-  session.py    Ghidra 侧实现（懒加载 pyghidra）
-  server.py     HTTP 前端、pidfile、端口探测
   client.py     客户端（纯 stdlib）
+  session.py    Ghidra 侧实现（懒加载 pyghidra）
+  server.py     HTTP 前端、pidfile、端口探测、job 队列
+  router.py     binary → daemon 路由（多项目）
+  config.py     机器本地配置：Ghidra 在哪、哪个 daemon 管哪个库
+  pipeline.py   可重放脚本（`ghlab run`）
+  campaign.py   家族聚类
+  render.py     调用树出图（dot / mermaid / svg，无第三方依赖）
+  mcp.py        stdio MCP server（工具 / 资源 / prompt）
+  mcpconfig.py  把 MCP 条目合进各家客户端配置
   cli.py        argparse 子命令 + 输出格式化
-tests/          test_protocol.py, test_server_client.py（stub session，真 HTTP）
+tests/          单元测试（stub session，真 HTTP）+ 两档 live 测试
 ```
 
-## 开发：ruff + ty
+### 测试
 
 ```bash
-uv tool install ruff ty                  # 一次性
-ruff check . && ruff format --check .    # 或者直接 ruff format .
-ty check                                 # 类型检查
-
-python -m unittest discover -s tests -q  # 272 个测试里跑 188 个，约 7 秒，不需要 daemon
+# 默认：只跑单元测试，不需要 Ghidra / daemon，几秒完事
+python -m unittest discover -s tests -q
 
 # 第一档：端到端冒烟，自带样例（40 KB 的 hostname.exe，临时项目，用完即删）
 GHLAB_LIVE=1 python -m unittest discover -s tests
@@ -533,13 +543,20 @@ GHLAB_LIVE_RICH=1 GHLAB_URL=http://127.0.0.1:8765/ python -m unittest discover -
 
 （此前不分档：一次 `discover` 300 秒，且在没有 WPS 的机器上会因为找不到样本而报错。）
 
+### ruff + ty
+
+```bash
+uv tool install ruff ty                  # 一次性
+ruff check . && ruff format --check .    # 或者直接 ruff format .
+ty check                                 # 类型检查
+```
+
 配置写在 `pyproject.toml` 的 `[tool.ruff]` / `[tool.ty.*]`。两条规则值得说明：
 
 - `select` 里带了 `BLE`（禁止裸 `except Exception`）：唯一豁免是 `session.py` 里那些**调用 jpype 反射**的地方，都写了 `# noqa: BLE001` 并注明原因（"a jpype call can raise anything"）。这类豁免是给人看的，不是给检查器看的。
 - `[tool.ty.rules] import-not-found = "ignore"`：`ghidra.*` / `jpype` 是 JVM 运行时才存在的模块，静态检查器没有可解析的包。关掉这条之后 ty 仍然抓到了真问题——比如 `_clean_name(callee)` 收到 `str | None`、`progress: io.TextIOBase` 接不住 `sys.stderr`、以及差集排序键的联合类型推断错误。
 
 ## 已知坑（都已在这里绕过）
-
 1. **Windows `SO_REUSEADDR` 允许同端口双监听** → 旧进程继续服务旧代码。ghlab 显式关掉 `allow_reuse_address`，第二个实例会直接失败而不是静默接管。
 2. `proj.importProgram(str)` 在 jpype 下重载歧义 → 必须 `proj.importProgram(File(path))`。
 3. `FunctionManager.getFunction(String)` 不存在（只有 `getFunction(long)`）→ 按符号表找。
@@ -560,25 +577,9 @@ GHLAB_LIVE_RICH=1 GHLAB_URL=http://127.0.0.1:8765/ python -m unittest discover -
 18. **给入口符号改名会让 `program.getEntryPoint()` 失效**（digest 的入口链随之变空）→ 别重命名 `entry`；`_entry_chain` 已加名字/可执行段首函数兜底。
 19. **常量的符号性不可假定**：反编译里的 `(HKEY)0xffffffff80000001` 到 `getScalar()` 是**负数** long → 断言比较时必须同时试 `value` / `_u64(value)` / 32 位与 16 位截断（`_const_views()`）。
 20. **地址字符串没有唯一写法**：`1400019d0` 不带 `0x` 时 `FlatProgramAPI.toAddr()` 认不出来（它不把裸 hex 当地址）→ `_hex_addr()` 统一识别，`_addr`/`_function` 都走它。
-
 21. **PDB 分析没有 2 参 `doAnalysis`**：12.2 只有 `PdbUniversalAnalyzer.doAnalysis(Program, File, PdbReaderOptions, PdbApplicatorOptions, MessageLog, TaskMonitor)`（返回 boolean）；`MessageLog` 没有 `getMessages()`/`getMessageLog()`，取文本用 `str(log)`。坏 PDB 返回 `false` 且函数数不变（干净拒绝），所以 `if ok` 之前不要 `save`。
+22. `PdbUniversalAnalyzer.doAnalysis` 不能直接调：applicator 会向 `TransientProgramProperties` 要 analysis-session 作用域的状态，而那只在 `AutoAnalysisManager.isAnalyzing()` 为真时可用，于是直接调得到 `IllegalArgumentException: No active analysis session`；`setAllowUntrustedOption`/`setPdbFileOption` 走同一条检查。ghlab 的做法是用 `jpype.JProxy` 造一个只实现 `added` 的 `ghidra.app.services.Analyzer` 替身，`scheduleOneTimeAnalysis` 之后在自己开的事务里 `startAnalysis`（`startAnalysis` 自己不开事务，缺了它第一次写入就是 `db.NoTransactionException`）。这条路径在 Ghidra 12.2 上用 `/Zi` 编出的 DLL 加真 MSF PDB 验过：149 → 5848 个函数、`add_numbers`/`scaled` 等符号落地。
 
 ## License
 
-MIT
-
-**偏移不是事实**：同一个 `+0x178` 在 `ctx` 上是 dword 排版模式，在 `doc` 上是指针。
-`ghlab offsets BIN FUN_1813200F0` 直接给出归属：
-
-```
-== wpscore.dll FUN_1813200f0 : undefined FUN_1813200f0() (14ms)
-   param_1 (param)
-         0x128  x1
-         0x12c  x1
-         0x130  x1
-   param_2 (param)
-          0x40  x1
-```
-
-写结论时把对象名带上（`doc+0x128` 而不是 `+0x128`），否则下一个人会拿它去错的结构体上验证。
-22. `PdbUniversalAnalyzer.doAnalysis` 不能直接调：applicator 会向 `TransientProgramProperties` 要 analysis-session 作用域的状态，而那只在 `AutoAnalysisManager.isAnalyzing()` 为真时可用，于是直接调得到 `IllegalArgumentException: No active analysis session`；`setAllowUntrustedOption`/`setPdbFileOption` 走同一条检查。ghlab 的做法是用 `jpype.JProxy` 造一个只实现 `added` 的 `ghidra.app.services.Analyzer` 替身，`scheduleOneTimeAnalysis` 之后在自己开的事务里 `startAnalysis`（`startAnalysis` 自己不开事务，缺了它第一次写入就是 `db.NoTransactionException`）。这条路径在 Ghidra 12.2 上用 `/Zi` 编出的 DLL 加真 MSF PDB 验过：149 → 5848 个函数、`add_numbers`/`scaled` 等符号落地。
+MIT，见 [LICENSE](LICENSE)。
